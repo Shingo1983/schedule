@@ -1,0 +1,57 @@
+{% extends "base.html" %}
+{% block title %}設定 - JAL LSP ショッピング比較{% endblock %}
+
+{% block content %}
+<h1>設定</h1>
+
+<form method="post" class="settings-form">
+    <div class="card">
+        <h2>楽天市場 API</h2>
+        <p class="text-small">
+            <a href="https://webservice.rakuten.co.jp/" target="_blank" rel="noopener">Rakuten Developers</a>
+            でアプリを登録し、アプリケーションIDを取得してください（無料）。
+        </p>
+        <div class="form-group">
+            <label for="rakuten_app_id">アプリケーションID</label>
+            <input type="text" id="rakuten_app_id" name="rakuten_app_id"
+                   value="{{ config.rakuten_app_id }}"
+                   placeholder="楽天アプリケーションID">
+            <span class="status {{ 'ok' if config.rakuten_app_id else 'ng' }}">
+                {{ '設定済み' if config.rakuten_app_id else '未設定' }}
+            </span>
+        </div>
+    </div>
+
+    <div class="card">
+        <h2>Yahoo!ショッピング API</h2>
+        <p class="text-small">
+            <a href="https://developer.yahoo.co.jp/webapi/shopping/" target="_blank" rel="noopener">Yahoo!デベロッパーネットワーク</a>
+            でアプリを登録し、Client IDを取得してください（無料）。
+        </p>
+        <div class="form-group">
+            <label for="yahoo_app_id">Client ID（アプリケーションID）</label>
+            <input type="text" id="yahoo_app_id" name="yahoo_app_id"
+                   value="{{ config.yahoo_app_id }}"
+                   placeholder="Yahoo! Client ID">
+            <span class="status {{ 'ok' if config.yahoo_app_id else 'ng' }}">
+                {{ '設定済み' if config.yahoo_app_id else '未設定' }}
+            </span>
+        </div>
+    </div>
+
+    <div class="card">
+        <h2>LSP価値設定</h2>
+        <p class="text-small">
+            1 LSPあたり何円の価値があると考えますか？この値に基づいて「実質価格」を計算します。
+        </p>
+        <div class="form-group">
+            <label for="lsp_value_yen">1 LSPの価値（円）</label>
+            <input type="number" id="lsp_value_yen" name="lsp_value_yen"
+                   value="{{ config.lsp_value_yen }}"
+                   step="0.1" min="0">
+        </div>
+    </div>
+
+    <button type="submit" class="btn btn-primary">設定を保存</button>
+</form>
+{% endblock %}

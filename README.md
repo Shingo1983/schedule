@@ -38,7 +38,16 @@ python -m jal_shopping_tool setup
 
 ## 使い方
 
-### 商品を検索して価格比較・LSP分析
+### Webアプリとして起動（推奨）
+
+```bash
+python -m jal_shopping_tool web
+```
+
+ブラウザで http://localhost:5000 を開いて利用できます。
+設定画面からAPIキーの登録、商品検索・比較、ショップ一覧の確認がすべてブラウザ上で完結します。
+
+### CLIで商品を検索して価格比較・LSP分析
 
 ```bash
 python -m jal_shopping_tool search "AirPods Pro"

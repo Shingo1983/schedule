@@ -9,6 +9,7 @@ description = "JALマイレージパーク LSP獲得を考慮したネットシ�
 requires-python = ">=3.10"
 dependencies = [
     "requests>=2.31",
+    "flask>=3.0",
 ]
 
 [project.optional-dependencies]
@@ -16,3 +17,4 @@ pdf = ["pdfplumber>=0.10"]
 
 [project.scripts]
 jal-shop = "jal_shopping_tool.cli:main"
+jal-shop-web = "jal_shopping_tool.app:main"

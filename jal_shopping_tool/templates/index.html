@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+{% block title %}JAL LSP ショッピング比較 - 商品検索{% endblock %}
+
+{% block content %}
+<div class="hero">
+    <h1>JAL LSP ショッピング比較</h1>
+    <p class="hero-sub">JALマイレージパーク経由のLSP獲得を考慮して、最もお得な購入先を見つけましょう</p>
+
+    <form action="{{ url_for('search') }}" method="get" class="search-form">
+        <div class="search-box">
+            <input type="text" name="q" placeholder="商品名を入力（例: AirPods Pro, ダイソン 掃除機）" required autofocus>
+            <button type="submit">検索</button>
+        </div>
+    </form>
+
+    {% if not has_api_keys %}
+    <div class="flash flash-warning">
+        APIキーが未設定です。<a href="{{ url_for('settings') }}">設定画面</a>で楽天またはYahoo!ショッピングのAPIキーを登録してください。
+    </div>
+    {% endif %}
+</div>
+
+<div class="features">
+    <div class="feature-card">
+        <h3>価格比較</h3>
+        <p>楽天市場・Yahoo!ショッピングから最安値を自動検索</p>
+    </div>
+    <div class="feature-card">
+        <h3>LSP計算</h3>
+        <p>JALマイレージパーク経由で獲得できるマイル・LSPを自動計算</p>
+    </div>
+    <div class="feature-card">
+        <h3>実質価格比較</h3>
+        <p>LSPの価値を差し引いた実質価格で購入先を比較・推奨</p>
+    </div>
+</div>
+{% endblock %}
