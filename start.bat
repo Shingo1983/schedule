@@ -2,39 +2,57 @@
 chcp 65001 >nul 2>&1
 title JAL LSP ショッピング比較ツール
 
-echo ============================================================
-echo   JAL LSP ショッピング比較ツール - 起動中...
-echo ============================================================
+:: このbatファイルがあるフォルダに移動
+cd /d "%~dp0"
+
+echo.
+echo   ====================================================
+echo    JAL LSP ショッピング比較ツール
+echo   ====================================================
 echo.
 
 :: Pythonの存在確認
 python --version >nul 2>&1
 if errorlevel 1 (
-    echo [エラー] Pythonが見つかりません。
-    echo https://www.python.org/downloads/ からインストールしてください。
+    echo   [エラー] Pythonがインストールされていません。
+    echo.
+    echo   以下のページからPythonをインストールしてください:
+    echo   https://www.python.org/downloads/
+    echo.
+    echo   インストール時に「Add Python to PATH」に
+    echo   チェックを入れるのを忘れないでください!
+    echo.
+    echo   インストール後、このファイルをもう一度ダブルクリックしてください。
     echo.
     pause
     exit /b 1
 )
 
-:: 依存パッケージの自動インストール
-echo 依存パッケージを確認中...
+:: 依存パッケージの自動インストール（初回のみ）
 python -c "import flask" >nul 2>&1
 if errorlevel 1 (
-    echo Flask をインストール中...
-    pip install requests flask
+    echo   初回セットアップ中です。少々お待ちください...
+    echo.
+    pip install requests flask >nul 2>&1
+    if errorlevel 1 (
+        echo   [エラー] パッケージのインストールに失敗しました。
+        echo   インターネット接続を確認してください。
+        echo.
+        pause
+        exit /b 1
+    )
+    echo   セットアップ完了!
     echo.
 )
 
-:: Webサーバー起動
+echo   起動中... ブラウザが自動で開きます。
 echo.
-echo ============================================================
-echo   ブラウザで http://localhost:5000 を開いてください
-echo   終了するにはこのウィンドウを閉じるか Ctrl+C を押してください
-echo ============================================================
+echo   ----------------------------------------------------
+echo   終了するには、このウィンドウを閉じてください。
+echo   ----------------------------------------------------
 echo.
 
-:: ブラウザを自動で開く（1秒後）
+:: ブラウザを自動で開く（2秒後）
 start "" cmd /c "timeout /t 2 /nobreak >nul && start http://localhost:5000"
 
 :: Flaskアプリ起動
