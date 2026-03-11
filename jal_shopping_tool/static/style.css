@@ -33,7 +33,7 @@ body {
 a { color: var(--jal-red); text-decoration: none; }
 a:hover { text-decoration: underline; }
 
-.container { max-width: 960px; margin: 0 auto; padding: 0 16px; width: 100%; }
+.container { max-width: 1100px; margin: 0 auto; padding: 0 16px; width: 100%; }
 
 /* === Navbar === */
 .navbar {
@@ -131,14 +131,91 @@ main { flex: 1; padding: 24px 0; }
 .recommend-neutral .recommend-title { color: #e65100; }
 .savings { color: var(--green); font-weight: 700; font-size: 1.1rem; margin-top: 8px; }
 
-/* === Lowest price === */
-.lowest-price { margin: 8px 0; }
-.price-big { font-size: 2rem; font-weight: 700; color: var(--jal-red); }
-.product-name { font-size: 0.95rem; margin: 4px 0; }
-.shop-info { color: var(--gray-600); font-size: 0.85rem; margin-bottom: 8px; }
+/* === Comparison Table === */
+.offers-table-wrap { overflow-x: auto; margin-top: 12px; }
+.comparison-table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
+.comparison-table th {
+    background: var(--jal-dark);
+    color: #fff;
+    padding: 10px 12px;
+    text-align: left;
+    font-weight: 600;
+    white-space: nowrap;
+    font-size: 0.85rem;
+}
+.comparison-table td {
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--gray-200);
+    vertical-align: middle;
+}
+.comparison-table tbody tr:hover { background: var(--gray-50); }
+.comparison-table .best-row { background: #fff3e0; }
+.comparison-table .best-row:hover { background: #ffe0b2; }
+.comparison-table .effective-best-row { background: var(--green-light); }
+.comparison-table .effective-best-row:hover { background: #c8e6c9; }
 
-/* === Offers table === */
-.offers-table-wrap { overflow-x: auto; }
+/* Rank badges */
+.rank-badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+    border-radius: 50%;
+    font-weight: 700;
+    font-size: 0.85rem;
+    background: var(--gray-200);
+    color: var(--gray-600);
+}
+.rank-1 { background: #ffd700; color: #5d4e00; }
+.rank-2 { background: #c0c0c0; color: #444; }
+.rank-3 { background: #cd7f32; color: #fff; }
+
+/* Price cell */
+.price-cell { font-weight: 700; color: var(--jal-red); font-size: 1rem; white-space: nowrap; }
+
+/* Diff display */
+.diff-plus { color: #c62828; font-weight: 600; white-space: nowrap; }
+.diff-plus-lsp { color: var(--green); font-weight: 600; }
+.diff-minus-lsp { color: #c62828; font-weight: 600; }
+
+/* Action links */
+.action-links { display: flex; gap: 4px; flex-wrap: nowrap; }
+
+/* Error text */
+.error-list { margin-top: 12px; }
+.error-text { color: #c62828; }
+
+/* Not found list */
+.not-found-list { display: flex; flex-direction: column; gap: 8px; margin-top: 8px; }
+.not-found-item {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 10px 12px;
+    background: var(--gray-50);
+    border-radius: var(--radius);
+    border: 1px solid var(--gray-200);
+}
+.not-found-name { font-weight: 600; min-width: 140px; }
+.not-found-reason { flex: 1; color: var(--gray-600); }
+
+/* Product details */
+.product-details { display: flex; flex-direction: column; gap: 8px; margin-top: 8px; }
+.product-detail-item {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 10px 12px;
+    border: 1px solid var(--gray-200);
+    border-radius: var(--radius);
+}
+.product-detail-item:hover { background: var(--gray-50); }
+.product-detail-shop { font-weight: 600; min-width: 140px; color: var(--jal-dark); }
+.product-detail-name { flex: 1; font-size: 0.85rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.product-detail-price { font-weight: 700; color: var(--jal-red); white-space: nowrap; }
+
+/* === Legacy tables (shops page) === */
 .offers-table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
 .offers-table th {
     background: var(--gray-100);
@@ -156,23 +233,6 @@ main { flex: 1; padding: 24px 0; }
 .offers-table .best-row { background: #fff3e0; }
 .offers-table .best-row td { font-weight: 600; }
 
-/* === Result list === */
-.result-list { display: flex; flex-direction: column; gap: 8px; }
-.result-item {
-    display: flex;
-    align-items: center;
-    gap: 16px;
-    padding: 12px;
-    border: 1px solid var(--gray-200);
-    border-radius: var(--radius);
-    transition: background 0.15s;
-}
-.result-item:hover { background: var(--gray-50); }
-.result-price { font-size: 1.1rem; font-weight: 700; color: var(--jal-red); min-width: 100px; }
-.result-detail { flex: 1; min-width: 0; }
-.result-name { font-size: 0.9rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.result-shop { color: var(--gray-600); font-size: 0.8rem; margin-top: 2px; }
-
 /* === Badges === */
 .badge {
     display: inline-block;
@@ -183,16 +243,6 @@ main { flex: 1; padding: 24px 0; }
     color: var(--gray-800);
 }
 .badge-green { background: var(--green-light); color: var(--green); font-weight: 600; }
-.source-badge {
-    display: inline-block;
-    padding: 1px 6px;
-    border-radius: 4px;
-    font-size: 0.7rem;
-    font-weight: 600;
-    color: #fff;
-}
-.source-rakuten { background: #bf0000; }
-.source-yahoo { background: #ff0033; }
 
 /* === Buttons === */
 .btn {
@@ -208,7 +258,7 @@ main { flex: 1; padding: 24px 0; }
 }
 .btn:hover { text-decoration: none; }
 .btn-primary { background: var(--jal-red); color: #fff; }
-.btn-primary:hover { background: #a00d24; }
+.btn-primary:hover { background: #a00d24; color: #fff; }
 .btn-outline { border: 1px solid var(--jal-red); color: var(--jal-red); background: transparent; }
 .btn-outline:hover { background: #fff5f5; }
 .btn-small { padding: 4px 10px; font-size: 0.8rem; }
@@ -251,11 +301,13 @@ main { flex: 1; padding: 24px 0; }
 .results-header h1 { font-size: 1.4rem; margin-bottom: 12px; color: var(--jal-dark); }
 
 /* === Responsive === */
-@media (max-width: 600px) {
+@media (max-width: 768px) {
     .hero h1 { font-size: 1.5rem; }
     .search-box { flex-direction: column; }
     .search-box button { width: 100%; }
-    .offers-table { font-size: 0.8rem; }
-    .offers-table th, .offers-table td { padding: 8px 6px; }
-    .result-item { flex-wrap: wrap; }
+    .comparison-table { font-size: 0.8rem; }
+    .comparison-table th, .comparison-table td { padding: 8px 6px; }
+    .not-found-item { flex-wrap: wrap; }
+    .product-detail-item { flex-wrap: wrap; }
+    .product-detail-name { min-width: 100%; order: 3; }
 }

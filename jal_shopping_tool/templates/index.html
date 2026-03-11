@@ -4,7 +4,7 @@
 {% block content %}
 <div class="hero">
     <h1>JAL LSP ショッピング比較</h1>
-    <p class="hero-sub">JALマイレージパーク経由のLSP獲得を考慮して、最もお得な購入先を見つけましょう</p>
+    <p class="hero-sub">JALマイレージパーク提携の全ショップで価格を比較し、LSP獲得込みの最安を見つけます</p>
 
     <form action="{{ url_for('search') }}" method="get" class="search-form">
         <div class="search-box">
@@ -15,23 +15,24 @@
 
     {% if not has_api_keys %}
     <div class="flash flash-warning">
-        APIキーが未設定です。<a href="{{ url_for('settings') }}">設定画面</a>で楽天またはYahoo!ショッピングのAPIキーを登録してください。
+        楽天・Yahoo!のAPIキーが未設定です。APIキーなしでもスクレイピングで多くのショップを検索できますが、
+        楽天・Yahoo!は<a href="{{ url_for('settings') }}">設定画面</a>でAPIキーを登録するとより正確な結果が得られます。
     </div>
     {% endif %}
 </div>
 
 <div class="features">
     <div class="feature-card">
-        <h3>価格比較</h3>
-        <p>楽天市場・Yahoo!ショッピングから最安値を自動検索</p>
+        <h3>全ショップ横断検索</h3>
+        <p>楽天・Yahoo!・Amazon・ビックカメラ・コジマ・ヤマダ・Joshinなど主要ショップを一括検索</p>
     </div>
     <div class="feature-card">
-        <h3>LSP計算</h3>
-        <p>JALマイレージパーク経由で獲得できるマイル・LSPを自動計算</p>
+        <h3>LSP自動計算</h3>
+        <p>各ショップのマイルレートからLSP獲得量を自動計算</p>
     </div>
     <div class="feature-card">
-        <h3>実質価格比較</h3>
-        <p>LSPの価値を差し引いた実質価格で購入先を比較・推奨</p>
+        <h3>実質価格で比較</h3>
+        <p>LSPの価値を差し引いた実質価格で購入先を比較・ランキング表示</p>
     </div>
 </div>
 {% endblock %}

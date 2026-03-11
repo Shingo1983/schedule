@@ -12,135 +12,186 @@
     </form>
 </div>
 
-{% if no_results %}
+{% if analysis.found_count == 0 %}
 <div class="card">
-    <p>商品が見つかりませんでした。検索キーワードを変えてお試しください。</p>
+    <p>どのショップでも商品が見つかりませんでした。検索キーワードを変えてお試しください。</p>
+    {% if errors %}
+    <div class="error-list">
+        <p class="text-small"><strong>エラー詳細:</strong></p>
+        {% for err in errors %}
+        <p class="text-small error-text">{{ err }}</p>
+        {% endfor %}
+    </div>
+    {% endif %}
 </div>
 {% else %}
 
-{# 推奨判定（最上部に目立つように） #}
-{% if analysis.jal_offers %}
+{# === 推奨表示 === #}
+{% if analysis.best_effective and analysis.cheapest %}
 <div class="card recommendation">
-    <h2>購入推奨</h2>
-    {% set best = analysis.best_jal_offer %}
-    {% if best and best.effective_price <= analysis.lowest_price %}
+    <h2>おすすめ</h2>
+    {% if analysis.best_effective.effective_price < analysis.cheapest.price %}
     <div class="recommend-good">
-        <p class="recommend-title">JALマイレージパーク経由がお得!</p>
+        <p class="recommend-title">LSP込みで「{{ analysis.best_effective.shop_name }}」が最もお得!</p>
         <p>
-            <strong>{{ best.shop_name }}</strong> で購入すると、
-            {{ best.lsp_earned | round(1) }} LSP（≒{{ best.lsp_value_yen | currency_float }}相当）を獲得でき、
-            実質価格は <strong>{{ best.effective_price | currency_float }}</strong> になります。
+            最安値は <strong>{{ analysis.cheapest.shop_name }}</strong>（{{ analysis.cheapest.price | currency }}）ですが、
+            LSP獲得を考慮すると <strong>{{ analysis.best_effective.shop_name }}</strong> の実質価格
+            <strong>{{ analysis.best_effective.effective_price | currency_float }}</strong> が最安です。
         </p>
-        {% set savings = analysis.lowest_price - best.effective_price %}
+        {% set savings = analysis.cheapest.price - analysis.best_effective.effective_price %}
         {% if savings > 0 %}
         <p class="savings">最安値より実質 {{ savings | currency_float }} お得!</p>
         {% endif %}
     </div>
-    {% elif best %}
+    {% else %}
     <div class="recommend-neutral">
-        <p class="recommend-title">判断ポイント</p>
+        <p class="recommend-title">最安値: {{ analysis.cheapest.shop_name }}（{{ analysis.cheapest.price | currency }}）</p>
         <p>
-            最安値（{{ analysis.lowest_price | currency }}）に対し、
-            <strong>{{ best.shop_name }}</strong> は {{ best.price_diff_from_lowest | currency }} 高いですが、
-            {{ best.lsp_earned | round(1) }} LSP（≒{{ best.lsp_value_yen | currency_float }}相当）を獲得できます。
+            {{ analysis.cheapest.shop_name }}が最安値です。
+            {% if analysis.cheapest.lsp_earned > 0 %}
+            JALマイレージパーク経由で {{ analysis.cheapest.lsp_earned | round(2) }} LSP も獲得できます。
+            {% endif %}
         </p>
-        {% if best.lsp_value_yen >= best.price_diff_from_lowest %}
-        <p class="recommend-good-text">LSP価値が差額以上なので、JALマイレージパーク経由がお得です。</p>
-        {% else %}
-        <p>差額（{{ best.price_diff_from_lowest | currency }}）がLSP価値（{{ best.lsp_value_yen | currency_float }}）を上回るため、最安ショップが経済的です。</p>
-        <p class="text-small">※ 1 LSPを{{ "¥{:,.0f}".format(best.price_diff_from_lowest / best.lsp_earned) }}以上の価値と考えるなら、JAL経由も検討に値します。</p>
-        {% endif %}
     </div>
     {% endif %}
 </div>
 {% endif %}
 
-{# 最安値 #}
+{# === メイン比較テーブル === #}
 <div class="card">
-    <h2>全検索結果の最安値</h2>
-    {% if analysis.lowest_price_result %}
-    {% set r = analysis.lowest_price_result %}
-    <div class="lowest-price">
-        <span class="price-big">{{ r.price | currency }}</span>
-    </div>
-    <p class="product-name">{{ r.product_name }}</p>
-    <p class="shop-info">
-        {% if r.source == 'rakuten' %}楽天市場{% elif r.source == 'yahoo' %}Yahoo!ショッピング{% else %}{{ r.source }}{% endif %}
-        - {{ r.shop_name }}
+    <h2>全ショップ比較（価格順）</h2>
+    <p class="text-small">
+        {{ analysis.found_count }}/{{ analysis.total_count }}ショップで商品が見つかりました
+        ・1 LSP = {{ config.lsp_value_yen }}円として計算（<a href="{{ url_for('settings') }}">変更</a>）
     </p>
-    <a href="{{ r.shop_url }}" target="_blank" rel="noopener" class="btn btn-outline">商品ページを開く</a>
-    {% endif %}
-</div>
-
-{# JALマイレージパーク経由オファー #}
-{% if analysis.jal_offers %}
-<div class="card">
-    <h2>JALマイレージパーク経由の比較</h2>
-    <p class="text-small">1 LSP = {{ config.lsp_value_yen }}円として計算（<a href="{{ url_for('settings') }}">変更</a>）</p>
 
     <div class="offers-table-wrap">
-        <table class="offers-table">
+        <table class="offers-table comparison-table">
             <thead>
                 <tr>
-                    <th>ショップ</th>
-                    <th>価格</th>
-                    <th>最安との差</th>
-                    <th>獲得マイル</th>
-                    <th>獲得LSP</th>
-                    <th>LSP価値</th>
-                    <th>実質価格</th>
-                    <th>JAL経由</th>
+                    <th class="col-rank">#</th>
+                    <th class="col-shop">ショップ</th>
+                    <th class="col-price">最安値</th>
+                    <th class="col-diff">1位との差</th>
+                    <th class="col-rate">マイルレート</th>
+                    <th class="col-lsp">獲得LSP</th>
+                    <th class="col-lsp-diff">LSP差</th>
+                    <th class="col-effective">実質価格</th>
+                    <th class="col-action">リンク</th>
                 </tr>
             </thead>
             <tbody>
-                {% for offer in analysis.jal_offers %}
-                <tr{% if offer == analysis.best_jal_offer %} class="best-row"{% endif %}>
-                    <td>
-                        <strong>{{ offer.shop_name }}</strong>
-                        <span class="text-small block">{{ offer.jal_shop.mile_rate_desc }}</span>
-                    </td>
-                    <td>{{ offer.price | currency }}</td>
-                    <td>
-                        {% if offer.price_diff_from_lowest == 0 %}
-                        <span class="badge badge-green">最安</span>
+                {% set rank = namespace(n=0) %}
+                {% for c in analysis.comparisons %}
+                {% if c.price is not none and c.price > 0 %}
+                {% set rank.n = rank.n + 1 %}
+                <tr class="{% if c.is_cheapest %}best-row{% endif %}{% if c == analysis.best_effective and not c.is_cheapest %} effective-best-row{% endif %}">
+                    <td class="col-rank">
+                        {% if rank.n == 1 %}
+                        <span class="rank-badge rank-1">1</span>
+                        {% elif rank.n == 2 %}
+                        <span class="rank-badge rank-2">2</span>
+                        {% elif rank.n == 3 %}
+                        <span class="rank-badge rank-3">3</span>
                         {% else %}
-                        +{{ offer.price_diff_from_lowest | currency }}
+                        <span class="rank-badge">{{ rank.n }}</span>
                         {% endif %}
                     </td>
-                    <td>{{ offer.miles_earned }}マイル</td>
-                    <td><strong>{{ offer.lsp_earned | round(1) }}</strong></td>
-                    <td>{{ offer.lsp_value_yen | currency_float }}</td>
-                    <td><strong>{{ offer.effective_price | currency_float }}</strong></td>
-                    <td><a href="{{ offer.jal_shop.url }}" target="_blank" rel="noopener" class="btn btn-small">経由する</a></td>
+                    <td class="col-shop">
+                        <strong>{{ c.shop_name }}</strong>
+                    </td>
+                    <td class="col-price price-cell">{{ c.price | currency }}</td>
+                    <td class="col-diff">
+                        {% if c.is_cheapest %}
+                        <span class="badge badge-green">最安</span>
+                        {% else %}
+                        <span class="diff-plus">+{{ c.price_diff | currency }}</span>
+                        {% endif %}
+                    </td>
+                    <td class="col-rate">
+                        <span class="text-small">{{ c.mile_rate_desc }}</span>
+                    </td>
+                    <td class="col-lsp">
+                        <strong>{{ c.lsp_earned | round(2) }}</strong>
+                    </td>
+                    <td class="col-lsp-diff">
+                        {% if c.lsp_diff > 0 %}
+                        <span class="diff-plus-lsp">+{{ c.lsp_diff | round(2) }}</span>
+                        {% elif c.lsp_diff < 0 %}
+                        <span class="diff-minus-lsp">{{ c.lsp_diff | round(2) }}</span>
+                        {% else %}
+                        -
+                        {% endif %}
+                    </td>
+                    <td class="col-effective">
+                        <strong>{{ c.effective_price | currency_float }}</strong>
+                    </td>
+                    <td class="col-action">
+                        <div class="action-links">
+                            {% if c.jal_url %}
+                            <a href="{{ c.jal_url }}" target="_blank" rel="noopener" class="btn btn-small btn-primary" title="JALマイレージパーク経由">JAL経由</a>
+                            {% endif %}
+                            <a href="{{ c.search_url }}" target="_blank" rel="noopener" class="btn btn-small btn-outline" title="ショップで検索結果を確認">確認</a>
+                        </div>
+                    </td>
                 </tr>
+                {% endif %}
                 {% endfor %}
             </tbody>
         </table>
     </div>
 </div>
-{% endif %}
 
-{# 価格順一覧 #}
+{# === 商品が見つからなかったショップ === #}
+{% set not_found = [] %}
+{% for c in analysis.comparisons %}
+{% if c.price is none or c.price == 0 %}
+{% if not_found.append(c) %}{% endif %}
+{% endif %}
+{% endfor %}
+
+{% if not_found %}
 <div class="card">
-    <h2>検索結果一覧（価格順）</h2>
-    <div class="result-list">
-        {% for r in analysis.all_results[:20] %}
-        <div class="result-item">
-            <div class="result-price">{{ r.price | currency }}</div>
-            <div class="result-detail">
-                <p class="result-name">{{ r.product_name }}</p>
-                <p class="result-shop">
-                    <span class="source-badge source-{{ r.source }}">
-                        {% if r.source == 'rakuten' %}楽天{% elif r.source == 'yahoo' %}Yahoo!{% else %}{{ r.source }}{% endif %}
-                    </span>
-                    {{ r.shop_name }}
-                </p>
-            </div>
-            <a href="{{ r.shop_url }}" target="_blank" rel="noopener" class="btn btn-outline btn-small">開く</a>
+    <h2>取得できなかったショップ</h2>
+    <p class="text-small">以下のショップでは自動取得できませんでした。リンクから手動で確認できます。</p>
+    <div class="not-found-list">
+        {% for c in not_found %}
+        <div class="not-found-item">
+            <span class="not-found-name">{{ c.shop_name }}</span>
+            <span class="not-found-reason text-small">
+                {% if c.error %}{{ c.error }}{% else %}商品が見つかりませんでした{% endif %}
+            </span>
+            {% if c.search_url %}
+            <a href="{{ c.search_url }}" target="_blank" rel="noopener" class="btn btn-small btn-outline">手動で検索</a>
+            {% endif %}
         </div>
         {% endfor %}
     </div>
 </div>
+{% endif %}
+
+{# === 各ショップの最安商品名 === #}
+{% set found = [] %}
+{% for c in analysis.comparisons if c.price is not none and c.price > 0 and c.product_name %}
+{% if found.append(c) %}{% endif %}
+{% endfor %}
+{% if found %}
+<div class="card">
+    <h2>各ショップの最安商品</h2>
+    <div class="product-details">
+        {% for c in found %}
+        <div class="product-detail-item">
+            <div class="product-detail-shop">{{ c.shop_name }}</div>
+            <div class="product-detail-name">{{ c.product_name }}</div>
+            <div class="product-detail-price">{{ c.price | currency }}</div>
+            {% if c.product_url %}
+            <a href="{{ c.product_url }}" target="_blank" rel="noopener" class="btn btn-small btn-outline">商品ページ</a>
+            {% endif %}
+        </div>
+        {% endfor %}
+    </div>
+</div>
+{% endif %}
 
 {% endif %}
 {% endblock %}

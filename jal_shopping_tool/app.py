@@ -7,7 +7,7 @@ from flask import Flask, render_template, request, redirect, url_for, flash
 from .analyzer import analyze
 from .config import Config
 from .jal_shops import get_shops
-from .price_search import search_all
+from .price_search import search_all_sites
 
 
 def create_app() -> Flask:
@@ -27,32 +27,20 @@ def create_app() -> Flask:
         if not query:
             return redirect(url_for("index"))
 
-        if not config.rakuten_app_id and not config.yahoo_app_id:
-            flash("APIキーが設定されていません。先に設定画面で登録してください。", "error")
-            return redirect(url_for("settings"))
+        # 全ショップを検索
+        shop_prices = search_all_sites(query, config)
 
-        max_results = int(request.args.get("n", 10))
-        response = search_all(query, config, max_results=max_results)
+        # エラー一覧（画面表示用）
+        errors = [sp.error for sp in shop_prices if sp.error]
 
-        # APIエラーがあればブラウザに表示
-        for err in response.errors:
-            flash(err, "error")
+        # 分析
+        analysis = analyze(query, shop_prices, config)
 
-        if not response.results:
-            return render_template(
-                "results.html",
-                query=query,
-                analysis=None,
-                no_results=True,
-                config=config,
-            )
-
-        analysis = analyze(query, response.results, config)
         return render_template(
             "results.html",
             query=query,
             analysis=analysis,
-            no_results=False,
+            errors=errors,
             config=config,
         )
 

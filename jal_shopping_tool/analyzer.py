@@ -1,148 +1,137 @@
 """価格比較・LSP分析モジュール
 
-検索結果を分析し、最安値・JALマイレージパーク経由の価格・LSP獲得量を
-比較してユーザーの意思決定を支援する。
+各ショップの最安値を基に、LSP獲得量を計算し、
+全サイトの最安値からの差額を含めた比較一覧を生成する。
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from .config import Config, MILES_PER_LSP
-from .jal_shops import JalShop, get_shops, get_shop_for_store
-from .price_search import SearchResult
+from .jal_shops import JalShop, get_shops
+from .site_scrapers import ShopPrice
 
 
 @dataclass
-class JalShopOffer:
-    """JALマイレージパーク経由で購入した場合の情報"""
+class ShopComparison:
+    """1ショップの比較データ"""
 
-    jal_shop: JalShop
-    search_result: SearchResult
-    miles_earned: int
-    lsp_earned: float
-    lsp_value_yen: float  # LSP獲得分の金銭的価値（ユーザー設定のレート）
-    effective_price: float  # 実質価格 = 商品価格 - LSP価値
-    price_diff_from_lowest: int  # 全ネット最安値との差額
+    shop_name: str
+    jal_shop: JalShop | None  # JALマイレージパーク掲載情報
+    price: int | None  # 最安値（Noneなら取得失敗）
+    product_name: str
+    product_url: str
+    search_url: str
+    error: str | None
+
+    # 以下はprice != Noneの場合のみ有効
+    miles_earned: int = 0
+    lsp_earned: float = 0.0
+    lsp_value_yen: float = 0.0
+    effective_price: float = 0.0  # 実質価格 = price - LSP価値
+
+    # 全サイト最安値との比較
+    price_diff: int = 0  # 最安値との価格差
+    lsp_diff: float = 0.0  # 最安値ショップとのLSP差
+    is_cheapest: bool = False
 
     @property
-    def price(self) -> int:
-        return self.search_result.price
+    def jal_url(self) -> str:
+        """JALマイレージパーク経由URL"""
+        if self.jal_shop:
+            return self.jal_shop.url
+        return ""
 
     @property
-    def shop_name(self) -> str:
-        return self.jal_shop.name
+    def mile_rate_desc(self) -> str:
+        if self.jal_shop:
+            return self.jal_shop.mile_rate_desc
+        return "不明"
 
     @property
-    def product_name(self) -> str:
-        return self.search_result.product_name
+    def yen_per_mile(self) -> int:
+        if self.jal_shop:
+            return self.jal_shop.yen_per_mile
+        return 0
 
 
 @dataclass
 class AnalysisResult:
-    """分析結果"""
+    """全ショップ比較の分析結果"""
 
     query: str
-    lowest_price_result: SearchResult | None
-    all_results: list[SearchResult]
-    jal_offers: list[JalShopOffer]
-    jal_shops_without_product: list[JalShop]  # 商品が見つからなかったJALショップ
+    comparisons: list[ShopComparison]  # 価格順にソート済
+    cheapest: ShopComparison | None
+    best_effective: ShopComparison | None  # 実質価格が最安のショップ
 
     @property
-    def lowest_price(self) -> int | None:
-        if self.lowest_price_result:
-            return self.lowest_price_result.price
-        return None
+    def found_count(self) -> int:
+        """商品が見つかったショップ数"""
+        return sum(1 for c in self.comparisons if c.price is not None)
 
     @property
-    def best_jal_offer(self) -> JalShopOffer | None:
-        """実質価格が最も安いJALショップオファー"""
-        if not self.jal_offers:
-            return None
-        return min(self.jal_offers, key=lambda o: o.effective_price)
-
-    @property
-    def best_lsp_offer(self) -> JalShopOffer | None:
-        """LSP獲得量が最も多いJALショップオファー"""
-        if not self.jal_offers:
-            return None
-        return max(self.jal_offers, key=lambda o: o.lsp_earned)
+    def total_count(self) -> int:
+        return len(self.comparisons)
 
 
 def analyze(
     query: str,
-    search_results: list[SearchResult],
+    shop_prices: list[ShopPrice],
     config: Config,
 ) -> AnalysisResult:
-    """検索結果を分析してLSP獲得込みの比較を行う"""
+    """各ショップの検索結果を分析してLSP込みの比較を行う"""
     jal_shops = get_shops()
+    jal_shop_map = {s.name: s for s in jal_shops}
 
-    # 全ネット最安値
-    lowest = min(search_results, key=lambda r: r.price) if search_results else None
-    lowest_price = lowest.price if lowest else 0
+    comparisons: list[ShopComparison] = []
 
-    # JALマイレージパーク掲載ショップに該当する検索結果を探す
-    jal_offers: list[JalShopOffer] = []
-    matched_shop_names: set[str] = set()
+    for sp in shop_prices:
+        jal_shop = jal_shop_map.get(sp.shop_name)
 
-    for result in search_results:
-        # 検索結果のショップ名からJALマイレージパーク掲載ショップを特定
-        jal_shop = _match_result_to_jal_shop(result, jal_shops)
-        if jal_shop and jal_shop.name not in matched_shop_names:
-            matched_shop_names.add(jal_shop.name)
-            miles = jal_shop.calc_miles(result.price)
-            lsp = jal_shop.calc_lsp(result.price)
-            lsp_value = lsp * config.lsp_value_yen
-            effective_price = result.price - lsp_value
+        comp = ShopComparison(
+            shop_name=sp.shop_name,
+            jal_shop=jal_shop,
+            price=sp.price,
+            product_name=sp.product_name,
+            product_url=sp.product_url,
+            search_url=sp.search_url,
+            error=sp.error,
+        )
 
-            jal_offers.append(
-                JalShopOffer(
-                    jal_shop=jal_shop,
-                    search_result=result,
-                    miles_earned=miles,
-                    lsp_earned=lsp,
-                    lsp_value_yen=lsp_value,
-                    effective_price=effective_price,
-                    price_diff_from_lowest=result.price - lowest_price,
-                )
-            )
+        if sp.price is not None and sp.price > 0 and jal_shop:
+            comp.miles_earned = jal_shop.calc_miles(sp.price)
+            comp.lsp_earned = jal_shop.calc_lsp(sp.price)
+            comp.lsp_value_yen = comp.lsp_earned * config.lsp_value_yen
+            comp.effective_price = sp.price - comp.lsp_value_yen
 
-    # JALマイレージパーク掲載だが商品が見つからなかったショップ
-    # （主要ショップのみ表示）
-    major_sources = {"rakuten": "楽天市場", "yahoo": "Yahoo!ショッピング"}
-    jal_shops_without = []
-    for shop in jal_shops:
-        if shop.name not in matched_shop_names:
-            # 楽天・Yahoo!以外で、掲載があるが検索結果に出ない場合
-            jal_shops_without.append(shop)
+        comparisons.append(comp)
 
-    # JALオファーを実質価格順にソート
-    jal_offers.sort(key=lambda o: o.effective_price)
+    # 価格が取得できたショップだけで最安値を特定
+    priced = [c for c in comparisons if c.price is not None and c.price > 0]
+
+    cheapest = None
+    best_effective = None
+
+    if priced:
+        cheapest = min(priced, key=lambda c: c.price)
+        cheapest.is_cheapest = True
+        cheapest_price = cheapest.price
+
+        # 実質価格が最安のショップ
+        best_effective = min(priced, key=lambda c: c.effective_price)
+
+        # 各ショップの差分を計算
+        for c in priced:
+            c.price_diff = c.price - cheapest_price
+            c.lsp_diff = c.lsp_earned - cheapest.lsp_earned
+
+    # ソート: 価格取得済みを価格順 → 取得失敗を末尾
+    priced.sort(key=lambda c: c.price)
+    no_price = [c for c in comparisons if c.price is None or c.price == 0]
+    sorted_comparisons = priced + no_price
 
     return AnalysisResult(
         query=query,
-        lowest_price_result=lowest,
-        all_results=search_results,
-        jal_offers=jal_offers,
-        jal_shops_without_product=jal_shops_without,
+        comparisons=sorted_comparisons,
+        cheapest=cheapest,
+        best_effective=best_effective,
     )
-
-
-def _match_result_to_jal_shop(
-    result: SearchResult, jal_shops: list[JalShop]
-) -> JalShop | None:
-    """検索結果をJALマイレージパーク掲載ショップとマッチさせる
-
-    楽天市場・Yahoo!ショッピングの検索結果はそれぞれのモール全体に対応する。
-    """
-    if result.source == "rakuten":
-        # 楽天市場の検索結果 → JALマイレージパークの「楽天市場」に紐づけ
-        for shop in jal_shops:
-            if shop.name == "楽天市場":
-                return shop
-    elif result.source == "yahoo":
-        # Yahoo!ショッピングの検索結果 → JALマイレージパークの「Yahoo!ショッピング」
-        for shop in jal_shops:
-            if shop.name == "Yahoo!ショッピング":
-                return shop
-
-    # 個別ショップのマッチング（ストア名ベース）
-    return get_shop_for_store(result.shop_name, jal_shops)
