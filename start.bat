@@ -1,61 +1,62 @@
 @echo off
-chcp 65001 >nul 2>&1
-title JAL LSP ショッピング比較ツール
-
-:: このbatファイルがあるフォルダに移動
 cd /d "%~dp0"
+title JAL Shopping Tool
 
 echo.
 echo   ====================================================
-echo    JAL LSP ショッピング比較ツール
+echo    JAL LSP Shopping Comparison Tool
 echo   ====================================================
 echo.
 
-:: Pythonの存在確認
+:: Check Python
 python --version >nul 2>&1
 if errorlevel 1 (
-    echo   [エラー] Pythonがインストールされていません。
+    echo   [ERROR] Python is not installed.
     echo.
-    echo   以下のページからPythonをインストールしてください:
+    echo   Please install Python from:
     echo   https://www.python.org/downloads/
     echo.
-    echo   インストール時に「Add Python to PATH」に
-    echo   チェックを入れるのを忘れないでください!
+    echo   IMPORTANT: Check "Add python.exe to PATH" during install!
     echo.
-    echo   インストール後、このファイルをもう一度ダブルクリックしてください。
+    echo   After installing, double-click this file again.
     echo.
     pause
     exit /b 1
 )
 
-:: 依存パッケージの自動インストール（初回のみ）
+echo   Python OK
+echo.
+
+:: Install packages (first time only)
 python -c "import flask" >nul 2>&1
 if errorlevel 1 (
-    echo   初回セットアップ中です。少々お待ちください...
+    echo   Installing required packages (first time only)...
     echo.
-    pip install requests flask >nul 2>&1
+    pip install requests flask
     if errorlevel 1 (
-        echo   [エラー] パッケージのインストールに失敗しました。
-        echo   インターネット接続を確認してください。
+        echo.
+        echo   [ERROR] Package install failed.
+        echo   Please check your internet connection.
         echo.
         pause
         exit /b 1
     )
-    echo   セットアップ完了!
+    echo.
+    echo   Setup complete!
     echo.
 )
 
-echo   起動中... ブラウザが自動で開きます。
+echo   Starting... Your browser will open automatically.
 echo.
 echo   ----------------------------------------------------
-echo   終了するには、このウィンドウを閉じてください。
+echo   To stop: close this window or press Ctrl+C
 echo   ----------------------------------------------------
 echo.
 
-:: ブラウザを自動で開く（2秒後）
+:: Open browser after 2 seconds
 start "" cmd /c "timeout /t 2 /nobreak >nul && start http://localhost:5000"
 
-:: Flaskアプリ起動
+:: Start Flask app
 python -m jal_shopping_tool web
 
 pause
