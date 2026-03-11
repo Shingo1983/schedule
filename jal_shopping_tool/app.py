@@ -32,9 +32,13 @@ def create_app() -> Flask:
             return redirect(url_for("settings"))
 
         max_results = int(request.args.get("n", 10))
-        results = search_all(query, config, max_results=max_results)
+        response = search_all(query, config, max_results=max_results)
 
-        if not results:
+        # APIエラーがあればブラウザに表示
+        for err in response.errors:
+            flash(err, "error")
+
+        if not response.results:
             return render_template(
                 "results.html",
                 query=query,
@@ -43,7 +47,7 @@ def create_app() -> Flask:
                 config=config,
             )
 
-        analysis = analyze(query, results, config)
+        analysis = analyze(query, response.results, config)
         return render_template(
             "results.html",
             query=query,

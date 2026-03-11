@@ -1,7 +1,7 @@
 """価格検索モジュール - 楽天市場API・Yahoo!ショッピングAPI連携"""
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import requests
 
@@ -24,15 +24,23 @@ class SearchResult:
         return f"¥{self.price:,}"
 
 
+@dataclass
+class SearchResponse:
+    """検索結果とエラー情報をまとめて返す"""
+
+    results: list[SearchResult] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
+
+
 def search_rakuten(
     query: str, config: Config, max_results: int = 10
-) -> list[SearchResult]:
+) -> SearchResponse:
     """楽天市場商品検索API で商品を検索する
 
     API: https://webservice.rakuten.co.jp/documentation/ichiba-item-search
     """
     if not config.rakuten_app_id:
-        return []
+        return SearchResponse()
 
     url = "https://app.rakuten.co.jp/services/api/IchibaItem/Search/20220601"
     params = {
@@ -45,11 +53,28 @@ def search_rakuten(
 
     try:
         resp = requests.get(url, params=params, timeout=10)
-        resp.raise_for_status()
+        if resp.status_code != 200:
+            try:
+                err_data = resp.json()
+                err_msg = err_data.get("error_description", err_data.get("error", resp.text[:200]))
+            except ValueError:
+                err_msg = resp.text[:200]
+            msg = f"楽天API エラー (HTTP {resp.status_code}): {err_msg}"
+            print(f"  [{msg}]")
+            return SearchResponse(errors=[msg])
         data = resp.json()
+    except requests.ConnectionError:
+        msg = "楽天API: インターネットに接続できません"
+        print(f"  [{msg}]")
+        return SearchResponse(errors=[msg])
+    except requests.Timeout:
+        msg = "楽天API: 応答がありません（タイムアウト）"
+        print(f"  [{msg}]")
+        return SearchResponse(errors=[msg])
     except (requests.RequestException, ValueError) as e:
-        print(f"  [楽天API エラー] {e}")
-        return []
+        msg = f"楽天API エラー: {e}"
+        print(f"  [{msg}]")
+        return SearchResponse(errors=[msg])
 
     results = []
     for item_wrapper in data.get("Items", []):
@@ -65,18 +90,18 @@ def search_rakuten(
                 source="rakuten",
             )
         )
-    return results
+    return SearchResponse(results=results)
 
 
 def search_yahoo(
     query: str, config: Config, max_results: int = 10
-) -> list[SearchResult]:
+) -> SearchResponse:
     """Yahoo!ショッピング商品検索API v3 で商品を検索する
 
     API: https://developer.yahoo.co.jp/webapi/shopping/v3/itemsearch.html
     """
     if not config.yahoo_app_id:
-        return []
+        return SearchResponse()
 
     url = "https://shopping.yahooapis.jp/ShoppingWebService/V3/itemSearch"
     params = {
@@ -89,11 +114,28 @@ def search_yahoo(
 
     try:
         resp = requests.get(url, params=params, timeout=10)
-        resp.raise_for_status()
+        if resp.status_code != 200:
+            try:
+                err_data = resp.json()
+                err_msg = err_data.get("Message", err_data.get("error", resp.text[:200]))
+            except ValueError:
+                err_msg = resp.text[:200]
+            msg = f"Yahoo!ショッピングAPI エラー (HTTP {resp.status_code}): {err_msg}"
+            print(f"  [{msg}]")
+            return SearchResponse(errors=[msg])
         data = resp.json()
+    except requests.ConnectionError:
+        msg = "Yahoo!ショッピングAPI: インターネットに接続できません"
+        print(f"  [{msg}]")
+        return SearchResponse(errors=[msg])
+    except requests.Timeout:
+        msg = "Yahoo!ショッピングAPI: 応答がありません（タイムアウト）"
+        print(f"  [{msg}]")
+        return SearchResponse(errors=[msg])
     except (requests.RequestException, ValueError) as e:
-        print(f"  [Yahoo!ショッピングAPI エラー] {e}")
-        return []
+        msg = f"Yahoo!ショッピングAPI エラー: {e}"
+        print(f"  [{msg}]")
+        return SearchResponse(errors=[msg])
 
     results = []
     for hit in data.get("hits", []):
@@ -110,25 +152,28 @@ def search_yahoo(
                 source="yahoo",
             )
         )
-    return results
+    return SearchResponse(results=results)
 
 
 def search_all(
     query: str, config: Config, max_results: int = 10
-) -> list[SearchResult]:
+) -> SearchResponse:
     """全ソースから商品を検索し、価格順にソートして返す"""
     all_results = []
+    all_errors = []
 
     # 楽天
-    rakuten_results = search_rakuten(query, config, max_results)
-    all_results.extend(rakuten_results)
+    rakuten_resp = search_rakuten(query, config, max_results)
+    all_results.extend(rakuten_resp.results)
+    all_errors.extend(rakuten_resp.errors)
 
     # Yahoo!ショッピング（楽天APIのレート制限対応で1秒待つ）
     if config.rakuten_app_id and config.yahoo_app_id:
         time.sleep(1)
-    yahoo_results = search_yahoo(query, config, max_results)
-    all_results.extend(yahoo_results)
+    yahoo_resp = search_yahoo(query, config, max_results)
+    all_results.extend(yahoo_resp.results)
+    all_errors.extend(yahoo_resp.errors)
 
     # 価格順にソート
     all_results.sort(key=lambda r: r.price)
-    return all_results
+    return SearchResponse(results=all_results, errors=all_errors)
