@@ -295,6 +295,16 @@ main { flex: 1; padding: 24px 0; }
 /* === Utility === */
 .text-small { font-size: 0.85rem; color: var(--gray-600); }
 .block { display: block; }
+.shop-note {
+    font-size: 0.75rem;
+    color: #e65100;
+    background: #fff3e0;
+    padding: 2px 6px;
+    border-radius: 3px;
+    display: inline-block;
+    margin-top: 2px;
+    line-height: 1.4;
+}
 
 /* === Results header === */
 .results-header { margin-bottom: 20px; }

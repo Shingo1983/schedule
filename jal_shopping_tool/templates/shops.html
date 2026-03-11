@@ -3,7 +3,7 @@
 
 {% block content %}
 <h1>JALマイレージパーク LSP対象ショップ一覧</h1>
-<p>獲得マイル100マイルにつき1 LSPとして積算されます。</p>
+<p>獲得マイル100マイルにつき1 LSPとして積算されます。全{{ shops | length }}ショップ対応。</p>
 
 <div class="card">
     <div class="offers-table-wrap">
@@ -20,7 +20,12 @@
             <tbody>
                 {% for shop in shops %}
                 <tr>
-                    <td><strong>{{ shop.name }}</strong></td>
+                    <td>
+                        <strong>{{ shop.name }}</strong>
+                        {% if shop.note %}
+                        <br><span class="shop-note">{{ shop.note }}</span>
+                        {% endif %}
+                    </td>
                     <td>{{ shop.mile_rate_desc }}</td>
                     <td><span class="badge">{{ shop.category }}</span></td>
                     <td>

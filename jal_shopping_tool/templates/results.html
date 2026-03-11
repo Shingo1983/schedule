@@ -99,6 +99,9 @@
                     </td>
                     <td class="col-shop">
                         <strong>{{ c.shop_name }}</strong>
+                        {% if c.jal_shop and c.jal_shop.note %}
+                        <br><span class="shop-note">{{ c.jal_shop.note }}</span>
+                        {% endif %}
                     </td>
                     <td class="col-price price-cell">{{ c.price | currency }}</td>
                     <td class="col-diff">
@@ -142,7 +145,7 @@
     </div>
 </div>
 
-{# === 商品が見つからなかったショップ === #}
+{# === 自動取得できなかったショップ === #}
 {% set not_found = [] %}
 {% for c in analysis.comparisons %}
 {% if c.price is none or c.price == 0 %}
@@ -164,6 +167,30 @@
             {% if c.search_url %}
             <a href="{{ c.search_url }}" target="_blank" rel="noopener" class="btn btn-small btn-outline">手動で検索</a>
             {% endif %}
+        </div>
+        {% endfor %}
+    </div>
+</div>
+{% endif %}
+
+{# === 手動検索ショップ（スクレイパー未対応） === #}
+{% if manual_shops %}
+<div class="card">
+    <h2>その他の提携ショップ（手動検索）</h2>
+    <p class="text-small">以下のショップはJALマイレージパーク提携ですが、自動検索には未対応です。リンクから手動で検索できます。</p>
+    <div class="not-found-list">
+        {% for ms in manual_shops %}
+        <div class="not-found-item">
+            <span class="not-found-name">{{ ms.name }}</span>
+            <span class="not-found-reason text-small">
+                {{ ms.mile_rate_desc }} ・ {{ ms.category }}
+            </span>
+            <div class="action-links">
+                {% if ms.search_url %}
+                <a href="{{ ms.search_url }}" target="_blank" rel="noopener" class="btn btn-small btn-outline">検索する</a>
+                {% endif %}
+                <a href="{{ ms.jal_url }}" target="_blank" rel="noopener" class="btn btn-small btn-primary" title="JALマイレージパーク経由">JAL経由</a>
+            </div>
         </div>
         {% endfor %}
     </div>

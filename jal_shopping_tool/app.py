@@ -6,8 +6,9 @@ from flask import Flask, render_template, request, redirect, url_for, flash
 
 from .analyzer import analyze
 from .config import Config
-from .jal_shops import get_shops
+from .jal_shops import get_shops, SHOP_CACHE_FILE
 from .price_search import search_all_sites
+from .site_scrapers import MANUAL_SEARCH_SHOPS
 
 
 def create_app() -> Flask:
@@ -36,12 +37,28 @@ def create_app() -> Flask:
         # 分析
         analysis = analyze(query, shop_prices, config)
 
+        # 手動検索ショップのURL生成
+        jal_shops = get_shops()
+        jal_shop_map = {s.name: s for s in jal_shops}
+        manual_shops = []
+        for name in MANUAL_SEARCH_SHOPS:
+            shop = jal_shop_map.get(name)
+            if shop:
+                manual_shops.append({
+                    "name": name,
+                    "search_url": shop.get_search_url(query),
+                    "jal_url": shop.url,
+                    "mile_rate_desc": shop.mile_rate_desc,
+                    "category": shop.category,
+                })
+
         return render_template(
             "results.html",
             query=query,
             analysis=analysis,
             errors=errors,
             config=config,
+            manual_shops=manual_shops,
         )
 
     @app.route("/shops")
