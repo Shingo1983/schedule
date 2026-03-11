@@ -63,11 +63,12 @@
 
 1. ブラウザのアドレスバー（上のURLが表示されるところ）に以下をコピペしてEnterキーを押す
    ```
-   https://github.com/Shingo1983/schedule/archive/refs/heads/main.zip
+   https://github.com/Shingo1983/schedule/archive/refs/heads/claude/jal-points-shopping-tool-iTAdq.zip
    ```
+   （長いですが、全部コピーしてください）
    → 自動でダウンロードが始まります（ボタンを探す必要はありません！）
 
-2. ダウンロードされたファイル（schedule-main.zip）を探す
+2. ダウンロードされたファイル（schedule-claude-jal-points-shopping-tool-iTAdq.zip）を探す
    - **Chrome の場合**: 画面の右上にダウンロード表示が出る
    - **Edge の場合**: 画面の右上にダウンロード表示が出る
    - 見つからない場合: キーボードの **Ctrl+J** を押すとダウンロード一覧が開く
