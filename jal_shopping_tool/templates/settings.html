@@ -6,11 +6,19 @@
 
 <form method="post" class="settings-form">
     <div class="card">
-        <h2>楽天市場 API</h2>
-        <p class="text-small">
-            <a href="https://webservice.rakuten.co.jp/" target="_blank" rel="noopener">Rakuten Developers</a>
-            でアプリを登録し、アプリケーションIDを取得してください（無料）。
-        </p>
+        <h2>楽天市場 API <span class="text-small">（必須）</span></h2>
+        <details class="text-small" style="margin-bottom: 1rem; cursor: pointer;">
+            <summary><strong>取得方法を見る（5分・無料）</strong></summary>
+            <ol style="margin-top: 0.5rem; line-height: 1.8;">
+                <li><a href="https://webservice.rakuten.co.jp/" target="_blank" rel="noopener">Rakuten Developers</a> を開く</li>
+                <li>楽天IDでログイン（なければ新規登録・無料）</li>
+                <li>右上の <strong>「+アプリID発行」</strong> をクリック</li>
+                <li>アプリ名: <strong>価格比較</strong>（何でもOK）</li>
+                <li>アプリURL: <strong>http://localhost</strong>（何でもOK）</li>
+                <li>「規約に同意して新規アプリを作成」をクリック</li>
+                <li>表示された <strong>「アプリID/デベロッパーID」</strong> をコピーして下の欄に貼り付け</li>
+            </ol>
+        </details>
         <div class="form-group">
             <label for="rakuten_app_id">アプリケーションID</label>
             <input type="text" id="rakuten_app_id" name="rakuten_app_id"
@@ -23,11 +31,24 @@
     </div>
 
     <div class="card">
-        <h2>Yahoo!ショッピング API</h2>
+        <h2>Yahoo!ショッピング API <span class="text-small">（任意 - なくても使えます）</span></h2>
         <p class="text-small">
-            <a href="https://developer.yahoo.co.jp/webapi/shopping/" target="_blank" rel="noopener">Yahoo!デベロッパーネットワーク</a>
-            でアプリを登録し、Client IDを取得してください（無料）。
+            Yahoo!ショッピングの価格も比較したい場合に設定します。楽天だけでも使えます。
         </p>
+        <details class="text-small" style="margin-bottom: 1rem; cursor: pointer;">
+            <summary><strong>取得方法を見る（5分・無料）</strong></summary>
+            <ol style="margin-top: 0.5rem; line-height: 1.8;">
+                <li><a href="https://e.developer.yahoo.co.jp/register" target="_blank" rel="noopener">Yahoo!デベロッパー アプリ登録ページ</a> を開く</li>
+                <li>Yahoo! JAPAN IDでログイン</li>
+                <li>「アプリケーションの種類」→ <strong>サーバーサイド</strong> を選択</li>
+                <li>「アプリケーション名」→ <strong>価格比較</strong>（何でもOK）</li>
+                <li>「サイトURL」→ <strong>http://localhost</strong>（何でもOK）</li>
+                <li>メールアドレスを入力</li>
+                <li>ガイドラインに同意して「確認」→「登録」</li>
+                <li>表示された <strong>「Client ID」</strong> をコピーして下の欄に貼り付け</li>
+            </ol>
+            <p>※「シークレット」は使いません。「Client ID」だけでOKです。</p>
+        </details>
         <div class="form-group">
             <label for="yahoo_app_id">Client ID（アプリケーションID）</label>
             <input type="text" id="yahoo_app_id" name="yahoo_app_id"
