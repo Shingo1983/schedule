@@ -155,10 +155,11 @@ http://localhost:5000
    ```
    アプリ名:       価格比較（何でもOK）
    アプリURL:      http://localhost
-   許可されたWebサイト: localhost
+   許可されたWebサイト: localhost.localdomain
    ```
    > **「許可されたWebサイト」** が必須になっています。
-   > ここには **`localhost`** とだけ入力すればOKです。
+   > ここには **`localhost.localdomain`** と入力してください。
+   > （`localhost` だけだとエラーになります）
    > （このツールはパソコン上で動くので、localhostで問題ありません）
 
 5. **「規約に同意して新規アプリを作成」** をクリック
