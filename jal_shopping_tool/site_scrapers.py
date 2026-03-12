@@ -3,12 +3,15 @@
 JALマイレージパーク提携ショップの検索ページをスクレイピングし、
 商品の最安値を取得する。
 
-注意: JavaScriptで描画されるSPAサイト（au PAY マーケット、Qoo10等）は
-requestsでは取得できないため、手動検索として扱う。
+戦略:
+1. CSSセレクタでHTML要素から価格を取得（サーバーサイドレンダリングのサイト）
+2. JSON-LD構造化データから価格を取得（SEO用にSPAでも埋め込まれていることが多い）
+3. ページ内のJSON（__NEXT_DATA__等）から価格を取得
+4. 正規表現でページ全体から価格パターンを検出（最終手段）
 """
 
+import json
 import re
-import ssl
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -38,11 +41,19 @@ _HEADERS = {
     "Upgrade-Insecure-Requests": "1",
 }
 
+# JSON API用ヘッダー
+_JSON_HEADERS = {
+    "User-Agent": _HEADERS["User-Agent"],
+    "Accept": "application/json, text/javascript, */*; q=0.01",
+    "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+    "X-Requested-With": "XMLHttpRequest",
+}
+
 # リクエストタイムアウト（秒）
 _TIMEOUT = 25
 
 # 並列実行のワーカー数
-_MAX_WORKERS = 6
+_MAX_WORKERS = 8
 
 
 @dataclass
@@ -81,6 +92,13 @@ def _fetch(url: str, headers: dict | None = None, **kwargs) -> requests.Response
     return session.get(url, timeout=_TIMEOUT, **kwargs)
 
 
+def _fetch_json(url: str, params: dict | None = None, **kwargs) -> requests.Response:
+    """JSON API用のGETリクエスト"""
+    session = _new_session()
+    session.headers.update(_JSON_HEADERS)
+    return session.get(url, params=params, timeout=_TIMEOUT, **kwargs)
+
+
 def _parse_price(text: str) -> int | None:
     """価格テキストから数値を抽出: '¥12,345' → 12345"""
     digits = re.sub(r"[^\d]", "", text)
@@ -96,9 +114,123 @@ def _soup(resp: requests.Response) -> BeautifulSoup:
     return BeautifulSoup(resp.text, "lxml")
 
 
+# ---------------------------------------------------------------------------
+# 共通抽出関数
+# ---------------------------------------------------------------------------
+
+def _extract_jsonld_prices(soup: BeautifulSoup) -> list[dict]:
+    """JSON-LD構造化データから商品情報を抽出する。
+    SPAサイトでもSEO用にJSON-LDが埋め込まれていることが多い。
+    Returns: [{"name": str, "price": int, "url": str}, ...]
+    """
+    results = []
+    for script in soup.select('script[type="application/ld+json"]'):
+        try:
+            data = json.loads(script.string or "")
+        except (json.JSONDecodeError, TypeError):
+            continue
+
+        items = []
+        if isinstance(data, list):
+            items = data
+        elif isinstance(data, dict):
+            # ItemListなどの場合
+            if data.get("@type") == "ItemList":
+                items = data.get("itemListElement", [])
+            elif data.get("@type") in ("Product", "Offer"):
+                items = [data]
+            elif "mainEntity" in data:
+                me = data["mainEntity"]
+                items = me if isinstance(me, list) else [me]
+            else:
+                items = [data]
+
+        for item in items:
+            if isinstance(item, dict) and item.get("@type") == "ListItem":
+                item = item.get("item", item)
+
+            if not isinstance(item, dict):
+                continue
+
+            name = item.get("name", "")
+            url = item.get("url", "")
+            price = None
+
+            # Product > offers > price
+            offers = item.get("offers", {})
+            if isinstance(offers, list):
+                for o in offers:
+                    p = o.get("price") or o.get("lowPrice")
+                    if p:
+                        price = _parse_price(str(p))
+                        if price:
+                            break
+            elif isinstance(offers, dict):
+                p = offers.get("price") or offers.get("lowPrice")
+                if p:
+                    price = _parse_price(str(p))
+
+            # 直接priceがある場合
+            if not price and item.get("price"):
+                price = _parse_price(str(item["price"]))
+
+            if price:
+                results.append({"name": name, "price": price, "url": url})
+
+    return results
+
+
+def _extract_embedded_json(html: str) -> list[dict]:
+    """ページ内の埋め込みJSON（__NEXT_DATA__, __INITIAL_STATE__等）から商品価格を抽出"""
+    results = []
+
+    # __NEXT_DATA__ (Next.js)
+    patterns = [
+        r'<script\s+id="__NEXT_DATA__"\s+type="application/json">\s*({.*?})\s*</script>',
+        r'window\.__INITIAL_STATE__\s*=\s*({.*?});\s*</script>',
+        r'window\.__PRELOADED_STATE__\s*=\s*({.*?});\s*</script>',
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, html, re.DOTALL)
+        if not match:
+            continue
+        try:
+            data = json.loads(match.group(1))
+            _find_prices_in_dict(data, results, depth=0)
+        except (json.JSONDecodeError, RecursionError):
+            continue
+
+    return results
+
+
+def _find_prices_in_dict(obj, results: list, depth: int = 0):
+    """再帰的にJSONオブジェクト内の商品（price + name）を探す"""
+    if depth > 8:  # 深さ制限
+        return
+    if isinstance(obj, dict):
+        # "price" と "name" が同じレベルにあれば商品の可能性
+        has_price = "price" in obj or "salePrice" in obj or "itemPrice" in obj
+        has_name = "name" in obj or "itemName" in obj or "title" in obj or "productName" in obj
+        if has_price and has_name:
+            raw_price = obj.get("price") or obj.get("salePrice") or obj.get("itemPrice")
+            if raw_price is not None:
+                price = _parse_price(str(raw_price))
+                if price:
+                    name = obj.get("name") or obj.get("itemName") or obj.get("title") or obj.get("productName", "")
+                    url = obj.get("url") or obj.get("itemUrl") or obj.get("productUrl", "")
+                    results.append({"name": str(name), "price": price, "url": str(url)})
+        for v in obj.values():
+            _find_prices_in_dict(v, results, depth + 1)
+    elif isinstance(obj, list):
+        for item in obj[:50]:  # リスト要素数制限
+            _find_prices_in_dict(item, results, depth + 1)
+
+
 def _find_price_in_soup(soup: BeautifulSoup, selectors: list[tuple[str, str, str]],
                         base_url: str = "") -> tuple[int | None, str, str]:
     """複数のCSSセレクタパターンで商品を探す。(price, name, url)を返す"""
+    # 1. CSSセレクタで探す
     for item_sel, price_sel, name_sel in selectors:
         items = soup.select(item_sel)
         if not items:
@@ -125,9 +257,21 @@ def _find_price_in_soup(soup: BeautifulSoup, selectors: list[tuple[str, str, str
 
             return price, name, url
 
-    # フォールバック: ページ全体から価格パターンを探す
+    # 2. JSON-LD構造化データから探す
+    jsonld_items = _extract_jsonld_prices(soup)
+    if jsonld_items:
+        cheapest = min(jsonld_items, key=lambda x: x["price"])
+        return cheapest["price"], cheapest["name"], cheapest["url"]
+
+    # 3. 埋め込みJSONから探す
+    embedded = _extract_embedded_json(str(soup))
+    if embedded:
+        cheapest = min(embedded, key=lambda x: x["price"])
+        return cheapest["price"], cheapest["name"], cheapest["url"]
+
+    # 4. フォールバック: ページ全体から価格パターンを正規表現で探す
     all_text = soup.get_text()
-    price_patterns = re.findall(r'[¥￥][\s]*([0-9,]+)', all_text)
+    price_patterns = re.findall(r'[¥￥]\s*([0-9,]+)', all_text)
     if not price_patterns:
         price_patterns = re.findall(r'(\d{1,3}(?:,\d{3})+)\s*円', all_text)
     prices = []
@@ -141,6 +285,38 @@ def _find_price_in_soup(soup: BeautifulSoup, selectors: list[tuple[str, str, str
     return None, "", ""
 
 
+def _make_error_result(shop_name: str, search_url: str, error: str) -> ShopPrice:
+    """エラー結果を生成（共通ヘルパー）"""
+    return ShopPrice(shop_name, None, "", "", search_url, error=error)
+
+
+def _scrape_generic(shop_name: str, search_url: str,
+                    selectors: list[tuple[str, str, str]],
+                    base_url: str,
+                    headers: dict | None = None) -> ShopPrice:
+    """汎用スクレイパー: HTML取得→セレクタ→JSON-LD→正規表現の順で試行"""
+    try:
+        resp = _fetch(search_url, headers=headers)
+        if resp.status_code == 403:
+            return _make_error_result(shop_name, search_url, "アクセス制限（手動で検索してください）")
+        if resp.status_code != 200:
+            return _make_error_result(shop_name, search_url, f"HTTP {resp.status_code}")
+
+        soup = _soup(resp)
+        price, name, url = _find_price_in_soup(soup, selectors, base_url)
+        if price:
+            return ShopPrice(shop_name, price, name, url, search_url)
+
+        return ShopPrice(shop_name, None, "", "", search_url)
+
+    except requests.exceptions.ConnectionError:
+        return _make_error_result(shop_name, search_url, "接続エラー（手動で検索してください）")
+    except requests.exceptions.Timeout:
+        return _make_error_result(shop_name, search_url, "タイムアウト（手動で検索してください）")
+    except Exception:
+        return _make_error_result(shop_name, search_url, "取得失敗（手動で検索してください）")
+
+
 # ============================================================
 # 楽天市場 (API)
 # ============================================================
@@ -148,14 +324,8 @@ def search_rakuten(query: str, config: Config) -> ShopPrice:
     search_url = f"https://search.rakuten.co.jp/search/mall/{quote(query)}/"
 
     if not config.rakuten_app_id:
-        return ShopPrice(
-            shop_name="楽天市場",
-            price=None,
-            product_name="",
-            product_url="",
-            search_url=search_url,
-            error="APIキー未設定（設定画面で登録してください）",
-        )
+        return ShopPrice("楽天市場", None, "", "", search_url,
+                         error="APIキー未設定（設定画面で登録してください）")
 
     api_url = "https://app.rakuten.co.jp/services/api/IchibaItem/Search/20220601"
     params = {
@@ -200,14 +370,8 @@ def search_yahoo(query: str, config: Config) -> ShopPrice:
     search_url = f"https://shopping.yahoo.co.jp/search?p={quote(query)}"
 
     if not config.yahoo_app_id:
-        return ShopPrice(
-            shop_name="Yahoo!ショッピング",
-            price=None,
-            product_name="",
-            product_url="",
-            search_url=search_url,
-            error="APIキー未設定（設定画面で登録してください）",
-        )
+        return ShopPrice("Yahoo!ショッピング", None, "", "", search_url,
+                         error="APIキー未設定（設定画面で登録してください）")
 
     api_url = "https://shopping.yahooapis.jp/ShoppingWebService/V3/itemSearch"
     params = {
@@ -254,13 +418,11 @@ def search_amazon(query: str, _config: Config) -> ShopPrice:
     try:
         resp = _fetch(search_url)
         if resp.status_code != 200:
-            return ShopPrice("Amazon.co.jp", None, "", "", search_url,
-                             error=f"HTTP {resp.status_code}")
+            return _make_error_result("Amazon.co.jp", search_url, f"HTTP {resp.status_code}")
 
         soup = _soup(resp)
 
         for result in soup.select('[data-component-type="s-search-result"]'):
-            # スポンサー商品をスキップ
             sponsored = result.select_one('.s-label-popover-default')
             if sponsored and 'スポンサー' in sponsored.get_text():
                 continue
@@ -286,7 +448,7 @@ def search_amazon(query: str, _config: Config) -> ShopPrice:
         return ShopPrice("Amazon.co.jp", None, "", "", search_url)
 
     except Exception as e:
-        return ShopPrice("Amazon.co.jp", None, "", "", search_url, error=str(e))
+        return _make_error_result("Amazon.co.jp", search_url, "取得失敗（手動で検索してください）")
 
 
 # ============================================================
@@ -294,37 +456,16 @@ def search_amazon(query: str, _config: Config) -> ShopPrice:
 # ============================================================
 def search_biccamera(query: str, _config: Config) -> ShopPrice:
     search_url = f"https://www.biccamera.com/bc/category/?q={quote(query)}&rowPerPage=25&sort=PRICE_ASC"
-
-    try:
-        # 個別セッション + Referer設定（接続プール問題を回避）
-        headers = {"Referer": "https://www.biccamera.com/"}
-        resp = _fetch(search_url, headers=headers)
-        if resp.status_code != 200:
-            return ShopPrice("ビックカメラ.com", None, "", "", search_url,
-                             error=f"HTTP {resp.status_code}")
-
-        soup = _soup(resp)
-
-        selectors = [
-            (".bcs_listItem", ".bcs_price", ".bcs_title a"),
-            (".prod_box", ".val", ".prod_name a"),
-            (".bcs_item", ".bcs_price .val", ".bcs_title a"),
-            (".product_list_item", ".price", ".product_name a"),
-            ("li.prod_item", ".prod_price", ".prod_name a"),
-        ]
-
-        price, name, url = _find_price_in_soup(soup, selectors, "https://www.biccamera.com")
-        if price:
-            return ShopPrice("ビックカメラ.com", price, name, url, search_url)
-
-        return ShopPrice("ビックカメラ.com", None, "", "", search_url)
-
-    except requests.exceptions.ConnectionError:
-        return ShopPrice("ビックカメラ.com", None, "", "", search_url,
-                         error="接続エラー（手動で検索してください）")
-    except Exception as e:
-        return ShopPrice("ビックカメラ.com", None, "", "", search_url,
-                         error=f"取得失敗（手動で検索してください）")
+    selectors = [
+        (".bcs_listItem", ".bcs_price", ".bcs_title a"),
+        (".prod_box", ".val", ".prod_name a"),
+        (".bcs_item", ".bcs_price .val", ".bcs_title a"),
+        (".product_list_item", ".price", ".product_name a"),
+        ("li.prod_item", ".prod_price", ".prod_name a"),
+    ]
+    return _scrape_generic("ビックカメラ.com", search_url, selectors,
+                           "https://www.biccamera.com",
+                           headers={"Referer": "https://www.biccamera.com/"})
 
 
 # ============================================================
@@ -332,35 +473,15 @@ def search_biccamera(query: str, _config: Config) -> ShopPrice:
 # ============================================================
 def search_kojima(query: str, _config: Config) -> ShopPrice:
     search_url = f"https://www.kojima.net/ec/disp/CSfDispListPage_001.jsp?dispNo=&q={quote(query)}&sort=price&order=asc"
-
-    try:
-        resp = _fetch(search_url)
-        if resp.status_code != 200:
-            return ShopPrice("コジマネット", None, "", "", search_url,
-                             error=f"HTTP {resp.status_code}")
-
-        soup = _soup(resp)
-
-        selectors = [
-            (".product-list-item", ".price, .itemPrice, .product-price", ".product-name a, .itemName a"),
-            (".itemBox", ".itemPrice", ".itemName a"),
-            (".product_item", ".product-price", ".product_name a"),
-            ("li.item", ".price", "a.item-name, .name a"),
-            (".goods_list li", ".price", ".goods_name a"),
-        ]
-
-        price, name, url = _find_price_in_soup(soup, selectors, "https://www.kojima.net")
-        if price:
-            return ShopPrice("コジマネット", price, name, url, search_url)
-
-        return ShopPrice("コジマネット", None, "", "", search_url)
-
-    except requests.exceptions.ConnectionError:
-        return ShopPrice("コジマネット", None, "", "", search_url,
-                         error="接続エラー（手動で検索してください）")
-    except Exception as e:
-        return ShopPrice("コジマネット", None, "", "", search_url,
-                         error=f"取得失敗（手動で検索してください）")
+    selectors = [
+        (".product-list-item", ".price, .itemPrice, .product-price", ".product-name a, .itemName a"),
+        (".itemBox", ".itemPrice", ".itemName a"),
+        (".product_item", ".product-price", ".product_name a"),
+        ("li.item", ".price", "a.item-name, .name a"),
+        (".goods_list li", ".price", ".goods_name a"),
+    ]
+    return _scrape_generic("コジマネット", search_url, selectors,
+                           "https://www.kojima.net")
 
 
 # ============================================================
@@ -368,38 +489,15 @@ def search_kojima(query: str, _config: Config) -> ShopPrice:
 # ============================================================
 def search_yamada(query: str, _config: Config) -> ShopPrice:
     search_url = f"https://www.yamada-denkiweb.com/search?q={quote(query)}&sort=price_asc"
-
-    try:
-        headers = {"Referer": "https://www.yamada-denkiweb.com/"}
-        resp = _fetch(search_url, headers=headers)
-        if resp.status_code == 403:
-            return ShopPrice("ヤマダウェブコム", None, "", "", search_url,
-                             error="アクセス制限（手動で検索してください）")
-        if resp.status_code != 200:
-            return ShopPrice("ヤマダウェブコム", None, "", "", search_url,
-                             error=f"HTTP {resp.status_code}")
-
-        soup = _soup(resp)
-
-        selectors = [
-            (".searchResult__item", ".searchResult__price, .pPrice", ".searchResult__name a, .pName a"),
-            (".product", ".price, .product-price", ".product-name a"),
-            (".item", ".pPrice", ".pName a"),
-            ("li.product-item", ".price-box .price", ".product-item-link"),
-        ]
-
-        price, name, url = _find_price_in_soup(soup, selectors, "https://www.yamada-denkiweb.com")
-        if price:
-            return ShopPrice("ヤマダウェブコム", price, name, url, search_url)
-
-        return ShopPrice("ヤマダウェブコム", None, "", "", search_url)
-
-    except requests.exceptions.ConnectionError:
-        return ShopPrice("ヤマダウェブコム", None, "", "", search_url,
-                         error="接続エラー（手動で検索してください）")
-    except Exception as e:
-        return ShopPrice("ヤマダウェブコム", None, "", "", search_url,
-                         error=f"取得失敗（手動で検索してください）")
+    selectors = [
+        (".searchResult__item", ".searchResult__price, .pPrice", ".searchResult__name a, .pName a"),
+        (".product", ".price, .product-price", ".product-name a"),
+        (".item", ".pPrice", ".pName a"),
+        ("li.product-item", ".price-box .price", ".product-item-link"),
+    ]
+    return _scrape_generic("ヤマダウェブコム", search_url, selectors,
+                           "https://www.yamada-denkiweb.com",
+                           headers={"Referer": "https://www.yamada-denkiweb.com/"})
 
 
 # ============================================================
@@ -407,34 +505,73 @@ def search_yamada(query: str, _config: Config) -> ShopPrice:
 # ============================================================
 def search_joshin(query: str, _config: Config) -> ShopPrice:
     search_url = f"https://joshinweb.jp/servlet/emall.odr_wp?SHP=0&KW={quote(query)}&SORT=PRICE_LO"
+    selectors = [
+        (".productList__item", ".productList__price", ".productList__name a"),
+        (".lineup_box", ".lineup_price", ".lineup_name a"),
+        (".item", ".price", ".item-name a, .name a"),
+        ("li.product-item", ".price-box .price", ".product-item-link"),
+    ]
+    return _scrape_generic("Joshin webショップ", search_url, selectors,
+                           "https://joshinweb.jp")
 
-    try:
-        resp = _fetch(search_url)
-        if resp.status_code != 200:
-            return ShopPrice("Joshin webショップ", None, "", "", search_url,
-                             error=f"HTTP {resp.status_code}")
 
-        soup = _soup(resp)
+# ============================================================
+# au PAY マーケット (HTML + JSON-LD + 埋め込みJSON)
+# ============================================================
+def search_aupay(query: str, _config: Config) -> ShopPrice:
+    search_url = f"https://wowma.jp/itemlist?e_scope=O&at=FP&non_gr=ex&keyword={quote(query)}&categ_id=0&sort_type=priceasc"
+    selectors = [
+        (".itemList__item", ".itemList__price, .price", ".itemList__name a, .product-name a"),
+        (".product-item", ".product-price, .price", ".product-name a"),
+        ('[class*="ItemCard"]', '[class*="price"]', '[class*="name"] a, [class*="title"] a'),
+        (".item", ".price", "a.item-name"),
+    ]
+    return _scrape_generic("au PAY マーケット", search_url, selectors,
+                           "https://wowma.jp")
 
-        selectors = [
-            (".productList__item", ".productList__price", ".productList__name a"),
-            (".lineup_box", ".lineup_price", ".lineup_name a"),
-            (".item", ".price", ".item-name a, .name a"),
-            ("li.product-item", ".price-box .price", ".product-item-link"),
-        ]
 
-        price, name, url = _find_price_in_soup(soup, selectors, "https://joshinweb.jp")
-        if price:
-            return ShopPrice("Joshin webショップ", price, name, url, search_url)
+# ============================================================
+# セブンネットショッピング (HTML + JSON-LD + 埋め込みJSON)
+# ============================================================
+def search_seven(query: str, _config: Config) -> ShopPrice:
+    search_url = f"https://7net.omni7.jp/search/?keyword={quote(query)}&searchKeywordFlg=1"
+    selectors = [
+        (".productItem", ".productPrice, .price", ".productName a, .product-name a"),
+        (".product", ".price, .productPrice", ".productName a"),
+        (".item", ".price, .item-price", ".item-name a, .productName a"),
+        ('[class*="product"]', '[class*="price"]', '[class*="name"] a'),
+    ]
+    return _scrape_generic("セブンネットショッピング", search_url, selectors,
+                           "https://7net.omni7.jp")
 
-        return ShopPrice("Joshin webショップ", None, "", "", search_url)
 
-    except requests.exceptions.ConnectionError:
-        return ShopPrice("Joshin webショップ", None, "", "", search_url,
-                         error="接続エラー（手動で検索してください）")
-    except Exception as e:
-        return ShopPrice("Joshin webショップ", None, "", "", search_url,
-                         error=f"取得失敗（手動で検索してください）")
+# ============================================================
+# Qoo10 (HTML + JSON-LD + 埋め込みJSON)
+# ============================================================
+def search_qoo10(query: str, _config: Config) -> ShopPrice:
+    search_url = f"https://www.qoo10.jp/s/{quote(query)}?sort=prc"
+    selectors = [
+        (".sc-prd", ".prc .prc-dc, .prc", ".tit a, .sbj a"),
+        (".item_g", ".price, .prc", ".sbj a"),
+        ('[class*="product"]', '[class*="price"]', '[class*="title"] a, [class*="name"] a'),
+        (".goods_item", ".price", ".goods_name a, .title a"),
+    ]
+    return _scrape_generic("Qoo10", search_url, selectors,
+                           "https://www.qoo10.jp")
+
+
+# ============================================================
+# エディオンネットショップ (HTML + JSON-LD + 埋め込みJSON)
+# ============================================================
+def search_edion(query: str, _config: Config) -> ShopPrice:
+    search_url = f"https://www.edion.com/search?keyword={quote(query)}&sort=price_asc"
+    selectors = [
+        (".product-item, .item-list__item", ".price, .item-price", ".product-name a, .item-name a"),
+        ('[class*="product"]', '[class*="price"]', '[class*="name"] a'),
+        (".searchResultItem", ".resultPrice", ".resultName a"),
+    ]
+    return _scrape_generic("エディオンネットショップ", search_url, selectors,
+                           "https://www.edion.com")
 
 
 # ============================================================
@@ -443,13 +580,6 @@ def search_joshin(query: str, _config: Config) -> ShopPrice:
 
 # (検索関数, JALショップ名) のリスト
 # JALショップ名は jal_shops.py の KNOWN_SHOPS のキーと一致させること
-#
-# 注意: 以下のショップはJavaScript SPA（requestsでは取得不可）のため
-# スクレイパー対象外とし、手動検索として扱う:
-#   - au PAY マーケット (React SPA)
-#   - セブンネットショッピング (SPA)
-#   - Qoo10 (SPA)
-#   - エディオンネットショップ (SPA)
 SCRAPERS = [
     (search_rakuten, "楽天市場"),
     (search_yahoo, "Yahoo!ショッピング"),
@@ -458,6 +588,10 @@ SCRAPERS = [
     (search_kojima, "コジマネット"),
     (search_yamada, "ヤマダウェブコム"),
     (search_joshin, "Joshin webショップ"),
+    (search_aupay, "au PAY マーケット"),
+    (search_seven, "セブンネットショッピング"),
+    (search_qoo10, "Qoo10"),
+    (search_edion, "エディオンネットショップ"),
 ]
 
 # スクレイパー対応済みショップ名のセット（自動生成）
@@ -474,7 +608,6 @@ def search_all_shops(query: str, config: Config) -> list[ShopPrice]:
     """全ショップを並列に検索して結果を返す"""
     results: list[ShopPrice] = []
 
-    # 並列実行
     with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as executor:
         future_to_name: dict = {}
         for scraper_fn, name in SCRAPERS:
