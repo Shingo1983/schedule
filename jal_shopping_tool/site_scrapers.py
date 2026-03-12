@@ -461,7 +461,7 @@ def _extract_price_from_element(el) -> int | None:
 
 
 def _find_price_in_soup(soup: BeautifulSoup, selectors: list[tuple[str, str, str]],
-                        base_url: str = "") -> tuple[int | None, str, str]:
+                        base_url: str = "", query: str = "") -> tuple[int | None, str, str]:
     """複数のCSSセレクタパターンで商品を探す。(price, name, url)を返す
 
     戦略:
@@ -469,10 +469,34 @@ def _find_price_in_soup(soup: BeautifulSoup, selectors: list[tuple[str, str, str
     2. JSON-LD構造化データ
     3. 埋め込みJSON（__NEXT_DATA__等）
     ※正規表現フォールバックは廃止（無関係な価格を誤検出する原因のため）
+
+    queryが指定されている場合、各段階で関連性チェックを行い、
+    無関係な商品（「airpods pro 3」検索で化粧水等）を除外する。
     """
     # 0. 検索結果なしページを先にチェック
     if _is_no_results_page(soup):
         return None, "", ""
+
+    def _extract_url(name_el, item) -> str:
+        """商品URLを抽出するヘルパー"""
+        url = ""
+        if name_el and name_el.get("href"):
+            href = name_el["href"]
+            if href.startswith("http"):
+                url = href
+            elif href.startswith("/") and base_url:
+                url = f"{base_url}{href}"
+            elif base_url:
+                url = f"{base_url}/{href}"
+        if not url:
+            link = item.select_one("a[href]")
+            if link:
+                href = link["href"]
+                if href.startswith("http"):
+                    url = href
+                elif href.startswith("/") and base_url:
+                    url = f"{base_url}{href}"
+        return url
 
     # 1. CSSセレクタで探す
     for item_sel, price_sel, name_sel in selectors:
@@ -489,39 +513,34 @@ def _find_price_in_soup(soup: BeautifulSoup, selectors: list[tuple[str, str, str
 
             name_el = item.select_one(name_sel)
             name = name_el.get_text(strip=True) if name_el else ""
-            url = ""
-            # name要素のhref
-            if name_el and name_el.get("href"):
-                href = name_el["href"]
-                if href.startswith("http"):
-                    url = href
-                elif href.startswith("/") and base_url:
-                    url = f"{base_url}{href}"
-                elif base_url:
-                    url = f"{base_url}/{href}"
-            # name要素にhrefがなければ、item内の最初のaタグを試す
-            if not url:
-                link = item.select_one("a[href]")
-                if link:
-                    href = link["href"]
-                    if href.startswith("http"):
-                        url = href
-                    elif href.startswith("/") and base_url:
-                        url = f"{base_url}{href}"
 
+            # 関連性チェック（queryが指定されている場合）
+            if query and name and not _is_relevant_product(query, name):
+                continue  # 次の商品を試す
+
+            url = _extract_url(name_el, item)
             return price, name, url
 
     # 2. JSON-LD構造化データから探す
     jsonld_items = _extract_jsonld_prices(soup)
     if jsonld_items:
-        cheapest = min(jsonld_items, key=lambda x: x["price"])
-        return cheapest["price"], cheapest["name"], cheapest["url"]
+        # 関連性でフィルタしてから最安値
+        if query:
+            jsonld_items = [i for i in jsonld_items
+                           if not i["name"] or _is_relevant_product(query, i["name"])]
+        if jsonld_items:
+            cheapest = min(jsonld_items, key=lambda x: x["price"])
+            return cheapest["price"], cheapest["name"], cheapest["url"]
 
     # 3. 埋め込みJSONから探す
     embedded = _extract_embedded_json(str(soup))
     if embedded:
-        cheapest = min(embedded, key=lambda x: x["price"])
-        return cheapest["price"], cheapest["name"], cheapest["url"]
+        if query:
+            embedded = [i for i in embedded
+                        if not i["name"] or _is_relevant_product(query, i["name"])]
+        if embedded:
+            cheapest = min(embedded, key=lambda x: x["price"])
+            return cheapest["price"], cheapest["name"], cheapest["url"]
 
     return None, "", ""
 
@@ -572,13 +591,8 @@ def _scrape_generic(shop_name: str, search_url: str,
                     continue  # リトライ
                 return _make_error_result(shop_name, search_url, "アクセス制限（手動で検索してください）")
 
-            price, name, url = _find_price_in_soup(soup, selectors, base_url)
+            price, name, url = _find_price_in_soup(soup, selectors, base_url, query=query)
             if price:
-                # 検索クエリとの関連性チェック
-                if query and name and not _is_relevant_product(query, name):
-                    logger.info("Irrelevant product for %s: '%s' (query='%s')",
-                                shop_name, name, query)
-                    return ShopPrice(shop_name, None, "", "", search_url)
                 return ShopPrice(shop_name, price, name, url, search_url)
 
             return ShopPrice(shop_name, None, "", "", search_url)
@@ -661,12 +675,10 @@ def search_rakuten(query: str, config: Config) -> ShopPrice:
 # ============================================================
 # Yahoo!ショッピング (API)
 # ============================================================
-def search_yahoo(query: str, config: Config) -> ShopPrice:
-    search_url = f"https://shopping.yahoo.co.jp/search?p={quote(query)}"
-
+def _search_yahoo_api(query: str, config: Config, search_url: str) -> ShopPrice | None:
+    """Yahoo API検索（APIキー設定済みの場合のみ）。成功時はShopPrice、失敗時はNone"""
     if not config.yahoo_app_id:
-        return ShopPrice("Yahoo!ショッピング", None, "", "", search_url,
-                         error="APIキー未設定（設定画面で登録してください）")
+        return None
 
     api_url = "https://shopping.yahooapis.jp/ShoppingWebService/V3/itemSearch"
     params = {
@@ -680,12 +692,7 @@ def search_yahoo(query: str, config: Config) -> ShopPrice:
     try:
         resp = requests.get(api_url, params=params, timeout=_TIMEOUT)
         if resp.status_code != 200:
-            try:
-                err = resp.json()
-                msg = err.get("Message", err.get("error", f"HTTP {resp.status_code}"))
-            except ValueError:
-                msg = f"HTTP {resp.status_code}"
-            return ShopPrice("Yahoo!ショッピング", None, "", "", search_url, error=f"API: {msg}")
+            return None  # APIエラー → Webスクレイピングにフォールバック
 
         data = resp.json()
         hits = data.get("hits", [])
@@ -700,8 +707,36 @@ def search_yahoo(query: str, config: Config) -> ShopPrice:
             product_url=hit.get("url", ""),
             search_url=search_url,
         )
-    except Exception as e:
-        return ShopPrice("Yahoo!ショッピング", None, "", "", search_url, error=str(e))
+    except Exception:
+        return None  # フォールバック
+
+
+def search_yahoo(query: str, config: Config) -> ShopPrice:
+    search_url = f"https://shopping.yahoo.co.jp/search?p={quote(query)}&ss_first=1&ts=1&mcr=on&used=0&stipIcon=1&elc=1&cid=&brandId=&oid=&ran_cr=&ran_sh=&X=2&di=&sc_i=shp_pc_search_searchBox_2"
+
+    # 1. APIキーがあればAPIを試行
+    api_result = _search_yahoo_api(query, config, search_url)
+    if api_result is not None:
+        return api_result
+
+    # 2. Webスクレイピングフォールバック（APIキー不要）
+    selectors = [
+        # Yahoo!ショッピング検索結果ページのセレクタ
+        ('[class*="SearchResult"] [class*="Product"]',
+         '[class*="Product__price"], [class*="Price__value"]',
+         '[class*="Product__title"] a, [class*="Product__name"] a'),
+        (".mdSearchProduct", ".elPriceValue, .mdSearchProduct__price",
+         ".mdSearchProduct__title a, .elProductName a"),
+        ('[data-cl-params*="product"]',
+         '[class*="price"], [class*="Price"]',
+         'a[class*="title"], a[class*="Title"], a[class*="name"]'),
+        ('[class*="ProductItem"], [class*="productItem"]',
+         '[class*="price"], [class*="Price"]',
+         '[class*="title"] a, [class*="name"] a'),
+        (".product", ".price", ".product-name a, .title a"),
+    ]
+    return _scrape_generic("Yahoo!ショッピング", search_url, selectors,
+                           "https://shopping.yahoo.co.jp", query=query)
 
 
 # ============================================================
@@ -1003,8 +1038,14 @@ search_dshopping = _make_generic_scraper(
 
 search_buyma = _make_generic_scraper(
     "BUYMA",
-    "https://www.buyma.com/r/-{query}/",
+    "https://www.buyma.com/r/-{query}/?sort=2",
     "https://www.buyma.com",
+    selectors=[
+        (".product_body", ".product_price .price", ".product_name a"),
+        (".item_card", ".price", ".item_name a, .product_name a"),
+        ('[class*="ProductCard"]', '[class*="price"], [class*="Price"]',
+         '[class*="name"] a, [class*="title"] a'),
+    ] + _GENERIC_SELECTORS,
 )
 
 search_abcmart = _make_generic_scraper(
@@ -1157,14 +1198,9 @@ def _retry_with_browser(results: list[ShopPrice], query: str) -> None:
                         continue
 
                     selectors = _get_selectors_for_shop(r.shop_name)
-                    price, name, url = _find_price_in_soup(soup, selectors,
-                                                           f"{urlparse(r.search_url).scheme}://{urlparse(r.search_url).netloc}")
+                    base = f"{urlparse(r.search_url).scheme}://{urlparse(r.search_url).netloc}"
+                    price, name, url = _find_price_in_soup(soup, selectors, base, query=query)
                     if price:
-                        # 関連性チェック
-                        if name and not _is_relevant_product(query, name):
-                            logger.info("Browser retry: irrelevant product for %s: '%s'",
-                                        r.shop_name, name)
-                            continue
                         results[idx] = ShopPrice(r.shop_name, price, name, url, r.search_url)
                         logger.info("Browser retry success: %s = %d", r.shop_name, price)
                     else:
