@@ -29,6 +29,11 @@ from bs4 import BeautifulSoup
 
 from .config import Config
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -87,8 +92,8 @@ _JSON_HEADERS = {
 # リクエストタイムアウト（秒）
 _TIMEOUT = 25
 
-# 並列実行のワーカー数（多すぎるとbot検出される → 5に制限）
-_MAX_WORKERS = 5
+# 並列実行のワーカー数（各ショップは別ドメインなので並列OK）
+_MAX_WORKERS = 10
 
 
 @dataclass
@@ -192,7 +197,10 @@ def _parse_price(text: str) -> int | None:
 
 def _soup(resp: requests.Response) -> BeautifulSoup:
     """レスポンスからBeautifulSoupオブジェクトを作成"""
-    return BeautifulSoup(resp.text, "lxml")
+    try:
+        return BeautifulSoup(resp.text, "lxml")
+    except Exception:
+        return BeautifulSoup(resp.text, "html.parser")
 
 
 def _is_relevant_product(query: str, product_name: str) -> bool:
@@ -610,6 +618,10 @@ def _scrape_generic(shop_name: str, search_url: str,
             if price:
                 return ShopPrice(shop_name, price, name, url, search_url)
 
+            # 価格が見つからなかった理由をログ出力
+            text_len = len(soup.get_text())
+            logger.info("Phase1 no price for %s (HTML %d chars, status %d)",
+                        shop_name, text_len, resp.status_code)
             return ShopPrice(shop_name, None, "", "", search_url)
 
         except requests.exceptions.SSLError:
@@ -779,7 +791,16 @@ def search_amazon(query: str, _config: Config) -> ShopPrice:
 
         soup = _soup(resp)
 
-        for result in soup.select('[data-component-type="s-search-result"]'):
+        # bot検出チェック
+        if _is_bot_blocked_page(soup):
+            logger.info("Amazon: bot blocked page detected")
+            return _make_error_result("Amazon.co.jp", search_url, "アクセス制限（手動で検索してください）")
+
+        results_found = soup.select('[data-component-type="s-search-result"]')
+        logger.info("Amazon: found %d search results, HTML %d chars",
+                     len(results_found), len(resp.text))
+
+        for result in results_found:
             sponsored = result.select_one('.s-label-popover-default')
             if sponsored and 'スポンサー' in sponsored.get_text():
                 continue
@@ -796,6 +817,7 @@ def search_amazon(query: str, _config: Config) -> ShopPrice:
 
             # 関連性チェック（ケースや保護フィルム等のアクセサリを除外）
             if not _is_relevant_product(query, name):
+                logger.info("Amazon: skipping irrelevant '%s'", name[:50])
                 continue
 
             link_el = result.select_one("h2 a")
@@ -806,9 +828,15 @@ def search_amazon(query: str, _config: Config) -> ShopPrice:
 
             return ShopPrice("Amazon.co.jp", price, name, url, search_url)
 
+        # JSON-LD/embedded JSONもフォールバックとして試す
+        price, name, url = _find_price_in_soup(soup, [], "https://www.amazon.co.jp", query=query)
+        if price:
+            return ShopPrice("Amazon.co.jp", price, name, url, search_url)
+
         return ShopPrice("Amazon.co.jp", None, "", "", search_url)
 
     except Exception as e:
+        logger.warning("Amazon scrape error: %s", e)
         return _make_error_result("Amazon.co.jp", search_url, "取得失敗（手動で検索してください）")
 
 
@@ -1202,7 +1230,10 @@ def _retry_with_browser(results: list[ShopPrice], query: str) -> None:
 
     try:
         with sync_playwright() as pw:
-            browser = pw.chromium.launch(headless=True)
+            browser = pw.chromium.launch(
+                headless=True,
+                args=["--disable-http2", "--no-sandbox"],
+            )
             context = browser.new_context(
                 user_agent=_HEADERS["User-Agent"],
                 locale="ja-JP",
@@ -1211,13 +1242,13 @@ def _retry_with_browser(results: list[ShopPrice], query: str) -> None:
 
             for idx in retry_indices:
                 r = results[idx]
+                page = None
                 try:
                     page = context.new_page()
                     page.goto(r.search_url, timeout=30000, wait_until="domcontentloaded")
-                    # JS描画を待つ（networkidleは遅すぎるのでdomcontentloaded + 固定待機）
-                    page.wait_for_timeout(3000)
+                    # JS描画を待つ
+                    page.wait_for_timeout(2000)
                     html = page.content()
-                    page.close()
 
                     soup = BeautifulSoup(html, "lxml")
 
@@ -1239,7 +1270,12 @@ def _retry_with_browser(results: list[ShopPrice], query: str) -> None:
 
                 except Exception as e:
                     logger.warning("Browser retry error for %s: %s", r.shop_name, e)
-                    # 元の結果をそのまま保持
+                finally:
+                    if page:
+                        try:
+                            page.close()
+                        except Exception:
+                            pass
 
             context.close()
             browser.close()
@@ -1278,9 +1314,8 @@ def search_all_shops(query: str, config: Config) -> list[ShopPrice]:
     with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as executor:
         future_to_name: dict = {}
         for i, (scraper_fn, name) in enumerate(SCRAPERS):
-            # 各リクエストに0〜3秒のランダム遅延を追加
-            # 同じドメインに同時にアクセスしないようにする
-            delay = i * 0.3 + random.uniform(0, 0.5)
+            # 各ショップは別ドメインなので遅延は最小限
+            delay = random.uniform(0, 0.5)
             future = executor.submit(_delayed_scrape, scraper_fn, query, config, delay)
             future_to_name[future] = name
 
@@ -1289,7 +1324,14 @@ def search_all_shops(query: str, config: Config) -> list[ShopPrice]:
             try:
                 result = future.result(timeout=_TIMEOUT + 10)
                 results.append(result)
+                if result.price:
+                    logger.info("Phase1 OK: %s = ¥%s", name, f"{result.price:,}")
+                elif result.error:
+                    logger.info("Phase1 ERR: %s = %s", name, result.error)
+                else:
+                    logger.info("Phase1 EMPTY: %s (no price found)", name)
             except Exception as e:
+                logger.warning("Phase1 EXCEPTION: %s = %s", name, e)
                 results.append(ShopPrice(name, None, "", "", "", error=str(e)))
 
     phase1_found = sum(1 for r in results if r.price is not None)
