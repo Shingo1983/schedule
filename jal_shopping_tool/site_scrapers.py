@@ -148,12 +148,43 @@ def _fetch_json(url: str, params: dict | None = None, **kwargs) -> requests.Resp
 
 
 def _parse_price(text: str) -> int | None:
-    """価格テキストから数値を抽出: '¥12,345' → 12345"""
-    digits = re.sub(r"[^\d]", "", text)
-    if digits:
-        val = int(digits)
-        if val >= 100:  # 100円未満は送料等のノイズ
-            return val
+    """価格テキストから最初の価格数値を抽出: '¥12,345' → 12345
+
+    改善点:
+    - テキスト全体の数字を結合するのではなく、最初の価格パターンのみ抽出
+    - 「ポイント」「件」「%」等の非価格数値を除外
+    - 「送料」の数値を除外
+    """
+    if not text:
+        return None
+
+    # ポイント・件数・パーセントなどの非価格テキストを除外
+    # 「1,234ポイント」「100件」「50%OFF」等のパターンを先に除去
+    cleaned = re.sub(r'[\d,]+\s*(?:ポイント|ﾎﾟｲﾝﾄ|point|pts?|件|%|％|倍)', '', text, flags=re.IGNORECASE)
+    # 送料関連を除去: 「送料XXX円」「送料無料」
+    cleaned = re.sub(r'送料\s*[\d,]*\s*円?', '', cleaned)
+    # 「〜」以降を除去（価格範囲の上限を拾わないため）
+    cleaned = re.sub(r'[〜~～].+', '', cleaned)
+
+    # 価格パターン: ¥マーク付き or 数字+円 or カンマ区切り数字
+    # 最初にマッチしたものだけを使う
+    price_patterns = [
+        r'[¥￥]\s*([\d,]+)',           # ¥12,345
+        r'([\d,]+)\s*円',              # 12,345円
+        r'(?:税込|税抜|価格|特価|販売価格|通常価格)[^\d]*([\d,]+)',  # 価格: 12,345
+        r'(?:^|[^\d])([\d]{1,3}(?:,\d{3})+)(?:[^\d]|$)',  # カンマ区切り: 12,345 or 1,234,567
+        r'(?:^|[^\d])([\d]{3,7})(?:[^\d]|$)',  # 3〜7桁の数字（100〜9,999,999）
+    ]
+
+    for pattern in price_patterns:
+        m = re.search(pattern, cleaned)
+        if m:
+            digits = re.sub(r'[^\d]', '', m.group(1))
+            if digits:
+                val = int(digits)
+                if 100 <= val <= 99_999_999:  # 100円〜約1億円の範囲
+                    return val
+
     return None
 
 
@@ -169,9 +200,14 @@ def _soup(resp: requests.Response) -> BeautifulSoup:
 def _extract_jsonld_prices(soup: BeautifulSoup) -> list[dict]:
     """JSON-LD構造化データから商品情報を抽出する。
     SPAサイトでもSEO用にJSON-LDが埋め込まれていることが多い。
+
+    改善: Product/Offer型のみ対象（BreadcrumbList、Organization等を除外）
     Returns: [{"name": str, "price": int, "url": str}, ...]
     """
     results = []
+    # 商品に関連するJSON-LDの@type
+    _PRODUCT_TYPES = {"Product", "Offer", "AggregateOffer", "IndividualProduct"}
+
     for script in soup.select('script[type="application/ld+json"]'):
         try:
             data = json.loads(script.string or "")
@@ -182,16 +218,22 @@ def _extract_jsonld_prices(soup: BeautifulSoup) -> list[dict]:
         if isinstance(data, list):
             items = data
         elif isinstance(data, dict):
-            # ItemListなどの場合
-            if data.get("@type") == "ItemList":
+            dtype = data.get("@type", "")
+            if dtype == "ItemList":
                 items = data.get("itemListElement", [])
-            elif data.get("@type") in ("Product", "Offer"):
+            elif dtype in _PRODUCT_TYPES:
                 items = [data]
             elif "mainEntity" in data:
                 me = data["mainEntity"]
                 items = me if isinstance(me, list) else [me]
-            else:
-                items = [data]
+            elif dtype in ("WebPage", "SearchResultsPage"):
+                # WebPageの場合、mainEntityや関連プロパティを探す
+                for key in ("mainEntity", "about", "mentions"):
+                    val = data.get(key)
+                    if val:
+                        items = val if isinstance(val, list) else [val]
+                        break
+            # BreadcrumbList, Organization, WebSite 等は無視
 
         for item in items:
             if isinstance(item, dict) and item.get("@type") == "ListItem":
@@ -200,6 +242,13 @@ def _extract_jsonld_prices(soup: BeautifulSoup) -> list[dict]:
             if not isinstance(item, dict):
                 continue
 
+            # Product/Offer型でない場合はスキップ（商品以外のJSON-LDを除外）
+            item_type = item.get("@type", "")
+            if item_type and item_type not in _PRODUCT_TYPES and item_type != "ListItem":
+                # ただしoffersを持っていれば商品の可能性がある
+                if "offers" not in item:
+                    continue
+
             name = item.get("name", "")
             url = item.get("url", "")
             price = None
@@ -207,22 +256,25 @@ def _extract_jsonld_prices(soup: BeautifulSoup) -> list[dict]:
             # Product > offers > price
             offers = item.get("offers", {})
             if isinstance(offers, list):
+                prices = []
                 for o in offers:
                     p = o.get("price") or o.get("lowPrice")
-                    if p:
-                        price = _parse_price(str(p))
-                        if price:
-                            break
+                    if p is not None:
+                        parsed = _parse_price(str(p))
+                        if parsed:
+                            prices.append(parsed)
+                if prices:
+                    price = min(prices)  # 最安値を採用
             elif isinstance(offers, dict):
                 p = offers.get("price") or offers.get("lowPrice")
-                if p:
+                if p is not None:
                     price = _parse_price(str(p))
 
             # 直接priceがある場合
-            if not price and item.get("price"):
+            if not price and item.get("price") is not None:
                 price = _parse_price(str(item["price"]))
 
-            if price:
+            if price and name:  # 名前がないものは除外
                 results.append({"name": name, "price": price, "url": url})
 
     return results
@@ -232,11 +284,10 @@ def _extract_embedded_json(html: str) -> list[dict]:
     """ページ内の埋め込みJSON（__NEXT_DATA__, __INITIAL_STATE__等）から商品価格を抽出"""
     results = []
 
-    # __NEXT_DATA__ (Next.js)
     patterns = [
-        r'<script\s+id="__NEXT_DATA__"\s+type="application/json">\s*({.*?})\s*</script>',
-        r'window\.__INITIAL_STATE__\s*=\s*({.*?});\s*</script>',
-        r'window\.__PRELOADED_STATE__\s*=\s*({.*?});\s*</script>',
+        r'<script\s+id="__NEXT_DATA__"\s+type="application/json">\s*({.+?})\s*</script>',
+        r'window\.__INITIAL_STATE__\s*=\s*({.+?});\s*</script>',
+        r'window\.__PRELOADED_STATE__\s*=\s*({.+?});\s*</script>',
     ]
 
     for pattern in patterns:
@@ -253,25 +304,39 @@ def _extract_embedded_json(html: str) -> list[dict]:
 
 
 def _find_prices_in_dict(obj, results: list, depth: int = 0):
-    """再帰的にJSONオブジェクト内の商品（price + name）を探す"""
-    if depth > 8:  # 深さ制限
+    """再帰的にJSONオブジェクト内の商品（price + name）を探す
+
+    改善:
+    - priceが数値型であることを確認（文字列のIDなどを除外）
+    - nameが十分な長さであることを確認
+    - 最大結果数を制限
+    """
+    if depth > 8 or len(results) >= 20:
         return
     if isinstance(obj, dict):
-        # "price" と "name" が同じレベルにあれば商品の可能性
         has_price = "price" in obj or "salePrice" in obj or "itemPrice" in obj
         has_name = "name" in obj or "itemName" in obj or "title" in obj or "productName" in obj
         if has_price and has_name:
-            raw_price = obj.get("price") or obj.get("salePrice") or obj.get("itemPrice")
+            raw_price = obj.get("salePrice") or obj.get("price") or obj.get("itemPrice")
             if raw_price is not None:
-                price = _parse_price(str(raw_price))
-                if price:
+                # 数値型チェック: 文字列の場合は数字のみの文字列であること
+                if isinstance(raw_price, (int, float)):
+                    price = int(raw_price) if raw_price >= 100 else None
+                elif isinstance(raw_price, str):
+                    price = _parse_price(raw_price)
+                else:
+                    price = None
+
+                if price and 100 <= price <= 99_999_999:
                     name = obj.get("name") or obj.get("itemName") or obj.get("title") or obj.get("productName", "")
-                    url = obj.get("url") or obj.get("itemUrl") or obj.get("productUrl", "")
-                    results.append({"name": str(name), "price": price, "url": str(url)})
+                    name = str(name).strip()
+                    if len(name) >= 2:  # 名前が短すぎるものは除外
+                        url = obj.get("url") or obj.get("itemUrl") or obj.get("productUrl", "")
+                        results.append({"name": name, "price": price, "url": str(url)})
         for v in obj.values():
             _find_prices_in_dict(v, results, depth + 1)
     elif isinstance(obj, list):
-        for item in obj[:50]:  # リスト要素数制限
+        for item in obj[:30]:
             _find_prices_in_dict(item, results, depth + 1)
 
 
@@ -304,6 +369,36 @@ def _is_no_results_page(soup: BeautifulSoup) -> bool:
     return False
 
 
+def _extract_price_from_element(el) -> int | None:
+    """価格要素からできるだけ正確に価格を抽出する。
+
+    戦略:
+    1. 価格専用の子要素（.a-price-whole等）があればそれだけ使う
+    2. なければ要素の直接テキストのみ使う（子要素のポイント等を除外）
+    3. 最終的にget_text()でフォールバック
+    """
+    # 価格専用の子要素を試す
+    price_children = el.select('.a-price-whole, [class*="price-value"], [class*="priceValue"]')
+    for child in price_children:
+        price = _parse_price(child.get_text())
+        if price:
+            return price
+
+    # 要素の直接テキストのみ使う（子要素のテキストを含めない）
+    # これにより「¥12,345 (1,234ポイント)」のような場合にポイント部分を含めない
+    direct_text = ""
+    for child in el.children:
+        if isinstance(child, str):
+            direct_text += child
+    if direct_text.strip():
+        price = _parse_price(direct_text)
+        if price:
+            return price
+
+    # フォールバック: 全テキスト（改善した_parse_priceが非価格を除外する）
+    return _parse_price(el.get_text())
+
+
 def _find_price_in_soup(soup: BeautifulSoup, selectors: list[tuple[str, str, str]],
                         base_url: str = "") -> tuple[int | None, str, str]:
     """複数のCSSセレクタパターンで商品を探す。(price, name, url)を返す
@@ -314,22 +409,27 @@ def _find_price_in_soup(soup: BeautifulSoup, selectors: list[tuple[str, str, str
     3. 埋め込みJSON（__NEXT_DATA__等）
     ※正規表現フォールバックは廃止（無関係な価格を誤検出する原因のため）
     """
+    # 0. 検索結果なしページを先にチェック
+    if _is_no_results_page(soup):
+        return None, "", ""
+
     # 1. CSSセレクタで探す
     for item_sel, price_sel, name_sel in selectors:
         items = soup.select(item_sel)
         if not items:
             continue
-        for item in items:
+        for item in items[:10]:  # 最初の10件だけチェック
             price_el = item.select_one(price_sel)
             if not price_el:
                 continue
-            price = _parse_price(price_el.get_text())
+            price = _extract_price_from_element(price_el)
             if not price:
                 continue
 
             name_el = item.select_one(name_sel)
             name = name_el.get_text(strip=True) if name_el else ""
             url = ""
+            # name要素のhref
             if name_el and name_el.get("href"):
                 href = name_el["href"]
                 if href.startswith("http"):
@@ -338,6 +438,15 @@ def _find_price_in_soup(soup: BeautifulSoup, selectors: list[tuple[str, str, str
                     url = f"{base_url}{href}"
                 elif base_url:
                     url = f"{base_url}/{href}"
+            # name要素にhrefがなければ、item内の最初のaタグを試す
+            if not url:
+                link = item.select_one("a[href]")
+                if link:
+                    href = link["href"]
+                    if href.startswith("http"):
+                        url = href
+                    elif href.startswith("/") and base_url:
+                        url = f"{base_url}{href}"
 
             return price, name, url
 
