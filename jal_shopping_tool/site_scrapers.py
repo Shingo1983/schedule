@@ -198,34 +198,48 @@ def _soup(resp: requests.Response) -> BeautifulSoup:
 def _is_relevant_product(query: str, product_name: str) -> bool:
     """商品名が検索クエリと関連しているかチェック。
 
-    「airpods pro 3」で検索 → 「AirPods Pro 第3世代」はOK、「化粧水」はNG
-    検索語のうち少なくとも1つの重要語が商品名に含まれていること。
+    「airpods pro 3」で検索:
+      OK: 「Apple AirPods Pro 第3世代」(airpods+pro両方含む)
+      NG: 「化粧水」「AirPods ケース」(proが含まれない)
+
+    キーワードが2つ以上ある場合は過半数のマッチを要求。
+    これによりアクセサリや無関係な商品を除外する。
     """
     if not product_name:
         return False  # 商品名なし = 関連性判定不能 → 不採用
 
-    query_lower = query.lower()
     name_lower = product_name.lower()
 
-    # 1文字の語やストップワードを除外
+    # ストップワード（助詞・冠詞のみ。pro/max/mini等の製品修飾語は含めない）
     stop_words = {"the", "a", "an", "and", "or", "in", "on", "at", "to", "for",
-                  "no", "の", "に", "を", "は", "が", "と", "で", "も", "から", "まで",
-                  "pro", "max", "plus", "mini", "lite"}
+                  "no", "の", "に", "を", "は", "が", "と", "で", "も", "から", "まで"}
     # クエリを単語分割
-    words = re.split(r'[\s　/／\-]+', query_lower)
+    words = re.split(r'[\s　/／\-]+', query.lower())
     # 重要な語（2文字以上でストップワードでないもの）
     keywords = [w for w in words if len(w) >= 2 and w not in stop_words]
 
     if not keywords:
-        # すべてストップワード → 元の語で判定
         keywords = [w for w in words if len(w) >= 1]
 
-    # キーワードのうち少なくとも1つが商品名に含まれること
-    for kw in keywords:
-        if kw in name_lower:
-            return True
+    if not keywords:
+        return True  # キーワードなし → フィルタ不能 → 通す
 
-    return False
+    # マッチ数をカウント
+    match_count = sum(1 for kw in keywords if kw in name_lower)
+
+    if len(keywords) == 1:
+        # キーワード1つなら、それが含まれていればOK
+        return match_count >= 1
+    elif len(keywords) == 2:
+        # キーワード2つなら、2つ全部マッチ必要
+        # 例: "airpods pro" → "airpods" + "pro" 両方必要
+        return match_count >= 2
+    else:
+        # キーワード3つ以上の場合、過半数（切り上げ）のマッチを要求
+        # 例: "iPhone 16 Pro Max" → 4つ中3つ以上必要
+        required = (len(keywords) + 1) // 2 + 1  # 厳しめ: 過半数+1
+        required = min(required, len(keywords))    # 全数を超えない
+        return match_count >= required
 
 
 def _is_bot_blocked_page(soup: BeautifulSoup) -> bool:
@@ -515,7 +529,8 @@ def _find_price_in_soup(soup: BeautifulSoup, selectors: list[tuple[str, str, str
             name = name_el.get_text(strip=True) if name_el else ""
 
             # 関連性チェック（queryが指定されている場合）
-            if query and name and not _is_relevant_product(query, name):
+            # 商品名が空 or 無関係 → スキップ
+            if query and not _is_relevant_product(query, name):
                 continue  # 次の商品を試す
 
             url = _extract_url(name_el, item)
@@ -524,10 +539,10 @@ def _find_price_in_soup(soup: BeautifulSoup, selectors: list[tuple[str, str, str
     # 2. JSON-LD構造化データから探す
     jsonld_items = _extract_jsonld_prices(soup)
     if jsonld_items:
-        # 関連性でフィルタしてから最安値
+        # 関連性でフィルタしてから最安値（名前なし or 無関係は除外）
         if query:
             jsonld_items = [i for i in jsonld_items
-                           if not i["name"] or _is_relevant_product(query, i["name"])]
+                           if _is_relevant_product(query, i["name"])]
         if jsonld_items:
             cheapest = min(jsonld_items, key=lambda x: x["price"])
             return cheapest["price"], cheapest["name"], cheapest["url"]
@@ -537,7 +552,7 @@ def _find_price_in_soup(soup: BeautifulSoup, selectors: list[tuple[str, str, str
     if embedded:
         if query:
             embedded = [i for i in embedded
-                        if not i["name"] or _is_relevant_product(query, i["name"])]
+                        if _is_relevant_product(query, i["name"])]
         if embedded:
             cheapest = min(embedded, key=lambda x: x["price"])
             return cheapest["price"], cheapest["name"], cheapest["url"]
@@ -766,6 +781,10 @@ def search_amazon(query: str, _config: Config) -> ShopPrice:
 
             title_el = result.select_one("h2 a span")
             name = title_el.get_text(strip=True) if title_el else ""
+
+            # 関連性チェック（ケースや保護フィルム等のアクセサリを除外）
+            if not _is_relevant_product(query, name):
+                continue
 
             link_el = result.select_one("h2 a")
             url = ""
