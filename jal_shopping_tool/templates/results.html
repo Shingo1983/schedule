@@ -158,15 +158,16 @@
 {% if scraper_not_found %}
 <div class="card">
     <h2>自動検索で取得できなかったショップ（{{ scraper_not_found | length }}件）</h2>
-    <p class="text-small">以下のショップでは自動取得できませんでした。リンクから手動で確認できます。</p>
+    <p class="text-small">以下のショップでは自動取得できませんでした。手動で価格を確認し、入力するとLSPが計算されます。</p>
     <div class="offers-table-wrap">
         <table class="offers-table not-found-table">
             <thead>
                 <tr>
                     <th>ショップ名</th>
                     <th>マイルレート</th>
-                    <th>LSPレート</th>
-                    <th>1万円購入時</th>
+                    <th>手動価格入力</th>
+                    <th>獲得マイル / LSP</th>
+                    <th>実質価格</th>
                     <th>理由</th>
                     <th>リンク</th>
                 </tr>
@@ -176,20 +177,17 @@
                 <tr>
                     <td><strong>{{ c.shop_name }}</strong></td>
                     <td class="text-small">{{ c.mile_rate_desc }}</td>
-                    <td class="text-small">
-                        {% if c.jal_shop and c.jal_shop.yen_per_mile > 0 %}
-                        {{ '%.2f' | format(1.0 / c.jal_shop.yen_per_mile) }}
-                        {% else %}
-                        -
-                        {% endif %}
+                    <td>
+                        <input type="number"
+                               class="manual-price-input"
+                               data-yen-per-mile="{{ c.jal_shop.yen_per_mile if c.jal_shop else 0 }}"
+                               data-shop-name="{{ c.shop_name }}"
+                               placeholder="例: 35000"
+                               min="0" step="1"
+                               style="width: 110px; padding: 4px 8px; border: 1px solid var(--gray-400); border-radius: 4px; font-size: 0.85rem;">
                     </td>
-                    <td class="text-small">
-                        {% if c.jal_shop %}
-                        {{ c.jal_shop.calc_miles(10000) }}マイル / {{ c.jal_shop.calc_lsp(10000) | round(1) }} LSP
-                        {% else %}
-                        -
-                        {% endif %}
-                    </td>
+                    <td class="text-small manual-calc-result" data-lsp-value="{{ config.lsp_value_yen }}">-</td>
+                    <td class="text-small manual-effective-price">-</td>
                     <td class="text-small">
                         {% if c.error %}{{ c.error }}{% else %}商品が見つかりませんでした{% endif %}
                     </td>
@@ -249,6 +247,28 @@
 </div>
 {% endif %}
 
+{# === 手動入力の比較結果 === #}
+<div class="card" id="manual-comparison" style="display:none">
+    <h2>手動入力の比較結果</h2>
+    <p class="text-small">上で手動入力した価格をもとに、LSPを計算した結果です。</p>
+    <div class="offers-table-wrap">
+        <table class="offers-table comparison-table">
+            <thead>
+                <tr>
+                    <th class="col-shop">ショップ</th>
+                    <th class="col-price">価格</th>
+                    <th class="col-rate">マイルレート</th>
+                    <th class="col-lsp">獲得マイル</th>
+                    <th class="col-lsp">獲得LSP</th>
+                    <th class="col-effective">実質価格</th>
+                </tr>
+            </thead>
+            <tbody id="manual-comparison-body">
+            </tbody>
+        </table>
+    </div>
+</div>
+
 {# === 各ショップの最安商品名 === #}
 {% if scraper_found %}
 <div class="card">
@@ -269,5 +289,93 @@
     </div>
 </div>
 {% endif %}
+
+<script>
+(function() {
+    var lspValueYen = {{ config.lsp_value_yen }};
+
+    function formatCurrency(n) {
+        return '¥' + Math.round(n).toLocaleString('ja-JP');
+    }
+
+    function updateManualCalc(input) {
+        var price = parseInt(input.value);
+        var yenPerMile = parseInt(input.dataset.yenPerMile);
+        var row = input.closest('tr');
+        var calcCell = row.querySelector('.manual-calc-result');
+        var effectiveCell = row.querySelector('.manual-effective-price');
+
+        if (!price || price <= 0 || !yenPerMile || yenPerMile <= 0) {
+            calcCell.textContent = '-';
+            effectiveCell.textContent = '-';
+            return;
+        }
+
+        var miles = Math.floor(price / yenPerMile);
+        var lsp = miles / 100;
+        var effectivePrice = price - (lsp * lspValueYen);
+
+        calcCell.innerHTML = '<strong>' + miles + '</strong>マイル / <strong>' + lsp.toFixed(2) + '</strong> LSP';
+        effectiveCell.innerHTML = '<strong>' + formatCurrency(effectivePrice) + '</strong>';
+    }
+
+    function updateComparisonTable() {
+        var inputs = document.querySelectorAll('.manual-price-input');
+        var tbody = document.getElementById('manual-comparison-body');
+        var card = document.getElementById('manual-comparison');
+        if (!tbody || !card) return;
+
+        tbody.innerHTML = '';
+        var entries = [];
+
+        inputs.forEach(function(input) {
+            var price = parseInt(input.value);
+            var yenPerMile = parseInt(input.dataset.yenPerMile);
+            if (!price || price <= 0 || !yenPerMile) return;
+
+            var shopName = input.dataset.shopName;
+            var miles = Math.floor(price / yenPerMile);
+            var lsp = miles / 100;
+            var effectivePrice = price - (lsp * lspValueYen);
+            var mileRateDesc = input.closest('tr').querySelectorAll('td')[1].textContent.trim();
+
+            entries.push({
+                shopName: shopName,
+                price: price,
+                mileRateDesc: mileRateDesc,
+                miles: miles,
+                lsp: lsp,
+                effectivePrice: effectivePrice
+            });
+        });
+
+        entries.sort(function(a, b) { return a.effectivePrice - b.effectivePrice; });
+
+        entries.forEach(function(e) {
+            var tr = document.createElement('tr');
+            tr.innerHTML =
+                '<td><strong>' + e.shopName + '</strong></td>' +
+                '<td class="price-cell">' + formatCurrency(e.price) + '</td>' +
+                '<td class="text-small">' + e.mileRateDesc + '</td>' +
+                '<td><strong>' + e.miles + '</strong></td>' +
+                '<td><strong>' + e.lsp.toFixed(2) + '</strong></td>' +
+                '<td><strong>' + formatCurrency(e.effectivePrice) + '</strong></td>';
+            tbody.appendChild(tr);
+        });
+
+        card.style.display = entries.length > 0 ? '' : 'none';
+    }
+
+    document.querySelectorAll('.manual-price-input').forEach(function(input) {
+        input.addEventListener('input', function() {
+            updateManualCalc(this);
+            updateComparisonTable();
+        });
+        input.addEventListener('keydown', function(e) {
+            if (e.key === 'Enter') { e.preventDefault(); this.blur(); }
+        });
+    });
+})();
+</script>
 
 {% endblock %}

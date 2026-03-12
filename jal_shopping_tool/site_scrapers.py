@@ -26,19 +26,27 @@ from .config import Config
 
 logger = logging.getLogger(__name__)
 
-# 共通ヘッダー（一般的なブラウザを模倣）
+# 共通ヘッダー（最新Chromeを完全模倣 - bot検出回避）
 _HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/126.0.0.0 Safari/537.36"
+        "Chrome/131.0.0.0 Safari/537.36"
     ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
     "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
-    "Accept-Encoding": "gzip, deflate, br",
-    "DNT": "1",
-    "Connection": "keep-alive",
+    "Accept-Encoding": "gzip, deflate, br, zstd",
+    "Cache-Control": "max-age=0",
+    "Sec-Ch-Ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"Windows"',
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
     "Upgrade-Insecure-Requests": "1",
+    "Connection": "keep-alive",
+    "DNT": "1",
 }
 
 # JSON API用ヘッダー
@@ -89,6 +97,11 @@ def _fetch(url: str, headers: dict | None = None, **kwargs) -> requests.Response
     session = _new_session()
     if headers:
         session.headers.update(headers)
+    # Refererを自動設定（bot検出対策）
+    if "Referer" not in (headers or {}):
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+        session.headers["Referer"] = f"{parsed.scheme}://{parsed.netloc}/"
     return session.get(url, timeout=_TIMEOUT, **kwargs)
 
 
@@ -257,9 +270,15 @@ def _is_no_results_page(soup: BeautifulSoup) -> bool:
 
 
 def _find_price_in_soup(soup: BeautifulSoup, selectors: list[tuple[str, str, str]],
-                        base_url: str = "",
-                        skip_regex_fallback: bool = False) -> tuple[int | None, str, str]:
-    """複数のCSSセレクタパターンで商品を探す。(price, name, url)を返す"""
+                        base_url: str = "") -> tuple[int | None, str, str]:
+    """複数のCSSセレクタパターンで商品を探す。(price, name, url)を返す
+
+    戦略:
+    1. CSSセレクタでHTML要素から抽出
+    2. JSON-LD構造化データ
+    3. 埋め込みJSON（__NEXT_DATA__等）
+    ※正規表現フォールバックは廃止（無関係な価格を誤検出する原因のため）
+    """
     # 1. CSSセレクタで探す
     for item_sel, price_sel, name_sel in selectors:
         items = soup.select(item_sel)
@@ -299,23 +318,6 @@ def _find_price_in_soup(soup: BeautifulSoup, selectors: list[tuple[str, str, str
         cheapest = min(embedded, key=lambda x: x["price"])
         return cheapest["price"], cheapest["name"], cheapest["url"]
 
-    # 4. フォールバック: ページ全体から価格パターンを正規表現で探す
-    #    ※0件ページでは正規表現フォールバックをスキップ（無関係な価格を拾うのを防止）
-    if skip_regex_fallback:
-        return None, "", ""
-
-    all_text = soup.get_text()
-    price_patterns = re.findall(r'[¥￥]\s*([0-9,]+)', all_text)
-    if not price_patterns:
-        price_patterns = re.findall(r'(\d{1,3}(?:,\d{3})+)\s*円', all_text)
-    prices = []
-    for p in price_patterns:
-        val = _parse_price(p)
-        if val and val >= 100:
-            prices.append(val)
-    if prices:
-        return min(prices), "(ページ内最安値)", ""
-
     return None, "", ""
 
 
@@ -328,7 +330,7 @@ def _scrape_generic(shop_name: str, search_url: str,
                     selectors: list[tuple[str, str, str]],
                     base_url: str,
                     headers: dict | None = None) -> ShopPrice:
-    """汎用スクレイパー: HTML取得→セレクタ→JSON-LD→正規表現の順で試行"""
+    """汎用スクレイパー: HTML取得→セレクタ→JSON-LD→埋め込みJSONの順で試行"""
     try:
         resp = _fetch(search_url, headers=headers)
         if resp.status_code == 403:
@@ -337,34 +339,30 @@ def _scrape_generic(shop_name: str, search_url: str,
             return _make_error_result(shop_name, search_url, f"HTTP {resp.status_code}")
 
         soup = _soup(resp)
-
-        # 0件ページ検出: 正規表現フォールバックを抑制して無関係な価格の誤検出を防止
-        no_results = _is_no_results_page(soup)
-        price, name, url = _find_price_in_soup(
-            soup, selectors, base_url, skip_regex_fallback=no_results
-        )
+        price, name, url = _find_price_in_soup(soup, selectors, base_url)
         if price:
             return ShopPrice(shop_name, price, name, url, search_url)
 
         return ShopPrice(shop_name, None, "", "", search_url)
 
+    except requests.exceptions.SSLError:
+        return _make_error_result(shop_name, search_url, "SSL接続エラー（手動で検索してください）")
     except requests.exceptions.ConnectionError:
         return _make_error_result(shop_name, search_url, "接続エラー（手動で検索してください）")
     except requests.exceptions.Timeout:
         return _make_error_result(shop_name, search_url, "タイムアウト（手動で検索してください）")
-    except Exception:
+    except Exception as e:
+        logger.warning("scrape error for %s: %s", shop_name, e)
         return _make_error_result(shop_name, search_url, "取得失敗（手動で検索してください）")
 
 
 # ============================================================
-# 楽天市場 (API)
+# 楽天市場 (API + Webスクレイピングフォールバック)
 # ============================================================
-def search_rakuten(query: str, config: Config) -> ShopPrice:
-    search_url = f"https://search.rakuten.co.jp/search/mall/{quote(query)}/"
-
+def _search_rakuten_api(query: str, config: Config, search_url: str) -> ShopPrice | None:
+    """楽天API検索（APIキー設定済みの場合のみ）。成功時はShopPrice、失敗時はNone"""
     if not config.rakuten_app_id:
-        return ShopPrice("楽天市場", None, "", "", search_url,
-                         error="APIキー未設定（設定画面で登録してください）")
+        return None
 
     api_url = "https://app.rakuten.co.jp/services/api/IchibaItem/Search/20220601"
     params = {
@@ -378,12 +376,7 @@ def search_rakuten(query: str, config: Config) -> ShopPrice:
     try:
         resp = requests.get(api_url, params=params, timeout=_TIMEOUT)
         if resp.status_code != 200:
-            try:
-                err = resp.json()
-                msg = err.get("error_description", err.get("error", f"HTTP {resp.status_code}"))
-            except ValueError:
-                msg = f"HTTP {resp.status_code}"
-            return ShopPrice("楽天市場", None, "", "", search_url, error=f"API: {msg}")
+            return None  # APIエラー → Webスクレイピングにフォールバック
 
         data = resp.json()
         items = data.get("Items", [])
@@ -398,8 +391,27 @@ def search_rakuten(query: str, config: Config) -> ShopPrice:
             product_url=item.get("itemUrl", ""),
             search_url=search_url,
         )
-    except Exception as e:
-        return ShopPrice("楽天市場", None, "", "", search_url, error=str(e))
+    except Exception:
+        return None  # フォールバック
+
+
+def search_rakuten(query: str, config: Config) -> ShopPrice:
+    search_url = f"https://search.rakuten.co.jp/search/mall/{quote(query)}/"
+
+    # 1. APIキーがあればAPIを試行
+    api_result = _search_rakuten_api(query, config, search_url)
+    if api_result is not None:
+        return api_result
+
+    # 2. Webスクレイピングフォールバック（APIキー不要）
+    selectors = [
+        (".searchresultitem", ".important", ".title a"),
+        ('[class*="dui-card"]', '[class*="price"]', '[class*="title"] a'),
+        ('[class*="product"]', '[class*="price"]', '[class*="title"] a, [class*="name"] a'),
+        (".item", ".price", "a.title, .name a"),
+    ]
+    return _scrape_generic("楽天市場", search_url, selectors,
+                           "https://search.rakuten.co.jp")
 
 
 # ============================================================
@@ -504,7 +516,10 @@ def search_biccamera(query: str, _config: Config) -> ShopPrice:
     ]
     return _scrape_generic("ビックカメラ.com", search_url, selectors,
                            "https://www.biccamera.com",
-                           headers={"Referer": "https://www.biccamera.com/"})
+                           headers={
+                               "Referer": "https://www.biccamera.com/",
+                               "Sec-Fetch-Site": "same-origin",
+                           })
 
 
 # ============================================================
@@ -603,10 +618,11 @@ def search_qoo10(query: str, _config: Config) -> ShopPrice:
 # エディオンネットショップ (HTML + JSON-LD + 埋め込みJSON)
 # ============================================================
 def search_edion(query: str, _config: Config) -> ShopPrice:
-    search_url = f"https://www.edion.com/search?keyword={quote(query)}&sort=price_asc"
+    search_url = f"https://www.edion.com/detail_search.html?q={quote(query)}&sort=price_asc"
     selectors = [
         (".product-item, .item-list__item", ".price, .item-price", ".product-name a, .item-name a"),
-        ('[class*="product"]', '[class*="price"]', '[class*="name"] a'),
+        ('[class*="product"]', '[class*="price"]', '[class*="name"] a, [class*="title"] a'),
+        ('[class*="item"]', '[class*="price"]', '[class*="name"] a, [class*="title"] a'),
         (".searchResultItem", ".resultPrice", ".resultName a"),
     ]
     return _scrape_generic("エディオンネットショップ", search_url, selectors,
@@ -668,6 +684,7 @@ search_jalmall = _make_generic_scraper(
     "JAL Mall",
     "https://mall.jal.co.jp/search/?q={query}",
     "https://mall.jal.co.jp",
+    headers={"Sec-Fetch-Site": "same-origin", "Referer": "https://mall.jal.co.jp/"},
 )
 
 search_bellemaison = _make_generic_scraper(
@@ -716,6 +733,7 @@ search_ksdenki = _make_generic_scraper(
     "ケーズデンキオンラインショップ",
     "https://www.ksdenki.com/shop/e/esearch/?keyword={query}",
     "https://www.ksdenki.com",
+    headers={"Referer": "https://www.ksdenki.com/", "Sec-Fetch-Site": "same-origin"},
 )
 
 search_nojima = _make_generic_scraper(

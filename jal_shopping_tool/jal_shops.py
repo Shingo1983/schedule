@@ -185,7 +185,7 @@ KNOWN_SHOPS = {
         "mile_rate_desc": "200円につき1マイル",
         "yen_per_mile": 200,
         "category": "家電",
-        "search_url_template": "https://www.edion.com/search?keyword={query}",
+        "search_url_template": "https://www.edion.com/detail_search.html?q={query}",
     },
     "ケーズデンキオンラインショップ": {
         "shop_id": "10588",
