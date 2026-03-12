@@ -565,6 +565,27 @@ def _find_price_in_soup(soup: BeautifulSoup, selectors: list[tuple[str, str, str
             cheapest = min(embedded, key=lambda x: x["price"])
             return cheapest["price"], cheapest["name"], cheapest["url"]
 
+    # 4. 最終フォールバック: price属性やdata-price属性を持つ要素を探す
+    for price_el in soup.select('[data-price], [itemprop="price"]'):
+        raw = price_el.get("data-price") or price_el.get("content") or price_el.get_text()
+        price = _parse_price(str(raw))
+        if not price:
+            continue
+        # 親要素から商品名とURLを探す
+        parent = price_el
+        for _ in range(5):  # 最大5レベル上まで
+            parent = parent.parent
+            if parent is None:
+                break
+            link = parent.select_one("a[href]")
+            if link:
+                name = link.get_text(strip=True)
+                if query and not _is_relevant_product(query, name):
+                    break  # この商品は無関係
+                href = link.get("href", "")
+                url = href if href.startswith("http") else (f"{base_url}{href}" if href.startswith("/") and base_url else "")
+                return price, name, url
+
     return None, "", ""
 
 
@@ -653,7 +674,7 @@ def _search_rakuten_api(query: str, config: Config, search_url: str) -> ShopPric
     params = {
         "applicationId": config.rakuten_app_id,
         "keyword": query,
-        "hits": 5,
+        "hits": 10,
         "sort": "+itemPrice",
         "availability": 1,
     }
@@ -674,9 +695,12 @@ def _search_rakuten_api(query: str, config: Config, search_url: str) -> ShopPric
             name = item.get("itemName", "")
             if not _is_relevant_product(query, name):
                 continue
+            price = item.get("itemPrice", 0)
+            if price < 100:
+                continue
             return ShopPrice(
                 shop_name="楽天市場",
-                price=item.get("itemPrice", 0),
+                price=price,
                 product_name=name,
                 product_url=item.get("itemUrl", ""),
                 search_url=search_url,
@@ -697,10 +721,20 @@ def search_rakuten(query: str, config: Config) -> ShopPrice:
 
     # 2. Webスクレイピングフォールバック（APIキー不要）
     selectors = [
+        # 2024-2026年の楽天検索結果ページ
         (".searchresultitem", ".important", ".title a"),
         ('[class*="dui-card"]', '[class*="price"]', '[class*="title"] a'),
         ('[class*="product"]', '[class*="price"]', '[class*="title"] a, [class*="name"] a'),
+        # React版の楽天検索ページ
+        ('[data-testid*="item"], [data-testid*="product"]',
+         '[data-testid*="price"], [class*="price"]',
+         'a[data-testid*="title"], a[data-testid*="name"]'),
+        # 旧版
         (".item", ".price", "a.title, .name a"),
+        # 汎用フォールバック
+        ("div.content--2nRdK, div[class*='content']",
+         "span.price--3kDkc, span[class*='price']",
+         "a[class*='title'], a[class*='name']"),
     ]
     return _scrape_generic("楽天市場", search_url, selectors,
                            "https://search.rakuten.co.jp", query=query)
@@ -718,7 +752,7 @@ def _search_yahoo_api(query: str, config: Config, search_url: str) -> ShopPrice 
     params = {
         "appid": config.yahoo_app_id,
         "query": query,
-        "results": 5,
+        "results": 10,
         "sort": "+price",
         "in_stock": "true",
     }
@@ -738,9 +772,13 @@ def _search_yahoo_api(query: str, config: Config, search_url: str) -> ShopPrice 
             name = hit.get("name", "")
             if not _is_relevant_product(query, name):
                 continue
+            price = int(hit.get("price", 0))
+            # 最低価格チェック（100円未満はゴミデータ）
+            if price < 100:
+                continue
             return ShopPrice(
                 shop_name="Yahoo!ショッピング",
-                price=int(hit.get("price", 0)),
+                price=price,
                 product_name=name,
                 product_url=hit.get("url", ""),
                 search_url=search_url,
@@ -800,6 +838,9 @@ def search_amazon(query: str, _config: Config) -> ShopPrice:
         logger.info("Amazon: found %d search results, HTML %d chars",
                      len(results_found), len(resp.text))
 
+        # 名前取得できない場合のフォールバック用
+        first_valid_price_result = None
+
         for result in results_found:
             sponsored = result.select_one('.s-label-popover-default')
             if sponsored and 'スポンサー' in sponsored.get_text():
@@ -812,12 +853,38 @@ def search_amazon(query: str, _config: Config) -> ShopPrice:
             if not price:
                 continue
 
-            title_el = result.select_one("h2 a span")
-            name = title_el.get_text(strip=True) if title_el else ""
+            # 商品名: 複数セレクタを試す（Amazon HTML変更対応）
+            name = ""
+            for name_sel in ["h2 a span", "h2 span", "h2 a",
+                             '[data-cy="title-recipe"] a span',
+                             ".a-text-normal", ".a-link-normal .a-text-normal",
+                             'span[class*="a-size-medium"]',
+                             'span[class*="a-size-base-plus"]']:
+                title_el = result.select_one(name_sel)
+                if title_el:
+                    name = title_el.get_text(strip=True)
+                    if name:
+                        break
 
-            # 関連性チェック（ケースや保護フィルム等のアクセサリを除外）
-            if not _is_relevant_product(query, name):
+            # 商品名が取れない場合、h2全体のテキストを使う
+            if not name:
+                h2 = result.select_one("h2")
+                if h2:
+                    name = h2.get_text(strip=True)
+
+            # 関連性チェック
+            if name and not _is_relevant_product(query, name):
                 logger.info("Amazon: skipping irrelevant '%s'", name[:50])
+                continue
+
+            # 名前が空でも価格が有効なら候補として保存
+            if not name and first_valid_price_result is None:
+                link_el = result.select_one("h2 a, a.a-link-normal")
+                url = ""
+                if link_el and link_el.get("href"):
+                    href = link_el["href"]
+                    url = f"https://www.amazon.co.jp{href}" if href.startswith("/") else href
+                first_valid_price_result = ShopPrice("Amazon.co.jp", price, "(商品名取得不可)", url, search_url)
                 continue
 
             link_el = result.select_one("h2 a")
@@ -827,6 +894,11 @@ def search_amazon(query: str, _config: Config) -> ShopPrice:
                 url = f"https://www.amazon.co.jp{href}" if href.startswith("/") else href
 
             return ShopPrice("Amazon.co.jp", price, name, url, search_url)
+
+        # 名前付き商品が見つからなかった場合、名前なしでも価格があれば返す
+        if first_valid_price_result:
+            logger.info("Amazon: using nameless result with price %d", first_valid_price_result.price)
+            return first_valid_price_result
 
         # JSON-LD/embedded JSONもフォールバックとして試す
         price, name, url = _find_price_in_soup(soup, [], "https://www.amazon.co.jp", query=query)
@@ -898,7 +970,8 @@ def search_yamada(query: str, _config: Config) -> ShopPrice:
 # Joshin webショップ (スクレイピング)
 # ============================================================
 def search_joshin(query: str, _config: Config) -> ShopPrice:
-    search_url = f"https://joshinweb.jp/servlet/emall.odr_wp?SHP=0&KW={quote(query)}&SORT=PRICE_LO"
+    # Joshin 新URL（旧servletパスは404）
+    search_url = f"https://joshinweb.jp/search?keyword={quote(query)}&sort=price_asc"
     selectors = [
         (".productList__item", ".productList__price", ".productList__name a"),
         (".lineup_box", ".lineup_price", ".lineup_name a"),
@@ -947,6 +1020,10 @@ def search_qoo10(query: str, _config: Config) -> ShopPrice:
     selectors = [
         (".sc-prd", ".prc .prc-dc, .prc", ".tit a, .sbj a"),
         (".item_g", ".price, .prc", ".sbj a"),
+        # Qoo10 2025年版セレクタ
+        ('[class*="goods"]', '[class*="price"], [class*="prc"]',
+         '[class*="name"] a, [class*="sbj"] a, [class*="tit"] a'),
+        (".gd_list li, .lst_cont li", ".prc, .price", ".tit a, .sbj a, .name a"),
         ('[class*="product"]', '[class*="price"]', '[class*="title"] a, [class*="name"] a'),
         (".goods_item", ".price", ".goods_name a, .title a"),
     ]
@@ -1023,7 +1100,7 @@ search_muji = _make_generic_scraper(
 
 search_jalmall = _make_generic_scraper(
     "JAL Mall",
-    "https://ec.jal.co.jp/shop/search/result.aspx?keyword={query}",
+    "https://ec.jal.co.jp/shop/search/?keyword={query}",
     "https://ec.jal.co.jp",
     headers={"Sec-Fetch-Site": "same-origin", "Referer": "https://ec.jal.co.jp/shop/"},
 )
@@ -1066,8 +1143,8 @@ search_fancl = _make_generic_scraper(
 
 search_sony = _make_generic_scraper(
     "ソニーストア",
-    "https://www.sony.jp/search/?q={query}",
-    "https://www.sony.jp",
+    "https://store.sony.jp/search/?q={query}",
+    "https://store.sony.jp",
 )
 
 search_ksdenki = _make_generic_scraper(
@@ -1093,6 +1170,13 @@ search_dshopping = _make_generic_scraper(
     "dショッピング",
     "https://dshopping.docomo.ne.jp/search?keyword={query}",
     "https://dshopping.docomo.ne.jp",
+    selectors=[
+        (".c-productListItem, .productListItem", ".c-productListItem__price, .productPrice",
+         ".c-productListItem__name a, .productName a"),
+        ('[class*="ProductCard"]', '[class*="price"], [class*="Price"]',
+         '[class*="name"] a, [class*="title"] a'),
+        (".search-item, .item-card", ".price, .item-price", ".item-name a, .title a"),
+    ] + _GENERIC_SELECTORS,
 )
 
 search_buyma = _make_generic_scraper(
@@ -1100,7 +1184,10 @@ search_buyma = _make_generic_scraper(
     "https://www.buyma.com/r/-{query}/?sort=2",
     "https://www.buyma.com",
     selectors=[
-        (".product_body", ".product_price .price", ".product_name a"),
+        # BUYMA 2025年版
+        (".product_body", ".product_price .price, .product_price", ".product_name a"),
+        (".product-card", ".product-card__price, .price", ".product-card__name a, .product_name a"),
+        ('[class*="Product"]', '[class*="price"], [class*="Price"]', '[class*="name"] a, [class*="title"] a'),
         (".item_card", ".price", ".item_name a, .product_name a"),
         ('[class*="ProductCard"]', '[class*="price"], [class*="Price"]',
          '[class*="name"] a, [class*="title"] a'),
@@ -1133,8 +1220,8 @@ search_iherb = _make_generic_scraper(
 
 search_cosme = _make_generic_scraper(
     "@cosme SHOPPING",
-    "https://www.cosme.net/shopping/search/product/?keyword={query}",
-    "https://www.cosme.net",
+    "https://www.cosme.com/products?keyword={query}",
+    "https://www.cosme.com",
 )
 
 
@@ -1212,14 +1299,19 @@ def _retry_with_browser(results: list[ShopPrice], query: str) -> None:
     if not _HAS_PLAYWRIGHT:
         return
 
-    # 再試行対象: 価格なし & エラーなし（= HTMLは取れたがJSレンダリングが必要）
-    # + エラーありでも接続エラー以外（403等はブラウザで回避できる可能性あり）
+    # 再試行対象の選定（Playwrightでの改善が見込めるもののみ）
+    # ブラウザリトライが無意味なケース:
+    #  - API問題はブラウザで解決しない
+    #  - HTTP 404は URLが間違っている → ブラウザでも同じ
+    #  - タイムアウトはPhase1で既にタイムアウト → ブラウザでも同様の可能性大
+    #  - アクセス制限はブラウザで回避できる可能性あり → リトライ対象
+    _SKIP_ERRORS = {"APIキー", "HTTP 404", "HTTP 410", "タイムアウト"}
     retry_indices = []
     for i, r in enumerate(results):
         if r.price is not None:
             continue  # 既に価格取得済み
-        if r.error and ("APIキー" in r.error):
-            continue  # API問題はブラウザでも解決しない
+        if r.error and any(skip in r.error for skip in _SKIP_ERRORS):
+            continue  # ブラウザでも解決しないエラー
         if r.search_url:
             retry_indices.append(i)
 
