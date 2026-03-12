@@ -207,46 +207,58 @@ def _is_relevant_product(query: str, product_name: str) -> bool:
     """商品名が検索クエリと関連しているかチェック。
 
     「airpods pro 3」で検索:
-      OK: 「Apple AirPods Pro 第3世代」(airpods+pro両方含む)
-      NG: 「化粧水」「AirPods ケース」(proが含まれない)
+      OK: 「Apple AirPods Pro 第3世代」
+      NG: 「AirPods Pro ケース」「AirPods Pro 保護フィルム」（アクセサリ）
+      NG: 「化粧水」（無関係）
 
-    キーワードが2つ以上ある場合は過半数のマッチを要求。
-    これによりアクセサリや無関係な商品を除外する。
+    2段階チェック:
+    1. キーワードマッチ（過半数一致が必要）
+    2. アクセサリ除外（ケース/カバー/フィルム等を含む場合は除外）
     """
     if not product_name:
         return False  # 商品名なし = 関連性判定不能 → 不採用
 
     name_lower = product_name.lower()
 
-    # ストップワード（助詞・冠詞のみ。pro/max/mini等の製品修飾語は含めない）
+    # === アクセサリ除外 ===
+    # 検索クエリ自体がアクセサリを指している場合は除外しない
+    query_lower = query.lower()
+    _ACCESSORY_WORDS = [
+        "ケース", "カバー", "フィルム", "保護", "ストラップ", "バンド",
+        "充電器", "充電ケーブル", "アダプタ", "スタンド", "ホルダー",
+        "ポーチ", "収納", "クリーナー", "イヤーピース", "イヤーチップ",
+        "シール", "ステッカー", "スキン", "デコ",
+        "case", "cover", "film", "protector", "strap", "band",
+        "charger", "cable", "adapter", "stand", "holder", "sleeve",
+        "skin", "sticker", "pouch", "cleaning",
+    ]
+    # クエリにアクセサリワードが含まれている場合はアクセサリ除外をスキップ
+    query_wants_accessory = any(aw in query_lower for aw in _ACCESSORY_WORDS)
+    if not query_wants_accessory:
+        if any(aw in name_lower for aw in _ACCESSORY_WORDS):
+            return False  # アクセサリと判定 → 除外
+
+    # === キーワードマッチ ===
     stop_words = {"the", "a", "an", "and", "or", "in", "on", "at", "to", "for",
                   "no", "の", "に", "を", "は", "が", "と", "で", "も", "から", "まで"}
-    # クエリを単語分割
-    words = re.split(r'[\s　/／\-]+', query.lower())
-    # 重要な語（2文字以上でストップワードでないもの）
+    words = re.split(r'[\s　/／\-]+', query_lower)
     keywords = [w for w in words if len(w) >= 2 and w not in stop_words]
 
     if not keywords:
         keywords = [w for w in words if len(w) >= 1]
 
     if not keywords:
-        return True  # キーワードなし → フィルタ不能 → 通す
+        return True
 
-    # マッチ数をカウント
     match_count = sum(1 for kw in keywords if kw in name_lower)
 
     if len(keywords) == 1:
-        # キーワード1つなら、それが含まれていればOK
         return match_count >= 1
     elif len(keywords) == 2:
-        # キーワード2つなら、2つ全部マッチ必要
-        # 例: "airpods pro" → "airpods" + "pro" 両方必要
         return match_count >= 2
     else:
-        # キーワード3つ以上の場合、過半数（切り上げ）のマッチを要求
-        # 例: "iPhone 16 Pro Max" → 4つ中3つ以上必要
-        required = (len(keywords) + 1) // 2 + 1  # 厳しめ: 過半数+1
-        required = min(required, len(keywords))    # 全数を超えない
+        required = (len(keywords) + 1) // 2 + 1
+        required = min(required, len(keywords))
         return match_count >= required
 
 
@@ -674,8 +686,8 @@ def _search_rakuten_api(query: str, config: Config, search_url: str) -> ShopPric
     params = {
         "applicationId": config.rakuten_app_id,
         "keyword": query,
-        "hits": 10,
-        "sort": "+itemPrice",
+        "hits": 20,
+        "sort": "standard",  # 関連性順（価格順だとアクセサリが先に来る）
         "availability": 1,
     }
 
@@ -689,7 +701,8 @@ def _search_rakuten_api(query: str, config: Config, search_url: str) -> ShopPric
         if not items:
             return ShopPrice("楽天市場", None, "", "", search_url)
 
-        # 関連性チェック付きで最安値を探す
+        # 関連性チェック付きで最安値を探す（関連性順で取得→最安値を選択）
+        candidates = []
         for item_wrapper in items:
             item = item_wrapper.get("Item", {})
             name = item.get("itemName", "")
@@ -698,11 +711,15 @@ def _search_rakuten_api(query: str, config: Config, search_url: str) -> ShopPric
             price = item.get("itemPrice", 0)
             if price < 100:
                 continue
+            candidates.append((price, name, item.get("itemUrl", "")))
+        if candidates:
+            candidates.sort(key=lambda x: x[0])
+            price, name, url = candidates[0]
             return ShopPrice(
                 shop_name="楽天市場",
                 price=price,
                 product_name=name,
-                product_url=item.get("itemUrl", ""),
+                product_url=url,
                 search_url=search_url,
             )
         # 全て無関係だった場合
@@ -752,8 +769,8 @@ def _search_yahoo_api(query: str, config: Config, search_url: str) -> ShopPrice 
     params = {
         "appid": config.yahoo_app_id,
         "query": query,
-        "results": 10,
-        "sort": "+price",
+        "results": 20,
+        "sort": "-score",  # 関連性順（価格順だとアクセサリが先に来る）
         "in_stock": "true",
     }
 
@@ -767,20 +784,24 @@ def _search_yahoo_api(query: str, config: Config, search_url: str) -> ShopPrice 
         if not hits:
             return ShopPrice("Yahoo!ショッピング", None, "", "", search_url)
 
-        # 関連性チェック付きで最安値を探す
+        # 関連性チェック付きで最安値を探す（関連性順で取得→最安値を選択）
+        candidates = []
         for hit in hits:
             name = hit.get("name", "")
             if not _is_relevant_product(query, name):
                 continue
             price = int(hit.get("price", 0))
-            # 最低価格チェック（100円未満はゴミデータ）
             if price < 100:
                 continue
+            candidates.append((price, name, hit.get("url", "")))
+        if candidates:
+            candidates.sort(key=lambda x: x[0])  # 最安値を選択
+            price, name, url = candidates[0]
             return ShopPrice(
                 shop_name="Yahoo!ショッピング",
                 price=price,
                 product_name=name,
-                product_url=hit.get("url", ""),
+                product_url=url,
                 search_url=search_url,
             )
         return ShopPrice("Yahoo!ショッピング", None, "", "", search_url)
@@ -820,7 +841,8 @@ def search_yahoo(query: str, config: Config) -> ShopPrice:
 # Amazon.co.jp (スクレイピング)
 # ============================================================
 def search_amazon(query: str, _config: Config) -> ShopPrice:
-    search_url = f"https://www.amazon.co.jp/s?k={quote(query)}&s=price-asc-rank"
+    # 関連性順でソート（価格順だとアクセサリが先に来る）
+    search_url = f"https://www.amazon.co.jp/s?k={quote(query)}"
 
     try:
         resp = _fetch(search_url)
@@ -853,8 +875,10 @@ def search_amazon(query: str, _config: Config) -> ShopPrice:
             if not price:
                 continue
 
-            # 商品名: 複数セレクタを試す（Amazon HTML変更対応）
+            # 商品名: 複数の方法で抽出（Amazon HTML頻繁変更に対応）
             name = ""
+
+            # 方法1: 各種CSSセレクタ
             for name_sel in ["h2 a span", "h2 span", "h2 a",
                              '[data-cy="title-recipe"] a span',
                              ".a-text-normal", ".a-link-normal .a-text-normal",
@@ -866,11 +890,25 @@ def search_amazon(query: str, _config: Config) -> ShopPrice:
                     if name:
                         break
 
-            # 商品名が取れない場合、h2全体のテキストを使う
+            # 方法2: h2全体のテキスト
             if not name:
                 h2 = result.select_one("h2")
                 if h2:
                     name = h2.get_text(strip=True)
+
+            # 方法3: aria-label属性（アクセシビリティ用に商品名が入っている）
+            if not name:
+                for el in result.select("[aria-label]"):
+                    label = el.get("aria-label", "")
+                    if len(label) > 10:  # 短すぎるのは無視
+                        name = label
+                        break
+
+            # 方法4: 画像のalt属性
+            if not name:
+                img = result.select_one("img.s-image, img[data-image-latency]")
+                if img and img.get("alt"):
+                    name = img["alt"]
 
             # 関連性チェック
             if name and not _is_relevant_product(query, name):
