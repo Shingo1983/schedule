@@ -84,7 +84,7 @@ KNOWN_SHOPS = {
         "mile_rate_desc": "100円(税抜)につき1マイル",
         "yen_per_mile": 100,
         "category": "総合通販",
-        "search_url_template": "https://ec.jal.co.jp/shop/search/result.aspx?keyword={query}",
+        "search_url_template": "https://ec.jal.co.jp/shop/goods/search.aspx?keyword={query}&search=x",
     },
     "ヤマダウェブコム": {
         "shop_id": "10159",
@@ -105,7 +105,7 @@ KNOWN_SHOPS = {
         "mile_rate_desc": "200円につき1マイル",
         "yen_per_mile": 200,
         "category": "家電",
-        "search_url_template": "https://joshinweb.jp/servlet/emall.odr_wp?SHP=0&KW={query}",
+        "search_url_template": "https://joshinweb.jp/servlet/emall.odr_wp?QS=&REQUEST_CODE=1&category_id=&SHP=0&QK={query}&PID=srhzs",
     },
     "セブンネットショッピング": {
         "shop_id": "10585",
@@ -161,7 +161,7 @@ KNOWN_SHOPS = {
         "mile_rate_desc": "200円につき1マイル",
         "yen_per_mile": 200,
         "category": "家電",
-        "search_url_template": "https://store.sony.jp/search/?q={query}",
+        "search_url_template": "https://search.sony.jp/ja_all/search.x?q={query}",
     },
     "au PAY マーケット": {
         "shop_id": "15091",
@@ -255,7 +255,7 @@ KNOWN_SHOPS = {
         "mile_rate_desc": "200円につき1マイル",
         "yen_per_mile": 200,
         "category": "コスメ・健康",
-        "search_url_template": "https://www.cosme.com/products/search?keyword={query}",
+        "search_url_template": "https://www.cosme.com/products/list.php?name={query}",
     },
 }
 

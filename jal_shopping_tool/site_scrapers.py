@@ -970,8 +970,8 @@ def search_yamada(query: str, _config: Config) -> ShopPrice:
 # Joshin webショップ (スクレイピング)
 # ============================================================
 def search_joshin(query: str, _config: Config) -> ShopPrice:
-    # Joshin 新URL（旧servletパスは404）
-    search_url = f"https://joshinweb.jp/search?keyword={quote(query)}&sort=price_asc"
+    # Joshin: パラメータはQK（KWではない）、PID=srhzsが必要
+    search_url = f"https://joshinweb.jp/servlet/emall.odr_wp?QS=&REQUEST_CODE=1&category_id=&SHP=0&QK={quote(query)}&PID=srhzs"
     selectors = [
         (".productList__item", ".productList__price", ".productList__name a"),
         (".lineup_box", ".lineup_price", ".lineup_name a"),
@@ -1100,7 +1100,7 @@ search_muji = _make_generic_scraper(
 
 search_jalmall = _make_generic_scraper(
     "JAL Mall",
-    "https://ec.jal.co.jp/shop/search/?keyword={query}",
+    "https://ec.jal.co.jp/shop/goods/search.aspx?keyword={query}&search=x",
     "https://ec.jal.co.jp",
     headers={"Sec-Fetch-Site": "same-origin", "Referer": "https://ec.jal.co.jp/shop/"},
 )
@@ -1143,8 +1143,8 @@ search_fancl = _make_generic_scraper(
 
 search_sony = _make_generic_scraper(
     "ソニーストア",
-    "https://store.sony.jp/search/?q={query}",
-    "https://store.sony.jp",
+    "https://search.sony.jp/ja_all/search.x?q={query}",
+    "https://www.sony.jp",
 )
 
 search_ksdenki = _make_generic_scraper(
@@ -1220,7 +1220,7 @@ search_iherb = _make_generic_scraper(
 
 search_cosme = _make_generic_scraper(
     "@cosme SHOPPING",
-    "https://www.cosme.com/products?keyword={query}",
+    "https://www.cosme.com/products/list.php?name={query}",
     "https://www.cosme.com",
 )
 
