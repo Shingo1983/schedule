@@ -186,6 +186,11 @@ main { flex: 1; padding: 24px 0; }
 .error-list { margin-top: 12px; }
 .error-text { color: #c62828; }
 
+/* Summary card */
+.summary-card { padding: 16px 24px; }
+.summary-text { font-size: 0.9rem; color: var(--gray-600); }
+.summary-text strong { color: var(--gray-800); }
+
 /* Not found list */
 .not-found-list { display: flex; flex-direction: column; gap: 8px; margin-top: 8px; }
 .not-found-item {
@@ -196,9 +201,17 @@ main { flex: 1; padding: 24px 0; }
     background: var(--gray-50);
     border-radius: var(--radius);
     border: 1px solid var(--gray-200);
+    min-height: 44px;
 }
-.not-found-name { font-weight: 600; min-width: 140px; }
-.not-found-reason { flex: 1; color: var(--gray-600); }
+.not-found-name { font-weight: 600; min-width: 160px; flex-shrink: 0; }
+.not-found-reason {
+    flex: 1;
+    color: var(--gray-600);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
+}
 
 /* Product details */
 .product-details { display: flex; flex-direction: column; gap: 8px; margin-top: 8px; }

@@ -674,24 +674,14 @@ SCRAPERS = [
     (search_edion, "エディオンネットショップ"),
 ]
 
-# スクレイパーがないが検索URLを提供できるショップ
-# （結果画面で「手動検索」リンクとして表示）
-MANUAL_SEARCH_SHOPS = [
-    "ケーズデンキオンラインショップ",
-    "ノジマオンライン",
-    "マツモトキヨシオンラインストア",
-    "dショッピング",
-    "BUYMA",
-    "ABC-MARTオンラインストア",
-    "GU オンラインストア",
-    "ショップジャパン",
-    "iHerb",
-    "@cosme SHOPPING",
-    "ベルメゾンネット",
-    "LOHACO",
-    "ニトリネット",
-    "ZOZOTOWN",
-]
+# スクレイパー対応済みショップ名のセット（自動生成）
+SCRAPER_SHOP_NAMES = {name for _, name in SCRAPERS}
+
+
+def get_manual_search_shops() -> list[str]:
+    """スクレイパー未対応のKNOWN_SHOPSを自動的に返す（常にKNOWN_SHOPSと同期）"""
+    from .jal_shops import KNOWN_SHOPS
+    return [name for name in KNOWN_SHOPS if name not in SCRAPER_SHOP_NAMES]
 
 
 def search_all_shops(query: str, config: Config) -> list[ShopPrice]:

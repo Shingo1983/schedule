@@ -361,7 +361,8 @@ def save_shops_cache(shops: list[JalShop]) -> None:
 def get_shops() -> list[JalShop]:
     """ショップ一覧を取得（キャッシュ→組み込みデータの順で検索）"""
     cached = load_cached_shops()
-    if cached:
+    # キャッシュのショップ数がKNOWN_SHOPSと異なる場合は再生成
+    if cached and len(cached) == len(KNOWN_SHOPS):
         return cached
     shops = load_known_shops()
     save_shops_cache(shops)

@@ -8,7 +8,7 @@ from .analyzer import analyze
 from .config import Config
 from .jal_shops import get_shops, SHOP_CACHE_FILE
 from .price_search import search_all_sites
-from .site_scrapers import MANUAL_SEARCH_SHOPS
+from .site_scrapers import get_manual_search_shops, SCRAPER_SHOP_NAMES
 
 
 def create_app() -> Flask:
@@ -37,11 +37,12 @@ def create_app() -> Flask:
         # 分析
         analysis = analyze(query, shop_prices, config)
 
-        # 手動検索ショップのURL生成
+        # 手動検索ショップのURL生成（スクレイパー未対応の全ショップ）
         jal_shops = get_shops()
         jal_shop_map = {s.name: s for s in jal_shops}
+        manual_shop_names = get_manual_search_shops()
         manual_shops = []
-        for name in MANUAL_SEARCH_SHOPS:
+        for name in manual_shop_names:
             shop = jal_shop_map.get(name)
             if shop:
                 manual_shops.append({
@@ -52,6 +53,9 @@ def create_app() -> Flask:
                     "category": shop.category,
                 })
 
+        # 全ショップ数（ショップ一覧ページと同じ数）
+        total_shop_count = len(jal_shops)
+
         return render_template(
             "results.html",
             query=query,
@@ -59,13 +63,22 @@ def create_app() -> Flask:
             errors=errors,
             config=config,
             manual_shops=manual_shops,
+            total_shop_count=total_shop_count,
         )
 
     @app.route("/shops")
     def shops():
         shop_list = get_shops()
         shop_list.sort(key=lambda s: s.yen_per_mile)
-        return render_template("shops.html", shops=shop_list)
+        auto_count = len(SCRAPER_SHOP_NAMES)
+        manual_count = len(shop_list) - auto_count
+        return render_template(
+            "shops.html",
+            shops=shop_list,
+            scraper_names=SCRAPER_SHOP_NAMES,
+            auto_count=auto_count,
+            manual_count=manual_count,
+        )
 
     @app.route("/settings", methods=["GET", "POST"])
     def settings():

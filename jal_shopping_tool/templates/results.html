@@ -12,17 +12,31 @@
     </form>
 </div>
 
-{% if analysis.found_count == 0 %}
+{# ショップ数の集計 #}
+{% set scraper_found = [] %}
+{% set scraper_not_found = [] %}
+{% for c in analysis.comparisons %}
+{% if c.price is not none and c.price > 0 %}
+{% if scraper_found.append(c) %}{% endif %}
+{% else %}
+{% if scraper_not_found.append(c) %}{% endif %}
+{% endif %}
+{% endfor %}
+
+<div class="card summary-card">
+    <p class="summary-text">
+        全<strong>{{ total_shop_count }}</strong>ショップ中、
+        自動検索 <strong>{{ analysis.total_count }}</strong>件
+        （価格取得 <strong>{{ scraper_found | length }}</strong>件 /
+        取得失敗 <strong>{{ scraper_not_found | length }}</strong>件）
+        ＋ 手動検索 <strong>{{ manual_shops | length }}</strong>件
+        ・1 LSP = {{ config.lsp_value_yen }}円として計算（<a href="{{ url_for('settings') }}">変更</a>）
+    </p>
+</div>
+
+{% if scraper_found | length == 0 %}
 <div class="card">
     <p>どのショップでも商品が見つかりませんでした。検索キーワードを変えてお試しください。</p>
-    {% if errors %}
-    <div class="error-list">
-        <p class="text-small"><strong>エラー詳細:</strong></p>
-        {% for err in errors %}
-        <p class="text-small error-text">{{ err }}</p>
-        {% endfor %}
-    </div>
-    {% endif %}
 </div>
 {% else %}
 
@@ -57,12 +71,11 @@
 </div>
 {% endif %}
 
-{# === メイン比較テーブル === #}
+{# === メイン比較テーブル（価格取得成功分） === #}
 <div class="card">
     <h2>全ショップ比較（価格順）</h2>
     <p class="text-small">
-        {{ analysis.found_count }}/{{ analysis.total_count }}ショップで商品が見つかりました
-        ・1 LSP = {{ config.lsp_value_yen }}円として計算（<a href="{{ url_for('settings') }}">変更</a>）
+        {{ scraper_found | length }}/{{ analysis.total_count }}ショップで商品が見つかりました
     </p>
 
     <div class="offers-table-wrap">
@@ -144,25 +157,23 @@
         </table>
     </div>
 </div>
-
-{# === 自動取得できなかったショップ === #}
-{% set not_found = [] %}
-{% for c in analysis.comparisons %}
-{% if c.price is none or c.price == 0 %}
-{% if not_found.append(c) %}{% endif %}
 {% endif %}
-{% endfor %}
 
-{% if not_found %}
+{# === 自動検索で取得できなかったショップ === #}
+{% if scraper_not_found %}
 <div class="card">
-    <h2>取得できなかったショップ</h2>
+    <h2>自動検索で取得できなかったショップ（{{ scraper_not_found | length }}件）</h2>
     <p class="text-small">以下のショップでは自動取得できませんでした。リンクから手動で確認できます。</p>
     <div class="not-found-list">
-        {% for c in not_found %}
+        {% for c in scraper_not_found %}
         <div class="not-found-item">
             <span class="not-found-name">{{ c.shop_name }}</span>
             <span class="not-found-reason text-small">
-                {% if c.error %}{{ c.error }}{% else %}商品が見つかりませんでした{% endif %}
+                {% if c.error %}
+                {{ c.error | truncate(60, True, '…') }}
+                {% else %}
+                商品が見つかりませんでした
+                {% endif %}
             </span>
             {% if c.search_url %}
             <a href="{{ c.search_url }}" target="_blank" rel="noopener" class="btn btn-small btn-outline">手動で検索</a>
@@ -176,7 +187,7 @@
 {# === 手動検索ショップ（スクレイパー未対応） === #}
 {% if manual_shops %}
 <div class="card">
-    <h2>その他の提携ショップ（手動検索）</h2>
+    <h2>その他の提携ショップ（{{ manual_shops | length }}件・手動検索）</h2>
     <p class="text-small">以下のショップはJALマイレージパーク提携ですが、自動検索には未対応です。リンクから手動で検索できます。</p>
     <div class="not-found-list">
         {% for ms in manual_shops %}
@@ -198,15 +209,12 @@
 {% endif %}
 
 {# === 各ショップの最安商品名 === #}
-{% set found = [] %}
-{% for c in analysis.comparisons if c.price is not none and c.price > 0 and c.product_name %}
-{% if found.append(c) %}{% endif %}
-{% endfor %}
-{% if found %}
+{% if scraper_found %}
 <div class="card">
     <h2>各ショップの最安商品</h2>
     <div class="product-details">
-        {% for c in found %}
+        {% for c in scraper_found %}
+        {% if c.product_name %}
         <div class="product-detail-item">
             <div class="product-detail-shop">{{ c.shop_name }}</div>
             <div class="product-detail-name">{{ c.product_name }}</div>
@@ -215,10 +223,10 @@
             <a href="{{ c.product_url }}" target="_blank" rel="noopener" class="btn btn-small btn-outline">商品ページ</a>
             {% endif %}
         </div>
+        {% endif %}
         {% endfor %}
     </div>
 </div>
 {% endif %}
 
-{% endif %}
 {% endblock %}
