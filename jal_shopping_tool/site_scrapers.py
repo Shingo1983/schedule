@@ -404,6 +404,10 @@ def _extract_embedded_json(html: str) -> list[dict]:
         r'<script\s+id="__NEXT_DATA__"\s+type="application/json">\s*({.+?})\s*</script>',
         r'window\.__INITIAL_STATE__\s*=\s*({.+?});\s*</script>',
         r'window\.__PRELOADED_STATE__\s*=\s*({.+?});\s*</script>',
+        r'window\.__NUXT__\s*=\s*({.+?});\s*</script>',
+        r'window\.__data\s*=\s*({.+?});\s*</script>',
+        r'window\.searchResult\s*=\s*({.+?});\s*</script>',
+        r'<script[^>]*>\s*var\s+(?:searchData|productData|itemData)\s*=\s*({.+?});\s*</script>',
     ]
 
     for pattern in patterns:
@@ -598,15 +602,14 @@ def _find_price_in_soup(soup: BeautifulSoup, selectors: list[tuple[str, str, str
             cheapest = min(embedded, key=lambda x: x["price"])
             return cheapest["price"], cheapest["name"], cheapest["url"]
 
-    # 4. 最終フォールバック: price属性やdata-price属性を持つ要素を探す
+    # 4. data-price属性を持つ要素を探す
     for price_el in soup.select('[data-price], [itemprop="price"]'):
         raw = price_el.get("data-price") or price_el.get("content") or price_el.get_text()
         price = _parse_price(str(raw))
         if not price:
             continue
-        # 親要素から商品名とURLを探す
         parent = price_el
-        for _ in range(5):  # 最大5レベル上まで
+        for _ in range(5):
             parent = parent.parent
             if parent is None:
                 break
@@ -614,12 +617,95 @@ def _find_price_in_soup(soup: BeautifulSoup, selectors: list[tuple[str, str, str
             if link:
                 name = link.get_text(strip=True)
                 if query and not _is_relevant_product(query, name):
-                    break  # この商品は無関係
+                    break
                 href = link.get("href", "")
                 url = href if href.startswith("http") else (f"{base_url}{href}" if href.startswith("/") and base_url else "")
                 return price, name, url
 
+    # 5. テキストベース汎用抽出（CSSセレクタに依存しない最終手段）
+    # 全ての<a>タグからクエリに関連する商品リンクを見つけ、
+    # その近くにある価格テキストを抽出する
+    if query:
+        result = _extract_price_by_text(soup, query, base_url)
+        if result:
+            return result
+
     return None, "", ""
+
+
+def _extract_price_by_text(soup: BeautifulSoup, query: str,
+                           base_url: str) -> tuple[int, str, str] | None:
+    """テキストベースの汎用価格抽出（CSSセレクタ不要）
+
+    戦略: <a>タグのテキストからクエリに関連する商品を見つけ、
+    その親要素内の価格パターンを探す。
+    あらゆるECサイトのHTML構造に対応できる汎用的なアプローチ。
+    """
+    candidates = []
+
+    # 全<a>タグの中からクエリにマッチする商品リンクを探す
+    for link in soup.find_all("a", href=True):
+        name = link.get_text(strip=True)
+        if not name or len(name) < 5:
+            continue
+        if not _is_relevant_product(query, name):
+            continue
+
+        # この商品リンクの周辺（親要素）から価格を探す
+        price = None
+        for parent_level in range(1, 8):  # 親を1〜7レベル上まで探索
+            parent = link
+            for _ in range(parent_level):
+                if parent.parent is None:
+                    break
+                parent = parent.parent
+
+            if parent is None:
+                break
+
+            # 親要素内のテキストから価格パターンを探す
+            parent_text = parent.get_text(separator=" ", strip=True)
+            # 価格パターン: ¥XX,XXX または XX,XXX円 または 税込XX,XXX
+            price_patterns = [
+                r'[¥￥]\s*([\d,]+)',
+                r'([\d]{1,3}(?:,\d{3})+)\s*円',
+                r'(?:税込|価格|特価)\s*[^\d]*([\d]{1,3}(?:,\d{3})+)',
+            ]
+            found_prices = []
+            for pattern in price_patterns:
+                for m in re.finditer(pattern, parent_text):
+                    digits = re.sub(r'[^\d]', '', m.group(1))
+                    if digits:
+                        val = int(digits)
+                        if 100 <= val <= 99_999_999:
+                            found_prices.append(val)
+
+            if found_prices:
+                # 商品の価格として最も妥当なもの（最小値）を採用
+                price = min(found_prices)
+                break
+
+        if price:
+            href = link.get("href", "")
+            if href.startswith("http"):
+                url = href
+            elif href.startswith("/") and base_url:
+                url = f"{base_url}{href}"
+            else:
+                url = ""
+            candidates.append((price, name, url))
+
+    if not candidates:
+        return None
+
+    # 外れ値除去 + 最安値選択
+    candidates.sort(key=lambda x: x[0])
+    if len(candidates) >= 3:
+        median_price = candidates[len(candidates) // 2][0]
+        candidates = [c for c in candidates if c[0] >= median_price * 0.3]
+    if candidates:
+        return candidates[0]
+    return None
 
 
 def _make_error_result(shop_name: str, search_url: str, error: str) -> ShopPrice:
