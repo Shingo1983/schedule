@@ -722,7 +722,7 @@ def _search_rakuten_api(query: str, config: Config, search_url: str) -> ShopPric
         if not items:
             return ShopPrice("楽天市場", None, "", "", search_url)
 
-        # 関連性チェック付きで最安値を探す（関連性順で取得→最安値を選択）
+        # 関連性チェック→外れ値除去→最安値選択
         candidates = []
         for item_wrapper in items:
             item = item_wrapper.get("Item", {})
@@ -735,14 +735,19 @@ def _search_rakuten_api(query: str, config: Config, search_url: str) -> ShopPric
             candidates.append((price, name, item.get("itemUrl", "")))
         if candidates:
             candidates.sort(key=lambda x: x[0])
-            price, name, url = candidates[0]
-            return ShopPrice(
-                shop_name="楽天市場",
-                price=price,
-                product_name=name,
-                product_url=url,
-                search_url=search_url,
-            )
+            # 外れ値除去
+            if len(candidates) >= 3:
+                median_price = candidates[len(candidates) // 2][0]
+                candidates = [c for c in candidates if c[0] >= median_price * 0.3]
+            if candidates:
+                price, name, url = candidates[0]
+                return ShopPrice(
+                    shop_name="楽天市場",
+                    price=price,
+                    product_name=name,
+                    product_url=url,
+                    search_url=search_url,
+                )
         # 全て無関係だった場合
         return ShopPrice("楽天市場", None, "", "", search_url)
     except Exception:
@@ -805,7 +810,7 @@ def _search_yahoo_api(query: str, config: Config, search_url: str) -> ShopPrice 
         if not hits:
             return ShopPrice("Yahoo!ショッピング", None, "", "", search_url)
 
-        # 関連性チェック付きで最安値を探す（関連性順で取得→最安値を選択）
+        # 関連性チェック→外れ値除去→最安値選択
         candidates = []
         for hit in hits:
             name = hit.get("name", "")
@@ -816,15 +821,21 @@ def _search_yahoo_api(query: str, config: Config, search_url: str) -> ShopPrice 
                 continue
             candidates.append((price, name, hit.get("url", "")))
         if candidates:
-            candidates.sort(key=lambda x: x[0])  # 最安値を選択
-            price, name, url = candidates[0]
-            return ShopPrice(
-                shop_name="Yahoo!ショッピング",
-                price=price,
-                product_name=name,
-                product_url=url,
-                search_url=search_url,
-            )
+            candidates.sort(key=lambda x: x[0])
+            # 外れ値除去: 3件以上あれば中央値の30%未満の価格は除外
+            # （アクセサリがフィルタをすり抜けた場合の安全策）
+            if len(candidates) >= 3:
+                median_price = candidates[len(candidates) // 2][0]
+                candidates = [c for c in candidates if c[0] >= median_price * 0.3]
+            if candidates:
+                price, name, url = candidates[0]
+                return ShopPrice(
+                    shop_name="Yahoo!ショッピング",
+                    price=price,
+                    product_name=name,
+                    product_url=url,
+                    search_url=search_url,
+                )
         return ShopPrice("Yahoo!ショッピング", None, "", "", search_url)
     except Exception:
         return None  # フォールバック
@@ -1359,34 +1370,62 @@ def _retry_with_browser(results: list[ShopPrice], query: str) -> None:
         return
 
     # 再試行対象の選定
-    # タイムアウト/アクセス制限: cloudscraperでは失敗してもブラウザなら成功する可能性大
-    # HTTP 404: URLが間違っている → ブラウザでも同じ → スキップ
     _SKIP_ERRORS = {"APIキー", "HTTP 404", "HTTP 410"}
-    retry_indices = []
+    retry_normal = []   # Phase1でHTMLは取れたがprice抽出失敗 → 成功見込み高
+    retry_timeout = []  # Phase1でタイムアウト/アクセス制限 → ブラウザなら成功の可能性
     for i, r in enumerate(results):
         if r.price is not None:
-            continue  # 既に価格取得済み
+            continue
         if r.error and any(skip in r.error for skip in _SKIP_ERRORS):
-            continue  # ブラウザでも解決しないエラー
-        if r.search_url:
-            retry_indices.append(i)
+            continue
+        if not r.search_url:
+            continue
+        if r.error and ("タイムアウト" in r.error or "アクセス制限" in r.error):
+            retry_timeout.append(i)
+        else:
+            retry_normal.append(i)
+
+    # 成功見込みの高いショップを先にリトライ
+    retry_indices = retry_normal + retry_timeout
 
     if not retry_indices:
         return
 
     logger.info("Phase 2: Playwright browser retry for %d shops", len(retry_indices))
 
+    # Phase 2 全体の時間制限（3分）
+    phase2_start = time.time()
+    PHASE2_BUDGET = 180  # 秒
+
+    def _launch_browser(pw):
+        """ブラウザ起動: Chrome → Chromiumの順にフォールバック"""
+        launch_args = [
+            "--disable-http2",
+            "--no-sandbox",
+            "--disable-blink-features=AutomationControlled",
+        ]
+        # まず実際のChromeを試す（最もリアルなフィンガープリント）
+        try:
+            browser = pw.chromium.launch(
+                channel="chrome",
+                headless=True,
+                args=launch_args,
+            )
+            logger.info("Phase 2: Using installed Chrome browser")
+            return browser
+        except Exception:
+            pass
+        # フォールバック: Playwright同梱のChromium
+        browser = pw.chromium.launch(
+            headless=True,
+            args=launch_args,
+        )
+        logger.info("Phase 2: Using Playwright Chromium")
+        return browser
+
     try:
         with sync_playwright() as pw:
-            browser = pw.chromium.launch(
-                headless=True,
-                args=[
-                    "--disable-http2",
-                    "--no-sandbox",
-                    "--disable-blink-features=AutomationControlled",
-                    "--disable-features=IsolateOrigins,site-per-process",
-                ],
-            )
+            browser = _launch_browser(pw)
             context = browser.new_context(
                 user_agent=_HEADERS["User-Agent"],
                 locale="ja-JP",
@@ -1396,21 +1435,26 @@ def _retry_with_browser(results: list[ShopPrice], query: str) -> None:
                     "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
                 },
             )
-            # ステルス: navigator.webdriver を隠す（bot検出回避）
+            # ステルス: bot検出回避（最小限で安全な変更のみ）
             context.add_init_script("""
                 Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-                Object.defineProperty(navigator, 'languages', {get: () => ['ja', 'en-US', 'en']});
-                Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
-                window.chrome = {runtime: {}};
+                if (window.chrome === undefined) { window.chrome = {runtime: {}}; }
             """)
 
             for idx in retry_indices:
+                # 時間制限チェック
+                elapsed = time.time() - phase2_start
+                if elapsed > PHASE2_BUDGET:
+                    remaining = len(retry_indices) - retry_indices.index(idx)
+                    logger.info("Phase 2: time budget exceeded (%.0fs), skipping %d shops",
+                                elapsed, remaining)
+                    break
+
                 r = results[idx]
                 page = None
                 try:
                     page = context.new_page()
-                    # タイムアウトを45秒に延長（家電サイトは重いが確実にロードされる）
-                    page.goto(r.search_url, timeout=45000, wait_until="domcontentloaded")
+                    page.goto(r.search_url, timeout=30000, wait_until="domcontentloaded")
                     # JS描画を待つ
                     page.wait_for_timeout(3000)
                     html = page.content()
@@ -1431,7 +1475,8 @@ def _retry_with_browser(results: list[ShopPrice], query: str) -> None:
                         results[idx] = ShopPrice(r.shop_name, price, name, url, r.search_url)
                         logger.info("Browser retry success: %s = %d", r.shop_name, price)
                     else:
-                        logger.info("Browser retry: no price found for %s", r.shop_name)
+                        logger.info("Browser retry: no price found for %s (HTML %d chars)",
+                                    r.shop_name, len(html))
 
                 except Exception as e:
                     logger.warning("Browser retry error for %s: %s", r.shop_name, e)
