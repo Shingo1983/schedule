@@ -2,7 +2,7 @@
 
 import os
 
-from flask import Flask, render_template, request, redirect, url_for, flash
+from flask import Flask, render_template, request, redirect, url_for, flash, make_response
 
 from .analyzer import analyze
 from .config import Config
@@ -14,6 +14,13 @@ from .site_scrapers import get_manual_search_shops, SCRAPER_SHOP_NAMES, _HAS_CLO
 def create_app() -> Flask:
     app = Flask(__name__)
     app.secret_key = os.environ.get("SECRET_KEY", "jal-lsp-shopping-tool-dev")
+
+    @app.after_request
+    def add_no_cache_headers(response):
+        response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+        return response
 
     @app.route("/")
     def index():

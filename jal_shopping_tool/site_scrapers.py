@@ -349,7 +349,7 @@ def _extract_jsonld_prices(soup: BeautifulSoup) -> list[dict]:
             if not price and item.get("price") is not None:
                 price = _parse_price(str(item["price"]))
 
-            if price and name:  # 名前がないものは除外
+            if price and name and 100 <= price <= 99_999_999:  # 名前がないもの・異常値は除外
                 results.append({"name": name, "price": price, "url": url})
 
     return results
@@ -522,7 +522,7 @@ def _find_price_in_soup(soup: BeautifulSoup, selectors: list[tuple[str, str, str
             if not price_el:
                 continue
             price = _extract_price_from_element(price_el)
-            if not price:
+            if not price or price > 99_999_999:
                 continue
 
             name_el = item.select_one(name_sel)
@@ -656,14 +656,21 @@ def _search_rakuten_api(query: str, config: Config, search_url: str) -> ShopPric
         if not items:
             return ShopPrice("楽天市場", None, "", "", search_url)
 
-        item = items[0].get("Item", {})
-        return ShopPrice(
-            shop_name="楽天市場",
-            price=item.get("itemPrice", 0),
-            product_name=item.get("itemName", ""),
-            product_url=item.get("itemUrl", ""),
-            search_url=search_url,
-        )
+        # 関連性チェック付きで最安値を探す
+        for item_wrapper in items:
+            item = item_wrapper.get("Item", {})
+            name = item.get("itemName", "")
+            if not _is_relevant_product(query, name):
+                continue
+            return ShopPrice(
+                shop_name="楽天市場",
+                price=item.get("itemPrice", 0),
+                product_name=name,
+                product_url=item.get("itemUrl", ""),
+                search_url=search_url,
+            )
+        # 全て無関係だった場合
+        return ShopPrice("楽天市場", None, "", "", search_url)
     except Exception:
         return None  # フォールバック
 
@@ -714,14 +721,19 @@ def _search_yahoo_api(query: str, config: Config, search_url: str) -> ShopPrice 
         if not hits:
             return ShopPrice("Yahoo!ショッピング", None, "", "", search_url)
 
-        hit = hits[0]
-        return ShopPrice(
-            shop_name="Yahoo!ショッピング",
-            price=int(hit.get("price", 0)),
-            product_name=hit.get("name", ""),
-            product_url=hit.get("url", ""),
-            search_url=search_url,
-        )
+        # 関連性チェック付きで最安値を探す
+        for hit in hits:
+            name = hit.get("name", "")
+            if not _is_relevant_product(query, name):
+                continue
+            return ShopPrice(
+                shop_name="Yahoo!ショッピング",
+                price=int(hit.get("price", 0)),
+                product_name=name,
+                product_url=hit.get("url", ""),
+                search_url=search_url,
+            )
+        return ShopPrice("Yahoo!ショッピング", None, "", "", search_url)
     except Exception:
         return None  # フォールバック
 
