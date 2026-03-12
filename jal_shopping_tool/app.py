@@ -8,7 +8,7 @@ from .analyzer import analyze
 from .config import Config
 from .jal_shops import get_shops, SHOP_CACHE_FILE
 from .price_search import search_all_sites
-from .site_scrapers import get_manual_search_shops, SCRAPER_SHOP_NAMES
+from .site_scrapers import get_manual_search_shops, SCRAPER_SHOP_NAMES, _HAS_CLOUDSCRAPER, _HAS_PLAYWRIGHT
 
 
 def create_app() -> Flask:
@@ -69,6 +69,8 @@ def create_app() -> Flask:
             config=config,
             manual_shops=manual_shops,
             total_shop_count=total_shop_count,
+            has_cloudscraper=_HAS_CLOUDSCRAPER,
+            has_playwright=_HAS_PLAYWRIGHT,
         )
 
     @app.route("/shops")

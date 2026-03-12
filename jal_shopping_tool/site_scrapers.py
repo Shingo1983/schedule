@@ -4,18 +4,21 @@ JALマイレージパーク提携ショップの検索ページをスクレイ�
 商品の最安値を取得する。
 
 戦略:
-1. CSSセレクタでHTML要素から価格を取得（サーバーサイドレンダリングのサイト）
-2. JSON-LD構造化データから価格を取得（SEO用にSPAでも埋め込まれていることが多い）
-3. ページ内のJSON（__NEXT_DATA__等）から価格を取得
-4. 正規表現でページ全体から価格パターンを検出（最終手段）
+Phase 1: cloudscraper + BeautifulSoup（高速、bot検出回避）
+  1. CSSセレクタでHTML要素から価格を取得
+  2. JSON-LD構造化データから価格を取得
+  3. ページ内のJSON（__NEXT_DATA__等）から価格を取得
+Phase 2: Playwright ブラウザレンダリング（Phase 1で失敗したショップのみ）
+  JavaScript描画のSPAサイトでも価格を取得可能
 """
 
 import json
 import re
 import logging
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -25,6 +28,28 @@ from bs4 import BeautifulSoup
 from .config import Config
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# cloudscraper（Cloudflare/bot検出回避）: オプショナル
+# ---------------------------------------------------------------------------
+try:
+    import cloudscraper
+    _HAS_CLOUDSCRAPER = True
+    logger.info("cloudscraper available - anti-bot bypass enabled")
+except ImportError:
+    _HAS_CLOUDSCRAPER = False
+    logger.info("cloudscraper not installed - using standard requests")
+
+# ---------------------------------------------------------------------------
+# Playwright（ブラウザレンダリング）: オプショナル
+# ---------------------------------------------------------------------------
+_HAS_PLAYWRIGHT = False
+try:
+    from playwright.sync_api import sync_playwright
+    _HAS_PLAYWRIGHT = True
+    logger.info("playwright available - browser rendering enabled")
+except ImportError:
+    logger.info("playwright not installed - browser rendering disabled")
 
 # 共通ヘッダー（最新Chromeを完全模倣 - bot検出回避）
 _HEADERS = {
@@ -77,29 +102,39 @@ class ShopPrice:
 
 
 def _new_session() -> requests.Session:
-    """毎回新しいHTTPセッションを作成（接続プール問題を回避）"""
-    session = requests.Session()
-    retry = Retry(
-        total=2,
-        backoff_factor=1.0,
-        status_forcelist=[500, 502, 503, 504],
-        allowed_methods=["GET"],
-    )
-    adapter = HTTPAdapter(max_retries=retry)
-    session.mount("https://", adapter)
-    session.mount("http://", adapter)
-    session.headers.update(_HEADERS)
+    """毎回新しいHTTPセッションを作成
+    cloudscraper利用可能時はCloudflare/bot検出を自動回避
+    """
+    if _HAS_CLOUDSCRAPER:
+        session = cloudscraper.create_scraper(
+            browser={"browser": "chrome", "platform": "windows", "desktop": True},
+        )
+        # cloudscraper のUser-Agentを維持（TLSフィンガープリントと一致させるため）
+        # UA以外のヘッダーのみ追加
+        extra = {k: v for k, v in _HEADERS.items() if k.lower() != "user-agent"}
+        session.headers.update(extra)
+    else:
+        session = requests.Session()
+        retry = Retry(
+            total=2,
+            backoff_factor=1.0,
+            status_forcelist=[500, 502, 503, 504],
+            allowed_methods=["GET"],
+        )
+        adapter = HTTPAdapter(max_retries=retry)
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        session.headers.update(_HEADERS)
     return session
 
 
 def _fetch(url: str, headers: dict | None = None, **kwargs) -> requests.Response:
-    """HTTP GETリクエスト（毎回新しいセッションを使用）"""
+    """HTTP GETリクエスト（cloudscraper対応）"""
     session = _new_session()
     if headers:
         session.headers.update(headers)
     # Refererを自動設定（bot検出対策）
     if "Referer" not in (headers or {}):
-        from urllib.parse import urlparse
         parsed = urlparse(url)
         session.headers["Referer"] = f"{parsed.scheme}://{parsed.netloc}/"
     return session.get(url, timeout=_TIMEOUT, **kwargs)
@@ -842,10 +877,100 @@ def get_manual_search_shops() -> list[str]:
     return [name for name in KNOWN_SHOPS if name not in SCRAPER_SHOP_NAMES]
 
 
+def _get_selectors_for_shop(shop_name: str) -> list[tuple[str, str, str]]:
+    """ショップ名から対応するCSSセレクタを取得"""
+    for scraper_fn, name in SCRAPERS:
+        if name == shop_name:
+            # 各スクレイパーのselectorsを取得するため、ダミー呼び出しはせず
+            # 汎用セレクタ＋拡張セレクタを返す
+            break
+    return _GENERIC_SELECTORS + [
+        ('[class*="product"]', '[class*="price"]', '[class*="name"] a, [class*="title"] a'),
+        ('[class*="item"]', '[class*="price"]', '[class*="name"] a, [class*="title"] a'),
+        ("li", '[class*="price"]', 'a'),
+    ]
+
+
+def _retry_with_browser(results: list[ShopPrice], query: str) -> None:
+    """Phase 2: Playwright ブラウザレンダリングで失敗したショップを再試行
+
+    Phase 1 (cloudscraper) で価格取得できなかったショップのみ対象。
+    ブラウザでJavaScript描画を実行し、レンダリング後のHTMLから価格を抽出する。
+    """
+    if not _HAS_PLAYWRIGHT:
+        return
+
+    # 再試行対象: 価格なし & エラーなし（= HTMLは取れたがJSレンダリングが必要）
+    # + エラーありでも接続エラー以外（403等はブラウザで回避できる可能性あり）
+    retry_indices = []
+    for i, r in enumerate(results):
+        if r.price is not None:
+            continue  # 既に価格取得済み
+        if r.error and ("APIキー" in r.error or "タイムアウト" in r.error):
+            continue  # API問題・タイムアウトはブラウザでも解決しない
+        if r.search_url:
+            retry_indices.append(i)
+
+    if not retry_indices:
+        return
+
+    logger.info("Phase 2: Playwright browser retry for %d shops", len(retry_indices))
+
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            context = browser.new_context(
+                user_agent=_HEADERS["User-Agent"],
+                locale="ja-JP",
+                viewport={"width": 1920, "height": 1080},
+            )
+
+            for idx in retry_indices:
+                r = results[idx]
+                try:
+                    page = context.new_page()
+                    page.goto(r.search_url, timeout=20000, wait_until="domcontentloaded")
+                    # JS描画を待つ（networkidleは遅すぎるのでdomcontentloaded + 固定待機）
+                    page.wait_for_timeout(3000)
+                    html = page.content()
+                    page.close()
+
+                    soup = BeautifulSoup(html, "lxml")
+                    selectors = _get_selectors_for_shop(r.shop_name)
+                    price, name, url = _find_price_in_soup(soup, selectors,
+                                                           f"{urlparse(r.search_url).scheme}://{urlparse(r.search_url).netloc}")
+                    if price:
+                        results[idx] = ShopPrice(r.shop_name, price, name, url, r.search_url)
+                        logger.info("Browser retry success: %s = %d", r.shop_name, price)
+                    else:
+                        logger.info("Browser retry: no price found for %s", r.shop_name)
+
+                except Exception as e:
+                    logger.warning("Browser retry error for %s: %s", r.shop_name, e)
+                    # 元の結果をそのまま保持
+
+            context.close()
+            browser.close()
+
+    except Exception as e:
+        err_msg = str(e)
+        if "Executable doesn't exist" in err_msg or "browserType.launch" in err_msg:
+            logger.warning(
+                "Playwright browser not installed. Run: python -m playwright install chromium"
+            )
+        else:
+            logger.error("Playwright browser failed: %s", e)
+
+
 def search_all_shops(query: str, config: Config) -> list[ShopPrice]:
-    """全ショップを並列に検索して結果を返す"""
+    """全ショップを検索して結果を返す（2段階方式）
+
+    Phase 1: cloudscraper + BeautifulSoup（並列、高速）
+    Phase 2: Playwright ブラウザ（Phase 1失敗分のみ、逐次）
+    """
     results: list[ShopPrice] = []
 
+    # === Phase 1: cloudscraper（並列実行） ===
     with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as executor:
         future_to_name: dict = {}
         for scraper_fn, name in SCRAPERS:
@@ -859,5 +984,15 @@ def search_all_shops(query: str, config: Config) -> list[ShopPrice]:
                 results.append(result)
             except Exception as e:
                 results.append(ShopPrice(name, None, "", "", "", error=str(e)))
+
+    phase1_found = sum(1 for r in results if r.price is not None)
+    logger.info("Phase 1 complete: %d/%d shops found prices", phase1_found, len(results))
+
+    # === Phase 2: Playwright ブラウザレンダリング（失敗分のみ） ===
+    _retry_with_browser(results, query)
+
+    phase2_found = sum(1 for r in results if r.price is not None)
+    if phase2_found > phase1_found:
+        logger.info("Phase 2 recovered %d additional shops", phase2_found - phase1_found)
 
     return results

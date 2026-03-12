@@ -31,6 +31,19 @@
         ・ 自動検索で価格取得 <strong>{{ scraper_found | length }}</strong>件
         ・ 1 LSP = {{ config.lsp_value_yen }}円として計算（<a href="{{ url_for('settings') }}">変更</a>）
     </p>
+    <p class="text-small" style="margin-top:4px">
+        {% if has_cloudscraper %}
+        <span class="status ok">cloudscraper: ON</span>
+        {% else %}
+        <span class="status ng">cloudscraper: OFF</span>
+        {% endif %}
+        &nbsp;
+        {% if has_playwright %}
+        <span class="status ok">ブラウザ描画: ON</span>
+        {% else %}
+        <span class="status ng">ブラウザ描画: OFF（<code>pip install playwright</code> → <code>playwright install chromium</code>で有効化）</span>
+        {% endif %}
+    </p>
 </div>
 
 {% if scraper_found | length == 0 %}
