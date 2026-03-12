@@ -15,6 +15,8 @@ Phase 2: Playwright ブラウザレンダリング（Phase 1で失敗したシ�
 import json
 import re
 import logging
+import time
+import random
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -85,8 +87,8 @@ _JSON_HEADERS = {
 # リクエストタイムアウト（秒）
 _TIMEOUT = 25
 
-# 並列実行のワーカー数
-_MAX_WORKERS = 15
+# 並列実行のワーカー数（多すぎるとbot検出される → 5に制限）
+_MAX_WORKERS = 5
 
 
 @dataclass
@@ -191,6 +193,65 @@ def _parse_price(text: str) -> int | None:
 def _soup(resp: requests.Response) -> BeautifulSoup:
     """レスポンスからBeautifulSoupオブジェクトを作成"""
     return BeautifulSoup(resp.text, "lxml")
+
+
+def _is_relevant_product(query: str, product_name: str) -> bool:
+    """商品名が検索クエリと関連しているかチェック。
+
+    「airpods pro 3」で検索 → 「AirPods Pro 第3世代」はOK、「化粧水」はNG
+    検索語のうち少なくとも1つの重要語が商品名に含まれていること。
+    """
+    if not product_name:
+        return False  # 商品名なし = 関連性判定不能 → 不採用
+
+    query_lower = query.lower()
+    name_lower = product_name.lower()
+
+    # 1文字の語やストップワードを除外
+    stop_words = {"the", "a", "an", "and", "or", "in", "on", "at", "to", "for",
+                  "no", "の", "に", "を", "は", "が", "と", "で", "も", "から", "まで",
+                  "pro", "max", "plus", "mini", "lite"}
+    # クエリを単語分割
+    words = re.split(r'[\s　/／\-]+', query_lower)
+    # 重要な語（2文字以上でストップワードでないもの）
+    keywords = [w for w in words if len(w) >= 2 and w not in stop_words]
+
+    if not keywords:
+        # すべてストップワード → 元の語で判定
+        keywords = [w for w in words if len(w) >= 1]
+
+    # キーワードのうち少なくとも1つが商品名に含まれること
+    for kw in keywords:
+        if kw in name_lower:
+            return True
+
+    return False
+
+
+def _is_bot_blocked_page(soup: BeautifulSoup) -> bool:
+    """bot検出/アクセス制限ページかどうかを判定"""
+    text = soup.get_text()
+    block_patterns = [
+        r'一時的なアクセス増加',
+        r'一時的に.*アクセス.*制限',
+        r'アクセスが集中',
+        r'しばらく.*お待ち',
+        r'混雑.*しております',
+        r'アクセス制限',
+        r'ただいまメンテナンス',
+        r'メンテナンス中',
+        r'Access\s+Denied',
+        r'Bot\s+Protection',
+        r'Please\s+verify.*human',
+        r'captcha',
+        r'Checking your browser',
+        r'Just a moment',
+        r'Enable JavaScript and cookies',
+    ]
+    for pattern in block_patterns:
+        if re.search(pattern, text, re.IGNORECASE):
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -473,31 +534,70 @@ def _make_error_result(shop_name: str, search_url: str, error: str) -> ShopPrice
 def _scrape_generic(shop_name: str, search_url: str,
                     selectors: list[tuple[str, str, str]],
                     base_url: str,
-                    headers: dict | None = None) -> ShopPrice:
-    """汎用スクレイパー: HTML取得→セレクタ→JSON-LD→埋め込みJSONの順で試行"""
-    try:
-        resp = _fetch(search_url, headers=headers)
-        if resp.status_code == 403:
-            return _make_error_result(shop_name, search_url, "アクセス制限（手動で検索してください）")
-        if resp.status_code != 200:
-            return _make_error_result(shop_name, search_url, f"HTTP {resp.status_code}")
+                    headers: dict | None = None,
+                    query: str = "") -> ShopPrice:
+    """汎用スクレイパー: HTML取得→セレクタ→JSON-LD→埋め込みJSONの順で試行
 
-        soup = _soup(resp)
-        price, name, url = _find_price_in_soup(soup, selectors, base_url)
-        if price:
-            return ShopPrice(shop_name, price, name, url, search_url)
+    改善:
+    - bot検出ページを判定して適切なエラーメッセージ
+    - 検索クエリとの関連性チェック（無関係な商品を除外）
+    - bot検出時は1回リトライ（3秒待機）
+    """
+    max_attempts = 2
 
-        return ShopPrice(shop_name, None, "", "", search_url)
+    for attempt in range(max_attempts):
+        try:
+            # リトライ時は待機
+            if attempt > 0:
+                time.sleep(3 + random.uniform(0, 2))
 
-    except requests.exceptions.SSLError:
-        return _make_error_result(shop_name, search_url, "SSL接続エラー（手動で検索してください）")
-    except requests.exceptions.ConnectionError:
-        return _make_error_result(shop_name, search_url, "接続エラー（手動で検索してください）")
-    except requests.exceptions.Timeout:
-        return _make_error_result(shop_name, search_url, "タイムアウト（手動で検索してください）")
-    except Exception as e:
-        logger.warning("scrape error for %s: %s", shop_name, e)
-        return _make_error_result(shop_name, search_url, "取得失敗（手動で検索してください）")
+            resp = _fetch(search_url, headers=headers)
+            if resp.status_code == 403:
+                if attempt < max_attempts - 1:
+                    continue  # リトライ
+                return _make_error_result(shop_name, search_url, "アクセス制限（手動で検索してください）")
+            if resp.status_code == 503:
+                if attempt < max_attempts - 1:
+                    continue  # リトライ
+                return _make_error_result(shop_name, search_url, "サーバー混雑（手動で検索してください）")
+            if resp.status_code != 200:
+                return _make_error_result(shop_name, search_url, f"HTTP {resp.status_code}")
+
+            soup = _soup(resp)
+
+            # bot検出ページの判定
+            if _is_bot_blocked_page(soup):
+                if attempt < max_attempts - 1:
+                    logger.info("Bot blocked for %s, retrying...", shop_name)
+                    continue  # リトライ
+                return _make_error_result(shop_name, search_url, "アクセス制限（手動で検索してください）")
+
+            price, name, url = _find_price_in_soup(soup, selectors, base_url)
+            if price:
+                # 検索クエリとの関連性チェック
+                if query and name and not _is_relevant_product(query, name):
+                    logger.info("Irrelevant product for %s: '%s' (query='%s')",
+                                shop_name, name, query)
+                    return ShopPrice(shop_name, None, "", "", search_url)
+                return ShopPrice(shop_name, price, name, url, search_url)
+
+            return ShopPrice(shop_name, None, "", "", search_url)
+
+        except requests.exceptions.SSLError:
+            return _make_error_result(shop_name, search_url, "SSL接続エラー（手動で検索してください）")
+        except requests.exceptions.ConnectionError:
+            if attempt < max_attempts - 1:
+                continue  # リトライ
+            return _make_error_result(shop_name, search_url, "接続エラー（手動で検索してください）")
+        except requests.exceptions.Timeout:
+            if attempt < max_attempts - 1:
+                continue  # リトライ
+            return _make_error_result(shop_name, search_url, "タイムアウト（手動で検索してください）")
+        except Exception as e:
+            logger.warning("scrape error for %s: %s", shop_name, e)
+            return _make_error_result(shop_name, search_url, "取得失敗（手動で検索してください）")
+
+    return _make_error_result(shop_name, search_url, "取得失敗（手動で検索してください）")
 
 
 # ============================================================
@@ -555,7 +655,7 @@ def search_rakuten(query: str, config: Config) -> ShopPrice:
         (".item", ".price", "a.title, .name a"),
     ]
     return _scrape_generic("楽天市場", search_url, selectors,
-                           "https://search.rakuten.co.jp")
+                           "https://search.rakuten.co.jp", query=query)
 
 
 # ============================================================
@@ -663,7 +763,7 @@ def search_biccamera(query: str, _config: Config) -> ShopPrice:
                            headers={
                                "Referer": "https://www.biccamera.com/",
                                "Sec-Fetch-Site": "same-origin",
-                           })
+                           }, query=query)
 
 
 # ============================================================
@@ -679,23 +779,25 @@ def search_kojima(query: str, _config: Config) -> ShopPrice:
         (".goods_list li", ".price", ".goods_name a"),
     ]
     return _scrape_generic("コジマネット", search_url, selectors,
-                           "https://www.kojima.net")
+                           "https://www.kojima.net", query=query)
 
 
 # ============================================================
 # ヤマダウェブコム (スクレイピング)
 # ============================================================
 def search_yamada(query: str, _config: Config) -> ShopPrice:
-    search_url = f"https://www.yamada-denkiweb.com/search?q={quote(query)}&sort=price_asc"
+    search_url = f"https://www.yamada-denkiweb.com/search?keyword={quote(query)}&searchtarget=1&sorttype=price_asc"
     selectors = [
         (".searchResult__item", ".searchResult__price, .pPrice", ".searchResult__name a, .pName a"),
         (".product", ".price, .product-price", ".product-name a"),
         (".item", ".pPrice", ".pName a"),
+        ('[class*="c-product"]', '[class*="price"]', '[class*="name"] a, [class*="title"] a'),
         ("li.product-item", ".price-box .price", ".product-item-link"),
     ]
     return _scrape_generic("ヤマダウェブコム", search_url, selectors,
                            "https://www.yamada-denkiweb.com",
-                           headers={"Referer": "https://www.yamada-denkiweb.com/"})
+                           headers={"Referer": "https://www.yamada-denkiweb.com/"},
+                           query=query)
 
 
 # ============================================================
@@ -710,7 +812,7 @@ def search_joshin(query: str, _config: Config) -> ShopPrice:
         ("li.product-item", ".price-box .price", ".product-item-link"),
     ]
     return _scrape_generic("Joshin webショップ", search_url, selectors,
-                           "https://joshinweb.jp")
+                           "https://joshinweb.jp", query=query)
 
 
 # ============================================================
@@ -725,7 +827,7 @@ def search_aupay(query: str, _config: Config) -> ShopPrice:
         (".item", ".price", "a.item-name"),
     ]
     return _scrape_generic("au PAY マーケット", search_url, selectors,
-                           "https://wowma.jp")
+                           "https://wowma.jp", query=query)
 
 
 # ============================================================
@@ -740,7 +842,7 @@ def search_seven(query: str, _config: Config) -> ShopPrice:
         ('[class*="product"]', '[class*="price"]', '[class*="name"] a'),
     ]
     return _scrape_generic("セブンネットショッピング", search_url, selectors,
-                           "https://7net.omni7.jp")
+                           "https://7net.omni7.jp", query=query)
 
 
 # ============================================================
@@ -755,7 +857,7 @@ def search_qoo10(query: str, _config: Config) -> ShopPrice:
         (".goods_item", ".price", ".goods_name a, .title a"),
     ]
     return _scrape_generic("Qoo10", search_url, selectors,
-                           "https://www.qoo10.jp")
+                           "https://www.qoo10.jp", query=query)
 
 
 # ============================================================
@@ -770,7 +872,7 @@ def search_edion(query: str, _config: Config) -> ShopPrice:
         (".searchResultItem", ".resultPrice", ".resultName a"),
     ]
     return _scrape_generic("エディオンネットショップ", search_url, selectors,
-                           "https://www.edion.com")
+                           "https://www.edion.com", query=query)
 
 
 # ============================================================
@@ -803,7 +905,8 @@ def _make_generic_scraper(
     def scraper(query: str, _config: Config) -> ShopPrice:
         search_url = url_template.replace("{query}", quote(query))
         sels = selectors or _GENERIC_SELECTORS
-        return _scrape_generic(shop_name, search_url, sels, base_url, headers=headers)
+        return _scrape_generic(shop_name, search_url, sels, base_url,
+                               headers=headers, query=query)
 
     scraper.__name__ = f"search_{shop_name}"
     return scraper
@@ -826,21 +929,21 @@ search_muji = _make_generic_scraper(
 
 search_jalmall = _make_generic_scraper(
     "JAL Mall",
-    "https://mall.jal.co.jp/search/?q={query}",
-    "https://mall.jal.co.jp",
-    headers={"Sec-Fetch-Site": "same-origin", "Referer": "https://mall.jal.co.jp/"},
+    "https://shop.jal.co.jp/products/list?keyword={query}",
+    "https://shop.jal.co.jp",
+    headers={"Sec-Fetch-Site": "same-origin", "Referer": "https://shop.jal.co.jp/"},
 )
 
 search_bellemaison = _make_generic_scraper(
     "ベルメゾンネット",
-    "https://www.bellemaison.jp/search/{query}",
+    "https://www.bellemaison.jp/search/?keyword={query}",
     "https://www.bellemaison.jp",
 )
 
 search_lohaco = _make_generic_scraper(
     "LOHACO",
-    "https://lohaco.yahoo.co.jp/search?p={query}",
-    "https://lohaco.yahoo.co.jp",
+    "https://lohaco.jp/search/?keyword={query}",
+    "https://lohaco.jp",
 )
 
 search_nitori = _make_generic_scraper(
@@ -869,8 +972,8 @@ search_fancl = _make_generic_scraper(
 
 search_sony = _make_generic_scraper(
     "ソニーストア",
-    "https://store.sony.jp/search/?q={query}",
-    "https://store.sony.jp",
+    "https://www.sony.jp/search/?q={query}",
+    "https://www.sony.jp",
 )
 
 search_ksdenki = _make_generic_scraper(
@@ -894,8 +997,8 @@ search_matsukiyo = _make_generic_scraper(
 
 search_dshopping = _make_generic_scraper(
     "dショッピング",
-    "https://dshopping.docomo.ne.jp/search?keyword={query}",
-    "https://dshopping.docomo.ne.jp",
+    "https://shopping.dmkt-sp.jp/search/?keyword={query}",
+    "https://shopping.dmkt-sp.jp",
 )
 
 search_buyma = _make_generic_scraper(
@@ -930,8 +1033,8 @@ search_iherb = _make_generic_scraper(
 
 search_cosme = _make_generic_scraper(
     "@cosme SHOPPING",
-    "https://www.cosme.com/products/search?keyword={query}",
-    "https://www.cosme.com",
+    "https://www.cosme.net/shopping/search/product/?keyword={query}",
+    "https://www.cosme.net",
 )
 
 
@@ -1045,10 +1148,23 @@ def _retry_with_browser(results: list[ShopPrice], query: str) -> None:
                     page.close()
 
                     soup = BeautifulSoup(html, "lxml")
+
+                    # bot検出ページチェック
+                    if _is_bot_blocked_page(soup):
+                        logger.info("Browser retry: bot blocked for %s", r.shop_name)
+                        results[idx] = _make_error_result(r.shop_name, r.search_url,
+                                                          "アクセス制限（手動で検索してください）")
+                        continue
+
                     selectors = _get_selectors_for_shop(r.shop_name)
                     price, name, url = _find_price_in_soup(soup, selectors,
                                                            f"{urlparse(r.search_url).scheme}://{urlparse(r.search_url).netloc}")
                     if price:
+                        # 関連性チェック
+                        if name and not _is_relevant_product(query, name):
+                            logger.info("Browser retry: irrelevant product for %s: '%s'",
+                                        r.shop_name, name)
+                            continue
                         results[idx] = ShopPrice(r.shop_name, price, name, url, r.search_url)
                         logger.info("Browser retry success: %s = %d", r.shop_name, price)
                     else:
@@ -1071,25 +1187,40 @@ def _retry_with_browser(results: list[ShopPrice], query: str) -> None:
             logger.error("Playwright browser failed: %s", e)
 
 
+def _delayed_scrape(scraper_fn, query: str, config: Config, delay: float):
+    """遅延付きスクレイパー実行（bot検出回避のためリクエストを分散）"""
+    if delay > 0:
+        time.sleep(delay)
+    return scraper_fn(query, config)
+
+
 def search_all_shops(query: str, config: Config) -> list[ShopPrice]:
     """全ショップを検索して結果を返す（2段階方式）
 
-    Phase 1: cloudscraper + BeautifulSoup（並列、高速）
+    Phase 1: cloudscraper + BeautifulSoup（並列、分散遅延付き）
     Phase 2: Playwright ブラウザ（Phase 1失敗分のみ、逐次）
+
+    改善:
+    - 同時接続数を5に制限（15→5、bot検出回避）
+    - リクエスト間に分散遅延を追加（0〜3秒のランダム遅延）
+    - bot検出ページの判定とリトライ
     """
     results: list[ShopPrice] = []
 
-    # === Phase 1: cloudscraper（並列実行） ===
+    # === Phase 1: cloudscraper（並列実行・分散遅延付き） ===
     with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as executor:
         future_to_name: dict = {}
-        for scraper_fn, name in SCRAPERS:
-            future = executor.submit(scraper_fn, query, config)
+        for i, (scraper_fn, name) in enumerate(SCRAPERS):
+            # 各リクエストに0〜3秒のランダム遅延を追加
+            # 同じドメインに同時にアクセスしないようにする
+            delay = i * 0.3 + random.uniform(0, 0.5)
+            future = executor.submit(_delayed_scrape, scraper_fn, query, config, delay)
             future_to_name[future] = name
 
         for future in as_completed(future_to_name):
             name = future_to_name[future]
             try:
-                result = future.result(timeout=_TIMEOUT + 5)
+                result = future.result(timeout=_TIMEOUT + 10)
                 results.append(result)
             except Exception as e:
                 results.append(ShopPrice(name, None, "", "", "", error=str(e)))
