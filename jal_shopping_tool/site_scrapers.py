@@ -206,39 +206,23 @@ def _soup(resp: requests.Response) -> BeautifulSoup:
 def _is_relevant_product(query: str, product_name: str) -> bool:
     """商品名が検索クエリと関連しているかチェック。
 
-    「airpods pro 3」で検索:
-      OK: 「Apple AirPods Pro 第3世代」
-      NG: 「AirPods Pro ケース」「AirPods Pro 保護フィルム」（アクセサリ）
-      NG: 「化粧水」（無関係）
-
     2段階チェック:
     1. キーワードマッチ（過半数一致が必要）
-    2. アクセサリ除外（ケース/カバー/フィルム等を含む場合は除外）
+    2. アクセサリ除外（パターンベース — 「充電ケース付き」等の本体記述は除外しない）
+
+    例: query="airpods pro 3"
+      OK: 「Apple AirPods Pro 3 ワイヤレスイヤホン MagSafe充電ケース付き」
+      NG: 「AirPods Pro 3 用 ケース TPU クリア」（用ケース → アクセサリ）
+      NG: 「AirPods Pro 保護フィルム」（保護フィルム → アクセサリ）
+      NG: 「化粧水」（キーワード不一致）
     """
     if not product_name:
-        return False  # 商品名なし = 関連性判定不能 → 不採用
+        return False
 
     name_lower = product_name.lower()
-
-    # === アクセサリ除外 ===
-    # 検索クエリ自体がアクセサリを指している場合は除外しない
     query_lower = query.lower()
-    _ACCESSORY_WORDS = [
-        "ケース", "カバー", "フィルム", "保護", "ストラップ", "バンド",
-        "充電器", "充電ケーブル", "アダプタ", "スタンド", "ホルダー",
-        "ポーチ", "収納", "クリーナー", "イヤーピース", "イヤーチップ",
-        "シール", "ステッカー", "スキン", "デコ",
-        "case", "cover", "film", "protector", "strap", "band",
-        "charger", "cable", "adapter", "stand", "holder", "sleeve",
-        "skin", "sticker", "pouch", "cleaning",
-    ]
-    # クエリにアクセサリワードが含まれている場合はアクセサリ除外をスキップ
-    query_wants_accessory = any(aw in query_lower for aw in _ACCESSORY_WORDS)
-    if not query_wants_accessory:
-        if any(aw in name_lower for aw in _ACCESSORY_WORDS):
-            return False  # アクセサリと判定 → 除外
 
-    # === キーワードマッチ ===
+    # === キーワードマッチ（先にチェック — 無関係商品を先に弾く） ===
     stop_words = {"the", "a", "an", "and", "or", "in", "on", "at", "to", "for",
                   "no", "の", "に", "を", "は", "が", "と", "で", "も", "から", "まで"}
     words = re.split(r'[\s　/／\-]+', query_lower)
@@ -247,19 +231,56 @@ def _is_relevant_product(query: str, product_name: str) -> bool:
     if not keywords:
         keywords = [w for w in words if len(w) >= 1]
 
-    if not keywords:
-        return True
+    if keywords:
+        match_count = sum(1 for kw in keywords if kw in name_lower)
+        if len(keywords) == 1:
+            if match_count < 1:
+                return False
+        elif len(keywords) == 2:
+            if match_count < 2:
+                return False
+        else:
+            required = (len(keywords) + 1) // 2 + 1
+            required = min(required, len(keywords))
+            if match_count < required:
+                return False
 
-    match_count = sum(1 for kw in keywords if kw in name_lower)
+    # === アクセサリ除外（パターンベース） ===
+    # クエリ自体がアクセサリを指している場合はスキップ
+    _ACCESSORY_QUERY_WORDS = [
+        "ケース", "カバー", "フィルム", "ストラップ", "バンド", "充電器",
+        "イヤーピース", "case", "cover", "film", "charger", "strap",
+    ]
+    if any(aw in query_lower for aw in _ACCESSORY_QUERY_WORDS):
+        return True  # クエリがアクセサリを求めている → 通す
 
-    if len(keywords) == 1:
-        return match_count >= 1
-    elif len(keywords) == 2:
-        return match_count >= 2
-    else:
-        required = (len(keywords) + 1) // 2 + 1
-        required = min(required, len(keywords))
-        return match_count >= required
+    # パターンベースのアクセサリ判定
+    # 「用ケース」「専用カバー」等は除外するが「充電ケース付き」は除外しない
+    _ACCESSORY_PATTERNS = [
+        # 「〜用」パターン（アクセサリの最も確実な指標）
+        r'用\s*(?:ケース|カバー|フィルム|スタンド|ホルダー|ポーチ|バンド|充電器)',
+        r'専用\s*(?:ケース|カバー|フィルム|イヤーピース|イヤーチップ)',
+        r'対応\s*(?:ケース|カバー|フィルム|充電器)',
+        # 素材+ケース（ケース製品を示す）
+        r'(?:シリコン|TPU|レザー|ハード|ソフト|クリア|透明)\s*ケース',
+        # 常にアクセサリ（単体で十分明確）
+        r'イヤーピース', r'イヤーチップ', r'イヤーパッド',
+        r'保護フィルム', r'ガラスフィルム', r'液晶保護',
+        r'保護ケース', r'保護カバー', r'保護ガラス',
+        r'ストラップ',
+        r'クリーナー', r'クリーニング',
+        r'ステッカー', r'スキンシール', r'デコシール',
+        r'交換用',
+        # English
+        r'\bprotective\s+case\b', r'\bsilicone\s+case\b', r'\btpu\s+case\b',
+        r'\bscreen\s+protector\b', r'\bprotector\b',
+        r'\bear\s*tips?\b', r'\bsleeve\b',
+    ]
+    for pattern in _ACCESSORY_PATTERNS:
+        if re.search(pattern, name_lower, re.IGNORECASE):
+            return False
+
+    return True
 
 
 def _is_bot_blocked_page(soup: BeautifulSoup) -> bool:
@@ -1337,13 +1358,10 @@ def _retry_with_browser(results: list[ShopPrice], query: str) -> None:
     if not _HAS_PLAYWRIGHT:
         return
 
-    # 再試行対象の選定（Playwrightでの改善が見込めるもののみ）
-    # ブラウザリトライが無意味なケース:
-    #  - API問題はブラウザで解決しない
-    #  - HTTP 404は URLが間違っている → ブラウザでも同じ
-    #  - タイムアウトはPhase1で既にタイムアウト → ブラウザでも同様の可能性大
-    #  - アクセス制限はブラウザで回避できる可能性あり → リトライ対象
-    _SKIP_ERRORS = {"APIキー", "HTTP 404", "HTTP 410", "タイムアウト"}
+    # 再試行対象の選定
+    # タイムアウト/アクセス制限: cloudscraperでは失敗してもブラウザなら成功する可能性大
+    # HTTP 404: URLが間違っている → ブラウザでも同じ → スキップ
+    _SKIP_ERRORS = {"APIキー", "HTTP 404", "HTTP 410"}
     retry_indices = []
     for i, r in enumerate(results):
         if r.price is not None:
@@ -1362,22 +1380,39 @@ def _retry_with_browser(results: list[ShopPrice], query: str) -> None:
         with sync_playwright() as pw:
             browser = pw.chromium.launch(
                 headless=True,
-                args=["--disable-http2", "--no-sandbox"],
+                args=[
+                    "--disable-http2",
+                    "--no-sandbox",
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-features=IsolateOrigins,site-per-process",
+                ],
             )
             context = browser.new_context(
                 user_agent=_HEADERS["User-Agent"],
                 locale="ja-JP",
                 viewport={"width": 1920, "height": 1080},
+                java_script_enabled=True,
+                extra_http_headers={
+                    "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+                },
             )
+            # ステルス: navigator.webdriver を隠す（bot検出回避）
+            context.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                Object.defineProperty(navigator, 'languages', {get: () => ['ja', 'en-US', 'en']});
+                Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+                window.chrome = {runtime: {}};
+            """)
 
             for idx in retry_indices:
                 r = results[idx]
                 page = None
                 try:
                     page = context.new_page()
-                    page.goto(r.search_url, timeout=30000, wait_until="domcontentloaded")
+                    # タイムアウトを45秒に延長（家電サイトは重いが確実にロードされる）
+                    page.goto(r.search_url, timeout=45000, wait_until="domcontentloaded")
                     # JS描画を待つ
-                    page.wait_for_timeout(2000)
+                    page.wait_for_timeout(3000)
                     html = page.content()
 
                     soup = BeautifulSoup(html, "lxml")
