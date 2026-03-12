@@ -45,12 +45,17 @@ def create_app() -> Flask:
         for name in manual_shop_names:
             shop = jal_shop_map.get(name)
             if shop:
+                miles_10k = shop.calc_miles(10000)
+                lsp_10k = shop.calc_lsp(10000)
                 manual_shops.append({
                     "name": name,
                     "search_url": shop.get_search_url(query),
                     "jal_url": shop.url,
                     "mile_rate_desc": shop.mile_rate_desc,
                     "category": shop.category,
+                    "yen_per_mile": shop.yen_per_mile,
+                    "miles_10k": miles_10k,
+                    "lsp_10k": round(lsp_10k, 1),
                 })
 
         # 全ショップ数（ショップ一覧ページと同じ数）

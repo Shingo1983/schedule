@@ -203,7 +203,8 @@ main { flex: 1; padding: 24px 0; }
     border: 1px solid var(--gray-200);
     min-height: 44px;
 }
-.not-found-name { font-weight: 600; min-width: 160px; flex-shrink: 0; }
+.not-found-name { font-weight: 600; min-width: 140px; flex-shrink: 0; }
+.not-found-rate { min-width: 120px; flex-shrink: 0; color: var(--jal-red); font-weight: 500; }
 .not-found-reason {
     flex: 1;
     color: var(--gray-600);
@@ -212,6 +213,10 @@ main { flex: 1; padding: 24px 0; }
     white-space: nowrap;
     min-width: 0;
 }
+
+/* Manual shop table */
+.manual-shop-table { margin-top: 12px; }
+.manual-shop-table td { font-size: 0.88rem; }
 
 /* Product details */
 .product-details { display: flex; flex-direction: column; gap: 8px; margin-top: 8px; }

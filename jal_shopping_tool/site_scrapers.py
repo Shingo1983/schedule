@@ -2,13 +2,17 @@
 
 JALマイレージパーク提携ショップの検索ページをスクレイピングし、
 商品の最安値を取得する。
+
+注意: JavaScriptで描画されるSPAサイト（au PAY マーケット、Qoo10等）は
+requestsでは取得できないため、手動検索として扱う。
 """
 
 import re
+import ssl
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from urllib.parse import quote, urlencode
+from urllib.parse import quote
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -19,12 +23,12 @@ from .config import Config
 
 logger = logging.getLogger(__name__)
 
-# 共通ヘッダー
+# 共通ヘッダー（一般的なブラウザを模倣）
 _HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
+        "Chrome/126.0.0.0 Safari/537.36"
     ),
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
     "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
@@ -32,37 +36,13 @@ _HEADERS = {
     "DNT": "1",
     "Connection": "keep-alive",
     "Upgrade-Insecure-Requests": "1",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-    "Sec-Fetch-User": "?1",
 }
 
 # リクエストタイムアウト（秒）
-_TIMEOUT = 20
+_TIMEOUT = 25
 
 # 並列実行のワーカー数
 _MAX_WORKERS = 6
-
-
-def _create_session() -> requests.Session:
-    """リトライ付きのHTTPセッションを作成"""
-    session = requests.Session()
-    retry = Retry(
-        total=2,
-        backoff_factor=0.5,
-        status_forcelist=[500, 502, 503, 504],
-        allowed_methods=["GET"],
-    )
-    adapter = HTTPAdapter(max_retries=retry, pool_maxsize=_MAX_WORKERS)
-    session.mount("https://", adapter)
-    session.mount("http://", adapter)
-    session.headers.update(_HEADERS)
-    return session
-
-
-# グローバルセッション（コネクションプーリング）
-_session = _create_session()
 
 
 @dataclass
@@ -77,9 +57,28 @@ class ShopPrice:
     error: str | None = None  # エラーメッセージ
 
 
-def _fetch(url: str, params: dict | None = None, **kwargs) -> requests.Response:
-    """共通のHTTP GETリクエスト（セッション使用）"""
-    return _session.get(url, params=params, timeout=_TIMEOUT, **kwargs)
+def _new_session() -> requests.Session:
+    """毎回新しいHTTPセッションを作成（接続プール問題を回避）"""
+    session = requests.Session()
+    retry = Retry(
+        total=2,
+        backoff_factor=1.0,
+        status_forcelist=[500, 502, 503, 504],
+        allowed_methods=["GET"],
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    session.headers.update(_HEADERS)
+    return session
+
+
+def _fetch(url: str, headers: dict | None = None, **kwargs) -> requests.Response:
+    """HTTP GETリクエスト（毎回新しいセッションを使用）"""
+    session = _new_session()
+    if headers:
+        session.headers.update(headers)
+    return session.get(url, timeout=_TIMEOUT, **kwargs)
 
 
 def _parse_price(text: str) -> int | None:
@@ -87,8 +86,7 @@ def _parse_price(text: str) -> int | None:
     digits = re.sub(r"[^\d]", "", text)
     if digits:
         val = int(digits)
-        # 明らかに小さすぎる値は除外（送料等のノイズ）
-        if val >= 10:
+        if val >= 100:  # 100円未満は送料等のノイズ
             return val
     return None
 
@@ -96,6 +94,51 @@ def _parse_price(text: str) -> int | None:
 def _soup(resp: requests.Response) -> BeautifulSoup:
     """レスポンスからBeautifulSoupオブジェクトを作成"""
     return BeautifulSoup(resp.text, "lxml")
+
+
+def _find_price_in_soup(soup: BeautifulSoup, selectors: list[tuple[str, str, str]],
+                        base_url: str = "") -> tuple[int | None, str, str]:
+    """複数のCSSセレクタパターンで商品を探す。(price, name, url)を返す"""
+    for item_sel, price_sel, name_sel in selectors:
+        items = soup.select(item_sel)
+        if not items:
+            continue
+        for item in items:
+            price_el = item.select_one(price_sel)
+            if not price_el:
+                continue
+            price = _parse_price(price_el.get_text())
+            if not price:
+                continue
+
+            name_el = item.select_one(name_sel)
+            name = name_el.get_text(strip=True) if name_el else ""
+            url = ""
+            if name_el and name_el.get("href"):
+                href = name_el["href"]
+                if href.startswith("http"):
+                    url = href
+                elif href.startswith("/") and base_url:
+                    url = f"{base_url}{href}"
+                elif base_url:
+                    url = f"{base_url}/{href}"
+
+            return price, name, url
+
+    # フォールバック: ページ全体から価格パターンを探す
+    all_text = soup.get_text()
+    price_patterns = re.findall(r'[¥￥][\s]*([0-9,]+)', all_text)
+    if not price_patterns:
+        price_patterns = re.findall(r'(\d{1,3}(?:,\d{3})+)\s*円', all_text)
+    prices = []
+    for p in price_patterns:
+        val = _parse_price(p)
+        if val and val >= 100:
+            prices.append(val)
+    if prices:
+        return min(prices), "(ページ内最安値)", ""
+
+    return None, "", ""
 
 
 # ============================================================
@@ -218,16 +261,15 @@ def search_amazon(query: str, _config: Config) -> ShopPrice:
 
         for result in soup.select('[data-component-type="s-search-result"]'):
             # スポンサー商品をスキップ
-            if result.select_one('.s-label-popover-default'):
-                sponsored_text = result.select_one('.s-label-popover-default')
-                if sponsored_text and 'スポンサー' in sponsored_text.get_text():
-                    continue
+            sponsored = result.select_one('.s-label-popover-default')
+            if sponsored and 'スポンサー' in sponsored.get_text():
+                continue
 
             price_whole = result.select_one(".a-price .a-price-whole")
             if not price_whole:
                 continue
             price = _parse_price(price_whole.get_text())
-            if not price or price == 0:
+            if not price:
                 continue
 
             title_el = result.select_one("h2 a span")
@@ -254,52 +296,35 @@ def search_biccamera(query: str, _config: Config) -> ShopPrice:
     search_url = f"https://www.biccamera.com/bc/category/?q={quote(query)}&rowPerPage=25&sort=PRICE_ASC"
 
     try:
-        # ビックカメラはRefererが必要な場合がある
-        headers = {**_HEADERS, "Referer": "https://www.biccamera.com/"}
-        resp = _session.get(search_url, timeout=_TIMEOUT, headers=headers)
+        # 個別セッション + Referer設定（接続プール問題を回避）
+        headers = {"Referer": "https://www.biccamera.com/"}
+        resp = _fetch(search_url, headers=headers)
         if resp.status_code != 200:
             return ShopPrice("ビックカメラ.com", None, "", "", search_url,
                              error=f"HTTP {resp.status_code}")
 
         soup = _soup(resp)
 
-        # 複数のセレクタパターンで試行
         selectors = [
-            # 新レイアウト
             (".bcs_listItem", ".bcs_price", ".bcs_title a"),
-            # 旧レイアウト
             (".prod_box", ".val", ".prod_name a"),
-            # カテゴリ検索結果
             (".bcs_item", ".bcs_price .val", ".bcs_title a"),
-            # 汎用
-            ('[class*="product"]', '[class*="price"]', '[class*="name"] a, [class*="title"] a'),
+            (".product_list_item", ".price", ".product_name a"),
+            ("li.prod_item", ".prod_price", ".prod_name a"),
         ]
 
-        for item_sel, price_sel, name_sel in selectors:
-            items = soup.select(item_sel)
-            if not items:
-                continue
-            for item in items:
-                price_el = item.select_one(price_sel)
-                if not price_el:
-                    continue
-                price = _parse_price(price_el.get_text())
-                if not price or price == 0:
-                    continue
-
-                name_el = item.select_one(name_sel)
-                name = name_el.get_text(strip=True) if name_el else ""
-                url = ""
-                if name_el and name_el.get("href"):
-                    href = name_el["href"]
-                    url = f"https://www.biccamera.com{href}" if href.startswith("/") else href
-
-                return ShopPrice("ビックカメラ.com", price, name, url, search_url)
+        price, name, url = _find_price_in_soup(soup, selectors, "https://www.biccamera.com")
+        if price:
+            return ShopPrice("ビックカメラ.com", price, name, url, search_url)
 
         return ShopPrice("ビックカメラ.com", None, "", "", search_url)
 
+    except requests.exceptions.ConnectionError:
+        return ShopPrice("ビックカメラ.com", None, "", "", search_url,
+                         error="接続エラー（手動で検索してください）")
     except Exception as e:
-        return ShopPrice("ビックカメラ.com", None, "", "", search_url, error=str(e))
+        return ShopPrice("ビックカメラ.com", None, "", "", search_url,
+                         error=f"取得失敗（手動で検索してください）")
 
 
 # ============================================================
@@ -316,39 +341,26 @@ def search_kojima(query: str, _config: Config) -> ShopPrice:
 
         soup = _soup(resp)
 
-        # コジマネットの商品リスト
         selectors = [
             (".product-list-item", ".price, .itemPrice, .product-price", ".product-name a, .itemName a"),
             (".itemBox", ".itemPrice", ".itemName a"),
             (".product_item", ".product-price", ".product_name a"),
             ("li.item", ".price", "a.item-name, .name a"),
+            (".goods_list li", ".price", ".goods_name a"),
         ]
 
-        for item_sel, price_sel, name_sel in selectors:
-            items = soup.select(item_sel)
-            if not items:
-                continue
-            for item in items:
-                price_el = item.select_one(price_sel)
-                if not price_el:
-                    continue
-                price = _parse_price(price_el.get_text())
-                if not price or price == 0:
-                    continue
-
-                name_el = item.select_one(name_sel)
-                name = name_el.get_text(strip=True) if name_el else ""
-                url = ""
-                if name_el and name_el.get("href"):
-                    href = name_el["href"]
-                    url = f"https://www.kojima.net{href}" if href.startswith("/") else href
-
-                return ShopPrice("コジマネット", price, name, url, search_url)
+        price, name, url = _find_price_in_soup(soup, selectors, "https://www.kojima.net")
+        if price:
+            return ShopPrice("コジマネット", price, name, url, search_url)
 
         return ShopPrice("コジマネット", None, "", "", search_url)
 
+    except requests.exceptions.ConnectionError:
+        return ShopPrice("コジマネット", None, "", "", search_url,
+                         error="接続エラー（手動で検索してください）")
     except Exception as e:
-        return ShopPrice("コジマネット", None, "", "", search_url, error=str(e))
+        return ShopPrice("コジマネット", None, "", "", search_url,
+                         error=f"取得失敗（手動で検索してください）")
 
 
 # ============================================================
@@ -358,11 +370,8 @@ def search_yamada(query: str, _config: Config) -> ShopPrice:
     search_url = f"https://www.yamada-denkiweb.com/search?q={quote(query)}&sort=price_asc"
 
     try:
-        headers = {
-            **_HEADERS,
-            "Referer": "https://www.yamada-denkiweb.com/",
-        }
-        resp = _session.get(search_url, timeout=_TIMEOUT, headers=headers)
+        headers = {"Referer": "https://www.yamada-denkiweb.com/"}
+        resp = _fetch(search_url, headers=headers)
         if resp.status_code == 403:
             return ShopPrice("ヤマダウェブコム", None, "", "", search_url,
                              error="アクセス制限（手動で検索してください）")
@@ -376,33 +385,21 @@ def search_yamada(query: str, _config: Config) -> ShopPrice:
             (".searchResult__item", ".searchResult__price, .pPrice", ".searchResult__name a, .pName a"),
             (".product", ".price, .product-price", ".product-name a"),
             (".item", ".pPrice", ".pName a"),
+            ("li.product-item", ".price-box .price", ".product-item-link"),
         ]
 
-        for item_sel, price_sel, name_sel in selectors:
-            items = soup.select(item_sel)
-            if not items:
-                continue
-            for item in items:
-                price_el = item.select_one(price_sel)
-                if not price_el:
-                    continue
-                price = _parse_price(price_el.get_text())
-                if not price or price == 0:
-                    continue
-
-                name_el = item.select_one(name_sel)
-                name = name_el.get_text(strip=True) if name_el else ""
-                url = ""
-                if name_el and name_el.get("href"):
-                    href = name_el["href"]
-                    url = f"https://www.yamada-denkiweb.com{href}" if href.startswith("/") else href
-
-                return ShopPrice("ヤマダウェブコム", price, name, url, search_url)
+        price, name, url = _find_price_in_soup(soup, selectors, "https://www.yamada-denkiweb.com")
+        if price:
+            return ShopPrice("ヤマダウェブコム", price, name, url, search_url)
 
         return ShopPrice("ヤマダウェブコム", None, "", "", search_url)
 
+    except requests.exceptions.ConnectionError:
+        return ShopPrice("ヤマダウェブコム", None, "", "", search_url,
+                         error="接続エラー（手動で検索してください）")
     except Exception as e:
-        return ShopPrice("ヤマダウェブコム", None, "", "", search_url, error=str(e))
+        return ShopPrice("ヤマダウェブコム", None, "", "", search_url,
+                         error=f"取得失敗（手動で検索してください）")
 
 
 # ============================================================
@@ -423,235 +420,21 @@ def search_joshin(query: str, _config: Config) -> ShopPrice:
             (".productList__item", ".productList__price", ".productList__name a"),
             (".lineup_box", ".lineup_price", ".lineup_name a"),
             (".item", ".price", ".item-name a, .name a"),
+            ("li.product-item", ".price-box .price", ".product-item-link"),
         ]
 
-        for item_sel, price_sel, name_sel in selectors:
-            items = soup.select(item_sel)
-            if not items:
-                continue
-            for item in items:
-                price_el = item.select_one(price_sel)
-                if not price_el:
-                    continue
-                price = _parse_price(price_el.get_text())
-                if not price or price == 0:
-                    continue
-
-                name_el = item.select_one(name_sel)
-                name = name_el.get_text(strip=True) if name_el else ""
-                url = ""
-                if name_el and name_el.get("href"):
-                    href = name_el["href"]
-                    url = f"https://joshinweb.jp{href}" if href.startswith("/") else href
-
-                return ShopPrice("Joshin webショップ", price, name, url, search_url)
+        price, name, url = _find_price_in_soup(soup, selectors, "https://joshinweb.jp")
+        if price:
+            return ShopPrice("Joshin webショップ", price, name, url, search_url)
 
         return ShopPrice("Joshin webショップ", None, "", "", search_url)
 
+    except requests.exceptions.ConnectionError:
+        return ShopPrice("Joshin webショップ", None, "", "", search_url,
+                         error="接続エラー（手動で検索してください）")
     except Exception as e:
-        return ShopPrice("Joshin webショップ", None, "", "", search_url, error=str(e))
-
-
-# ============================================================
-# au PAY マーケット (スクレイピング)
-# ============================================================
-def search_aupay(query: str, _config: Config) -> ShopPrice:
-    # au PAY マーケット（旧Wowma!）
-    search_url = f"https://wowma.jp/itemlist?e_scope=O&at=FP&non_gr=ex&e_desc=Y&spe=Y&keyword={quote(query)}&categ_id=0&sort_type=priceasc"
-
-    try:
-        resp = _fetch(search_url, allow_redirects=True)
-        if resp.status_code != 200:
-            return ShopPrice("au PAY マーケット", None, "", "", search_url,
-                             error=f"HTTP {resp.status_code}")
-
-        soup = _soup(resp)
-
-        selectors = [
-            (".itemList__item", ".itemList__price, .price", ".itemList__name a, .product-name a"),
-            (".product-item", ".product-price, .price", ".product-name a"),
-            ('[class*="ItemCard"]', '[class*="price"]', '[class*="name"] a, [class*="title"] a'),
-            (".item", ".price", "a.item-name"),
-        ]
-
-        for item_sel, price_sel, name_sel in selectors:
-            items = soup.select(item_sel)
-            if not items:
-                continue
-            for item in items:
-                price_el = item.select_one(price_sel)
-                if not price_el:
-                    continue
-                price = _parse_price(price_el.get_text())
-                if not price or price == 0:
-                    continue
-
-                name_el = item.select_one(name_sel)
-                name = name_el.get_text(strip=True) if name_el else ""
-                url = ""
-                if name_el and name_el.get("href"):
-                    href = name_el["href"]
-                    if href.startswith("/"):
-                        url = f"https://wowma.jp{href}"
-                    elif href.startswith("http"):
-                        url = href
-                    else:
-                        url = f"https://wowma.jp/{href}"
-
-                return ShopPrice("au PAY マーケット", price, name, url, search_url)
-
-        return ShopPrice("au PAY マーケット", None, "", "", search_url)
-
-    except Exception as e:
-        return ShopPrice("au PAY マーケット", None, "", "", search_url, error=str(e))
-
-
-# ============================================================
-# セブンネットショッピング (スクレイピング)
-# ============================================================
-def search_seven(query: str, _config: Config) -> ShopPrice:
-    search_url = f"https://7net.omni7.jp/search/?keyword={quote(query)}&searchKeywordFlg=1"
-
-    try:
-        resp = _fetch(search_url, allow_redirects=True)
-        if resp.status_code != 200:
-            return ShopPrice("セブンネットショッピング", None, "", "", search_url,
-                             error=f"HTTP {resp.status_code}")
-
-        soup = _soup(resp)
-
-        selectors = [
-            (".productItem", ".productPrice, .price", ".productName a, .product-name a"),
-            (".product", ".price, .productPrice", ".productName a"),
-            (".item", ".price, .item-price", ".item-name a, .productName a"),
-            ('[class*="product"]', '[class*="price"]', '[class*="name"] a'),
-        ]
-
-        for item_sel, price_sel, name_sel in selectors:
-            items = soup.select(item_sel)
-            if not items:
-                continue
-            for item in items:
-                price_el = item.select_one(price_sel)
-                if not price_el:
-                    continue
-                price = _parse_price(price_el.get_text())
-                if not price or price == 0:
-                    continue
-
-                name_el = item.select_one(name_sel)
-                name = name_el.get_text(strip=True) if name_el else ""
-                url = ""
-                if name_el and name_el.get("href"):
-                    href = name_el["href"]
-                    url = f"https://7net.omni7.jp{href}" if href.startswith("/") else href
-
-                return ShopPrice("セブンネットショッピング", price, name, url, search_url)
-
-        return ShopPrice("セブンネットショッピング", None, "", "", search_url)
-
-    except Exception as e:
-        return ShopPrice("セブンネットショッピング", None, "", "", search_url, error=str(e))
-
-
-# ============================================================
-# Qoo10 (スクレイピング)
-# ============================================================
-def search_qoo10(query: str, _config: Config) -> ShopPrice:
-    search_url = f"https://www.qoo10.jp/s/{quote(query)}?sort=prc"
-
-    try:
-        resp = _fetch(search_url)
-        if resp.status_code != 200:
-            return ShopPrice("Qoo10", None, "", "", search_url,
-                             error=f"HTTP {resp.status_code}")
-
-        soup = _soup(resp)
-
-        selectors = [
-            (".sc-prd", ".prc .prc-dc, .prc", ".tit a, .sbj a"),
-            (".item_g", ".price, .prc", ".sbj a"),
-            ('[class*="product"]', '[class*="price"]', '[class*="title"] a, [class*="name"] a'),
-            (".goods_item", ".price", ".goods_name a, .title a"),
-        ]
-
-        for item_sel, price_sel, name_sel in selectors:
-            items = soup.select(item_sel)
-            if not items:
-                continue
-            for item in items:
-                price_el = item.select_one(price_sel)
-                if not price_el:
-                    continue
-                price = _parse_price(price_el.get_text())
-                if not price or price == 0:
-                    continue
-
-                name_el = item.select_one(name_sel)
-                name = name_el.get_text(strip=True) if name_el else ""
-                url = ""
-                if name_el and name_el.get("href"):
-                    href = name_el["href"]
-                    if href.startswith("/"):
-                        url = f"https://www.qoo10.jp{href}"
-                    elif href.startswith("http"):
-                        url = href
-                    else:
-                        url = f"https://www.qoo10.jp/{href}"
-
-                return ShopPrice("Qoo10", price, name, url, search_url)
-
-        return ShopPrice("Qoo10", None, "", "", search_url)
-
-    except Exception as e:
-        return ShopPrice("Qoo10", None, "", "", search_url, error=str(e))
-
-
-# ============================================================
-# エディオンネットショップ (スクレイピング)
-# ============================================================
-def search_edion(query: str, _config: Config) -> ShopPrice:
-    search_url = f"https://www.edion.com/search?keyword={quote(query)}&sort=price_asc"
-
-    try:
-        resp = _fetch(search_url)
-        if resp.status_code != 200:
-            return ShopPrice("エディオンネットショップ", None, "", "", search_url,
-                             error=f"HTTP {resp.status_code}")
-
-        soup = _soup(resp)
-
-        selectors = [
-            (".product-item, .item-list__item", ".price, .item-price", ".product-name a, .item-name a"),
-            ('[class*="product"]', '[class*="price"]', '[class*="name"] a'),
-            (".searchResultItem", ".resultPrice", ".resultName a"),
-        ]
-
-        for item_sel, price_sel, name_sel in selectors:
-            items = soup.select(item_sel)
-            if not items:
-                continue
-            for item in items:
-                price_el = item.select_one(price_sel)
-                if not price_el:
-                    continue
-                price = _parse_price(price_el.get_text())
-                if not price or price == 0:
-                    continue
-
-                name_el = item.select_one(name_sel)
-                name = name_el.get_text(strip=True) if name_el else ""
-                url = ""
-                if name_el and name_el.get("href"):
-                    href = name_el["href"]
-                    url = f"https://www.edion.com{href}" if href.startswith("/") else href
-
-                return ShopPrice("エディオンネットショップ", price, name, url, search_url)
-
-        return ShopPrice("エディオンネットショップ", None, "", "", search_url)
-
-    except Exception as e:
-        return ShopPrice("エディオンネットショップ", None, "", "", search_url, error=str(e))
+        return ShopPrice("Joshin webショップ", None, "", "", search_url,
+                         error=f"取得失敗（手動で検索してください）")
 
 
 # ============================================================
@@ -660,6 +443,13 @@ def search_edion(query: str, _config: Config) -> ShopPrice:
 
 # (検索関数, JALショップ名) のリスト
 # JALショップ名は jal_shops.py の KNOWN_SHOPS のキーと一致させること
+#
+# 注意: 以下のショップはJavaScript SPA（requestsでは取得不可）のため
+# スクレイパー対象外とし、手動検索として扱う:
+#   - au PAY マーケット (React SPA)
+#   - セブンネットショッピング (SPA)
+#   - Qoo10 (SPA)
+#   - エディオンネットショップ (SPA)
 SCRAPERS = [
     (search_rakuten, "楽天市場"),
     (search_yahoo, "Yahoo!ショッピング"),
@@ -668,10 +458,6 @@ SCRAPERS = [
     (search_kojima, "コジマネット"),
     (search_yamada, "ヤマダウェブコム"),
     (search_joshin, "Joshin webショップ"),
-    (search_aupay, "au PAY マーケット"),
-    (search_seven, "セブンネットショッピング"),
-    (search_qoo10, "Qoo10"),
-    (search_edion, "エディオンネットショップ"),
 ]
 
 # スクレイパー対応済みショップ名のセット（自動生成）

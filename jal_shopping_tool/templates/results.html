@@ -25,18 +25,17 @@
 
 <div class="card summary-card">
     <p class="summary-text">
-        全<strong>{{ total_shop_count }}</strong>ショップ中、
-        自動検索 <strong>{{ analysis.total_count }}</strong>件
-        （価格取得 <strong>{{ scraper_found | length }}</strong>件 /
-        取得失敗 <strong>{{ scraper_not_found | length }}</strong>件）
-        ＋ 手動検索 <strong>{{ manual_shops | length }}</strong>件
-        ・1 LSP = {{ config.lsp_value_yen }}円として計算（<a href="{{ url_for('settings') }}">変更</a>）
+        全<strong>{{ total_shop_count }}</strong>ショップ対応
+        （自動検索 <strong>{{ analysis.total_count }}</strong>件
+        ＋ 手動検索 <strong>{{ manual_shops | length }}</strong>件）
+        ・ 自動検索で価格取得 <strong>{{ scraper_found | length }}</strong>件
+        ・ 1 LSP = {{ config.lsp_value_yen }}円として計算（<a href="{{ url_for('settings') }}">変更</a>）
     </p>
 </div>
 
 {% if scraper_found | length == 0 %}
 <div class="card">
-    <p>どのショップでも商品が見つかりませんでした。検索キーワードを変えてお試しください。</p>
+    <p>自動検索ではどのショップでも商品が見つかりませんでした。下の手動検索リンクからご確認ください。</p>
 </div>
 {% else %}
 
@@ -74,10 +73,6 @@
 {# === メイン比較テーブル（価格取得成功分） === #}
 <div class="card">
     <h2>全ショップ比較（価格順）</h2>
-    <p class="text-small">
-        {{ scraper_found | length }}/{{ analysis.total_count }}ショップで商品が見つかりました
-    </p>
-
     <div class="offers-table-wrap">
         <table class="offers-table comparison-table">
             <thead>
@@ -168,12 +163,9 @@
         {% for c in scraper_not_found %}
         <div class="not-found-item">
             <span class="not-found-name">{{ c.shop_name }}</span>
+            <span class="not-found-rate text-small">{{ c.mile_rate_desc }}</span>
             <span class="not-found-reason text-small">
-                {% if c.error %}
-                {{ c.error | truncate(60, True, '…') }}
-                {% else %}
-                商品が見つかりませんでした
-                {% endif %}
+                {% if c.error %}{{ c.error }}{% else %}商品が見つかりませんでした{% endif %}
             </span>
             {% if c.search_url %}
             <a href="{{ c.search_url }}" target="_blank" rel="noopener" class="btn btn-small btn-outline">手動で検索</a>
@@ -187,23 +179,40 @@
 {# === 手動検索ショップ（スクレイパー未対応） === #}
 {% if manual_shops %}
 <div class="card">
-    <h2>その他の提携ショップ（{{ manual_shops | length }}件・手動検索）</h2>
-    <p class="text-small">以下のショップはJALマイレージパーク提携ですが、自動検索には未対応です。リンクから手動で検索できます。</p>
-    <div class="not-found-list">
-        {% for ms in manual_shops %}
-        <div class="not-found-item">
-            <span class="not-found-name">{{ ms.name }}</span>
-            <span class="not-found-reason text-small">
-                {{ ms.mile_rate_desc }} ・ {{ ms.category }}
-            </span>
-            <div class="action-links">
-                {% if ms.search_url %}
-                <a href="{{ ms.search_url }}" target="_blank" rel="noopener" class="btn btn-small btn-outline">検索する</a>
-                {% endif %}
-                <a href="{{ ms.jal_url }}" target="_blank" rel="noopener" class="btn btn-small btn-primary" title="JALマイレージパーク経由">JAL経由</a>
-            </div>
-        </div>
-        {% endfor %}
+    <h2>その他の提携ショップ（{{ manual_shops | length }}件）</h2>
+    <p class="text-small">以下のJALマイレージパーク提携ショップでも手動で検索できます。</p>
+    <div class="offers-table-wrap">
+        <table class="offers-table manual-shop-table">
+            <thead>
+                <tr>
+                    <th>ショップ名</th>
+                    <th>マイルレート</th>
+                    <th>カテゴリ</th>
+                    <th>1万円購入時</th>
+                    <th>リンク</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for ms in manual_shops %}
+                <tr>
+                    <td><strong>{{ ms.name }}</strong></td>
+                    <td class="text-small">{{ ms.mile_rate_desc }}</td>
+                    <td><span class="badge">{{ ms.category }}</span></td>
+                    <td class="text-small">
+                        {{ ms.miles_10k }}マイル / {{ ms.lsp_10k }} LSP
+                    </td>
+                    <td>
+                        <div class="action-links">
+                            {% if ms.search_url %}
+                            <a href="{{ ms.search_url }}" target="_blank" rel="noopener" class="btn btn-small btn-outline">検索する</a>
+                            {% endif %}
+                            <a href="{{ ms.jal_url }}" target="_blank" rel="noopener" class="btn btn-small btn-primary">JAL経由</a>
+                        </div>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
     </div>
 </div>
 {% endif %}
