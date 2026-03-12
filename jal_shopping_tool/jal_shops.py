@@ -84,14 +84,14 @@ KNOWN_SHOPS = {
         "mile_rate_desc": "100円(税抜)につき1マイル",
         "yen_per_mile": 100,
         "category": "総合通販",
-        "search_url_template": "https://mall.jal.co.jp/search/?q={query}",
+        "search_url_template": "https://ec.jal.co.jp/shop/search/result.aspx?keyword={query}",
     },
     "ヤマダウェブコム": {
         "shop_id": "10159",
         "mile_rate_desc": "300円につき1マイル",
         "yen_per_mile": 300,
         "category": "家電",
-        "search_url_template": "https://www.yamada-denkiweb.com/search?q={query}",
+        "search_url_template": "https://www.yamada-denkiweb.com/search/{query}/",
     },
     "コジマネット": {
         "shop_id": "10587",
@@ -192,7 +192,7 @@ KNOWN_SHOPS = {
         "mile_rate_desc": "200円につき1マイル",
         "yen_per_mile": 200,
         "category": "家電",
-        "search_url_template": "https://www.ksdenki.com/shop/e/esearch/?keyword={query}",
+        "search_url_template": "https://www.ksdenki.com/shop/goods/search.aspx?keyword={query}",
     },
     "ノジマオンライン": {
         "shop_id": "10586",

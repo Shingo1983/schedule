@@ -852,7 +852,7 @@ def search_kojima(query: str, _config: Config) -> ShopPrice:
 # ヤマダウェブコム (スクレイピング)
 # ============================================================
 def search_yamada(query: str, _config: Config) -> ShopPrice:
-    search_url = f"https://www.yamada-denkiweb.com/search?keyword={quote(query)}&searchtarget=1&sorttype=price_asc"
+    search_url = f"https://www.yamada-denkiweb.com/search/{quote(query)}/"
     selectors = [
         (".searchResult__item", ".searchResult__price, .pPrice", ".searchResult__name a, .pName a"),
         (".product", ".price, .product-price", ".product-name a"),
@@ -995,9 +995,9 @@ search_muji = _make_generic_scraper(
 
 search_jalmall = _make_generic_scraper(
     "JAL Mall",
-    "https://shop.jal.co.jp/products/list?keyword={query}",
-    "https://shop.jal.co.jp",
-    headers={"Sec-Fetch-Site": "same-origin", "Referer": "https://shop.jal.co.jp/"},
+    "https://ec.jal.co.jp/shop/search/result.aspx?keyword={query}",
+    "https://ec.jal.co.jp",
+    headers={"Sec-Fetch-Site": "same-origin", "Referer": "https://ec.jal.co.jp/shop/"},
 )
 
 search_bellemaison = _make_generic_scraper(
@@ -1044,9 +1044,9 @@ search_sony = _make_generic_scraper(
 
 search_ksdenki = _make_generic_scraper(
     "ケーズデンキオンラインショップ",
-    "https://www.ksdenki.com/shop/e/esearch/?keyword={query}",
+    "https://www.ksdenki.com/shop/goods/search.aspx?keyword={query}",
     "https://www.ksdenki.com",
-    headers={"Referer": "https://www.ksdenki.com/", "Sec-Fetch-Site": "same-origin"},
+    headers={"Referer": "https://www.ksdenki.com/shop/", "Sec-Fetch-Site": "same-origin"},
 )
 
 search_nojima = _make_generic_scraper(
@@ -1063,8 +1063,8 @@ search_matsukiyo = _make_generic_scraper(
 
 search_dshopping = _make_generic_scraper(
     "dショッピング",
-    "https://shopping.dmkt-sp.jp/search/?keyword={query}",
-    "https://shopping.dmkt-sp.jp",
+    "https://dshopping.docomo.ne.jp/search?keyword={query}",
+    "https://dshopping.docomo.ne.jp",
 )
 
 search_buyma = _make_generic_scraper(
@@ -1190,8 +1190,8 @@ def _retry_with_browser(results: list[ShopPrice], query: str) -> None:
     for i, r in enumerate(results):
         if r.price is not None:
             continue  # 既に価格取得済み
-        if r.error and ("APIキー" in r.error or "タイムアウト" in r.error):
-            continue  # API問題・タイムアウトはブラウザでも解決しない
+        if r.error and ("APIキー" in r.error):
+            continue  # API問題はブラウザでも解決しない
         if r.search_url:
             retry_indices.append(i)
 
@@ -1213,7 +1213,7 @@ def _retry_with_browser(results: list[ShopPrice], query: str) -> None:
                 r = results[idx]
                 try:
                     page = context.new_page()
-                    page.goto(r.search_url, timeout=20000, wait_until="domcontentloaded")
+                    page.goto(r.search_url, timeout=30000, wait_until="domcontentloaded")
                     # JS描画を待つ（networkidleは遅すぎるのでdomcontentloaded + 固定待機）
                     page.wait_for_timeout(3000)
                     html = page.content()
