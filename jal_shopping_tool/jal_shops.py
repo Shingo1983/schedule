@@ -98,7 +98,7 @@ KNOWN_SHOPS = {
         "mile_rate_desc": "200円につき1マイル",
         "yen_per_mile": 200,
         "category": "家電",
-        "search_url_template": "https://www.kojima.net/ec/disp/CSfDispListPage_001.jsp?dispNo=&q={query}",
+        "search_url_template": "https://www.kojima.net/ec/prod_list.html?keyword={query}",
     },
     "Joshin webショップ": {
         "shop_id": "10091",
@@ -213,7 +213,7 @@ KNOWN_SHOPS = {
         "mile_rate_desc": "200円につき1マイル",
         "yen_per_mile": 200,
         "category": "総合通販",
-        "search_url_template": "https://dshopping.docomo.ne.jp/search/{query}",
+        "search_url_template": "https://dshopping.docomo.ne.jp/search?keyword={query}",
     },
     "BUYMA": {
         "shop_id": "10556",

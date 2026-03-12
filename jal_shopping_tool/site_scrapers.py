@@ -53,7 +53,7 @@ _JSON_HEADERS = {
 _TIMEOUT = 25
 
 # 並列実行のワーカー数
-_MAX_WORKERS = 8
+_MAX_WORKERS = 15
 
 
 @dataclass
@@ -227,8 +227,38 @@ def _find_prices_in_dict(obj, results: list, depth: int = 0):
             _find_prices_in_dict(item, results, depth + 1)
 
 
+def _is_no_results_page(soup: BeautifulSoup) -> bool:
+    """検索結果が0件のページかどうかを判定"""
+    text = soup.get_text()
+    no_results_patterns = [
+        r'(?<!\d)0\s*件中\s*0',
+        r'件中\s*0\s*～\s*0\s*件',
+        r'(?<!\d)0\s*件\s*～\s*0\s*件.*?表示',
+        r'該当する商品.*?(?:ございません|みつかりません|見つかりません|ありません)',
+        r'みつかりませんでした',
+        r'見つかりませんでした',
+        r'一致する.*?(?:ございません|ありません|見つかりません)',
+        r'商品が見つかりません',
+        r'検索結果.*?ありません',
+        r'お探しの.*?見つかりません',
+        r'該当.*?(?<!\d)0\s*件',
+        r'検索結果\s*[:：]?\s*(?<!\d)0\s*件',
+        r'(?<!\d)0\s*件の商品',
+        r'(?<!\d)0\s*件の検索結果',
+        r'no\s+results?\s+found',
+        r'(?<!\d)0\s+items?\s+found',
+        r'ヒットしませんでした',
+        r'条件に合う商品.*?(?:ございません|ありません)',
+    ]
+    for pattern in no_results_patterns:
+        if re.search(pattern, text, re.IGNORECASE):
+            return True
+    return False
+
+
 def _find_price_in_soup(soup: BeautifulSoup, selectors: list[tuple[str, str, str]],
-                        base_url: str = "") -> tuple[int | None, str, str]:
+                        base_url: str = "",
+                        skip_regex_fallback: bool = False) -> tuple[int | None, str, str]:
     """複数のCSSセレクタパターンで商品を探す。(price, name, url)を返す"""
     # 1. CSSセレクタで探す
     for item_sel, price_sel, name_sel in selectors:
@@ -270,6 +300,10 @@ def _find_price_in_soup(soup: BeautifulSoup, selectors: list[tuple[str, str, str
         return cheapest["price"], cheapest["name"], cheapest["url"]
 
     # 4. フォールバック: ページ全体から価格パターンを正規表現で探す
+    #    ※0件ページでは正規表現フォールバックをスキップ（無関係な価格を拾うのを防止）
+    if skip_regex_fallback:
+        return None, "", ""
+
     all_text = soup.get_text()
     price_patterns = re.findall(r'[¥￥]\s*([0-9,]+)', all_text)
     if not price_patterns:
@@ -303,7 +337,12 @@ def _scrape_generic(shop_name: str, search_url: str,
             return _make_error_result(shop_name, search_url, f"HTTP {resp.status_code}")
 
         soup = _soup(resp)
-        price, name, url = _find_price_in_soup(soup, selectors, base_url)
+
+        # 0件ページ検出: 正規表現フォールバックを抑制して無関係な価格の誤検出を防止
+        no_results = _is_no_results_page(soup)
+        price, name, url = _find_price_in_soup(
+            soup, selectors, base_url, skip_regex_fallback=no_results
+        )
         if price:
             return ShopPrice(shop_name, price, name, url, search_url)
 
@@ -472,7 +511,7 @@ def search_biccamera(query: str, _config: Config) -> ShopPrice:
 # コジマネット (スクレイピング)
 # ============================================================
 def search_kojima(query: str, _config: Config) -> ShopPrice:
-    search_url = f"https://www.kojima.net/ec/disp/CSfDispListPage_001.jsp?dispNo=&q={quote(query)}&sort=price&order=asc"
+    search_url = f"https://www.kojima.net/ec/prod_list.html?keyword={quote(query)}&sort=price&order=asc"
     selectors = [
         (".product-list-item", ".price, .itemPrice, .product-price", ".product-name a, .itemName a"),
         (".itemBox", ".itemPrice", ".itemName a"),
@@ -575,6 +614,166 @@ def search_edion(query: str, _config: Config) -> ShopPrice:
 
 
 # ============================================================
+# 汎用スクレイパー生成ファクトリ
+# ============================================================
+
+# 多くのECサイトで使える汎用CSSセレクタ
+_GENERIC_SELECTORS: list[tuple[str, str, str]] = [
+    ('[class*="product-item"], [class*="productItem"], [class*="ProductItem"]',
+     '[class*="price"], [class*="Price"]',
+     '[class*="name"] a, [class*="Name"] a, [class*="title"] a, [class*="Title"] a'),
+    ('[class*="item-card"], [class*="itemCard"], [class*="ItemCard"]',
+     '[class*="price"], [class*="Price"]',
+     '[class*="name"] a, [class*="Name"] a, [class*="title"] a'),
+    (".product", ".price", ".product-name a, .name a"),
+    (".item", ".price", ".item-name a, .name a"),
+    ("li.product-item", ".price-box .price", ".product-item-link"),
+]
+
+
+def _make_generic_scraper(
+    shop_name: str,
+    url_template: str,
+    base_url: str,
+    selectors: list[tuple[str, str, str]] | None = None,
+    headers: dict | None = None,
+):
+    """汎用スクレイパー関数を生成するファクトリ"""
+
+    def scraper(query: str, _config: Config) -> ShopPrice:
+        search_url = url_template.replace("{query}", quote(query))
+        sels = selectors or _GENERIC_SELECTORS
+        return _scrape_generic(shop_name, search_url, sels, base_url, headers=headers)
+
+    scraper.__name__ = f"search_{shop_name}"
+    return scraper
+
+
+# ============================================================
+# 追加ショップ（汎用スクレイパーで自動生成）
+# ============================================================
+search_uniqlo = _make_generic_scraper(
+    "ユニクロオンラインストア",
+    "https://www.uniqlo.com/jp/ja/search?q={query}",
+    "https://www.uniqlo.com",
+)
+
+search_muji = _make_generic_scraper(
+    "無印良品ネットストア",
+    "https://www.muji.com/jp/ja/search?q={query}",
+    "https://www.muji.com",
+)
+
+search_jalmall = _make_generic_scraper(
+    "JAL Mall",
+    "https://mall.jal.co.jp/search/?q={query}",
+    "https://mall.jal.co.jp",
+)
+
+search_bellemaison = _make_generic_scraper(
+    "ベルメゾンネット",
+    "https://www.bellemaison.jp/search/{query}",
+    "https://www.bellemaison.jp",
+)
+
+search_lohaco = _make_generic_scraper(
+    "LOHACO",
+    "https://lohaco.yahoo.co.jp/search?p={query}",
+    "https://lohaco.yahoo.co.jp",
+)
+
+search_nitori = _make_generic_scraper(
+    "ニトリネット",
+    "https://www.nitori-net.jp/ec/search/?q={query}",
+    "https://www.nitori-net.jp",
+)
+
+search_zozo = _make_generic_scraper(
+    "ZOZOTOWN",
+    "https://zozo.jp/search/?p_keyv={query}",
+    "https://zozo.jp",
+)
+
+search_dhc = _make_generic_scraper(
+    "DHCオンラインショップ",
+    "https://www.dhc.co.jp/goods/search.jsp?keyword={query}",
+    "https://www.dhc.co.jp",
+)
+
+search_fancl = _make_generic_scraper(
+    "ファンケルオンライン",
+    "https://www.fancl.co.jp/search/?q={query}",
+    "https://www.fancl.co.jp",
+)
+
+search_sony = _make_generic_scraper(
+    "ソニーストア",
+    "https://store.sony.jp/search/?q={query}",
+    "https://store.sony.jp",
+)
+
+search_ksdenki = _make_generic_scraper(
+    "ケーズデンキオンラインショップ",
+    "https://www.ksdenki.com/shop/e/esearch/?keyword={query}",
+    "https://www.ksdenki.com",
+)
+
+search_nojima = _make_generic_scraper(
+    "ノジマオンライン",
+    "https://online.nojima.co.jp/app/catalog/list/init?searchWord={query}",
+    "https://online.nojima.co.jp",
+)
+
+search_matsukiyo = _make_generic_scraper(
+    "マツモトキヨシオンラインストア",
+    "https://www.matsukiyo.co.jp/store/online/search?text={query}",
+    "https://www.matsukiyo.co.jp",
+)
+
+search_dshopping = _make_generic_scraper(
+    "dショッピング",
+    "https://dshopping.docomo.ne.jp/search?keyword={query}",
+    "https://dshopping.docomo.ne.jp",
+)
+
+search_buyma = _make_generic_scraper(
+    "BUYMA",
+    "https://www.buyma.com/r/-{query}/",
+    "https://www.buyma.com",
+)
+
+search_abcmart = _make_generic_scraper(
+    "ABC-MARTオンラインストア",
+    "https://www.abc-mart.net/shop/goods/search.aspx?keyword={query}",
+    "https://www.abc-mart.net",
+)
+
+search_gu = _make_generic_scraper(
+    "GU オンラインストア",
+    "https://www.gu-global.com/jp/ja/search?q={query}",
+    "https://www.gu-global.com",
+)
+
+search_shopjapan = _make_generic_scraper(
+    "ショップジャパン",
+    "https://www.shopjapan.co.jp/search/?q={query}",
+    "https://www.shopjapan.co.jp",
+)
+
+search_iherb = _make_generic_scraper(
+    "iHerb",
+    "https://jp.iherb.com/search?kw={query}",
+    "https://jp.iherb.com",
+)
+
+search_cosme = _make_generic_scraper(
+    "@cosme SHOPPING",
+    "https://www.cosme.com/products/search?keyword={query}",
+    "https://www.cosme.com",
+)
+
+
+# ============================================================
 # 全ショップ検索定義
 # ============================================================
 
@@ -592,6 +791,27 @@ SCRAPERS = [
     (search_seven, "セブンネットショッピング"),
     (search_qoo10, "Qoo10"),
     (search_edion, "エディオンネットショップ"),
+    # 追加ショップ（汎用スクレイパー）
+    (search_uniqlo, "ユニクロオンラインストア"),
+    (search_muji, "無印良品ネットストア"),
+    (search_jalmall, "JAL Mall"),
+    (search_bellemaison, "ベルメゾンネット"),
+    (search_lohaco, "LOHACO"),
+    (search_nitori, "ニトリネット"),
+    (search_zozo, "ZOZOTOWN"),
+    (search_dhc, "DHCオンラインショップ"),
+    (search_fancl, "ファンケルオンライン"),
+    (search_sony, "ソニーストア"),
+    (search_ksdenki, "ケーズデンキオンラインショップ"),
+    (search_nojima, "ノジマオンライン"),
+    (search_matsukiyo, "マツモトキヨシオンラインストア"),
+    (search_dshopping, "dショッピング"),
+    (search_buyma, "BUYMA"),
+    (search_abcmart, "ABC-MARTオンラインストア"),
+    (search_gu, "GU オンラインストア"),
+    (search_shopjapan, "ショップジャパン"),
+    (search_iherb, "iHerb"),
+    (search_cosme, "@cosme SHOPPING"),
 ]
 
 # スクレイパー対応済みショップ名のセット（自動生成）

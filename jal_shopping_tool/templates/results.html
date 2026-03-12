@@ -159,19 +159,51 @@
 <div class="card">
     <h2>自動検索で取得できなかったショップ（{{ scraper_not_found | length }}件）</h2>
     <p class="text-small">以下のショップでは自動取得できませんでした。リンクから手動で確認できます。</p>
-    <div class="not-found-list">
-        {% for c in scraper_not_found %}
-        <div class="not-found-item">
-            <span class="not-found-name">{{ c.shop_name }}</span>
-            <span class="not-found-rate text-small">{{ c.mile_rate_desc }}</span>
-            <span class="not-found-reason text-small">
-                {% if c.error %}{{ c.error }}{% else %}商品が見つかりませんでした{% endif %}
-            </span>
-            {% if c.search_url %}
-            <a href="{{ c.search_url }}" target="_blank" rel="noopener" class="btn btn-small btn-outline">手動で検索</a>
-            {% endif %}
-        </div>
-        {% endfor %}
+    <div class="offers-table-wrap">
+        <table class="offers-table not-found-table">
+            <thead>
+                <tr>
+                    <th>ショップ名</th>
+                    <th>マイルレート</th>
+                    <th>LSPレート</th>
+                    <th>1万円購入時</th>
+                    <th>理由</th>
+                    <th>リンク</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for c in scraper_not_found %}
+                <tr>
+                    <td><strong>{{ c.shop_name }}</strong></td>
+                    <td class="text-small">{{ c.mile_rate_desc }}</td>
+                    <td class="text-small">
+                        {% if c.jal_shop and c.jal_shop.yen_per_mile > 0 %}
+                        {{ '%.2f' | format(1.0 / c.jal_shop.yen_per_mile) }}
+                        {% else %}
+                        -
+                        {% endif %}
+                    </td>
+                    <td class="text-small">
+                        {% if c.jal_shop %}
+                        {{ c.jal_shop.calc_miles(10000) }}マイル / {{ c.jal_shop.calc_lsp(10000) | round(1) }} LSP
+                        {% else %}
+                        -
+                        {% endif %}
+                    </td>
+                    <td class="text-small">
+                        {% if c.error %}{{ c.error }}{% else %}商品が見つかりませんでした{% endif %}
+                    </td>
+                    <td>
+                        <div class="action-links">
+                            {% if c.search_url %}
+                            <a href="{{ c.search_url }}" target="_blank" rel="noopener" class="btn btn-small btn-outline">手動で検索</a>
+                            {% endif %}
+                        </div>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
     </div>
 </div>
 {% endif %}
