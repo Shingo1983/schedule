@@ -266,7 +266,7 @@ def _is_relevant_product(query: str, product_name: str) -> bool:
         r'(?:シリコン|TPU|レザー|ハード|ソフト|クリア|透明)\s*ケース',
         # スタンドアロンのアクセサリワード（「付き」で終わらないもの）
         # 「ケース」「カバー」単独 → アクセサリ（ただし「充電ケース付き」等は除外しない）
-        r'(?<!充電)ケース(?!付)',
+        r'ケース(?!付)',
         r'カバー(?!付)',
         # 常にアクセサリ（単体で十分明確）
         r'イヤーピース', r'イヤーチップ', r'イヤーパッド',
@@ -1358,7 +1358,7 @@ def search_joshin(query: str, _config: Config) -> ShopPrice:
 # au PAY マーケット (HTML + JSON-LD + 埋め込みJSON)
 # ============================================================
 def search_aupay(query: str, _config: Config) -> ShopPrice:
-    search_url = f"https://wowma.jp/itemlist?e_scope=O&at=FP&non_gr=ex&keyword={quote(query)}&categ_id=0&sort_type=priceasc"
+    search_url = f"https://wowma.jp/itemlist?e_scope=O&at=FP&non_gr=ex&keyword={quote(query)}&categ_id=0"
     selectors = [
         (".itemList__item", ".itemList__price, .price", ".itemList__name a, .product-name a"),
         (".product-item", ".product-price, .price", ".product-name a"),
@@ -1687,8 +1687,21 @@ def _retry_with_browser(results: list[ShopPrice], query: str) -> None:
         else:
             retry_normal.append(i)
 
-    # 成功見込みの高いショップを先にリトライ
-    retry_indices = retry_normal + retry_timeout
+    # 電子機器系ショップを優先（価格比較の本命）
+    _PRIORITY_SHOPS = {
+        "ビックカメラ.com", "ヨドバシ.com", "Joshin webショップ",
+        "ケーズデンキオンラインショップ", "コジマネット", "エディオンネットショップ",
+        "ノジマオンライン", "ヤマダウェブコム", "楽天市場", "Qoo10",
+        "au PAY マーケット", "セブンネットショッピング", "dショッピング",
+    }
+    retry_priority = []
+    retry_other = []
+    for i in (retry_normal + retry_timeout):
+        if results[i].shop_name in _PRIORITY_SHOPS:
+            retry_priority.append(i)
+        else:
+            retry_other.append(i)
+    retry_indices = retry_priority + retry_other
 
     if not retry_indices:
         return
@@ -1697,7 +1710,7 @@ def _retry_with_browser(results: list[ShopPrice], query: str) -> None:
 
     # Phase 2 全体の時間制限（3分）
     phase2_start = time.time()
-    PHASE2_BUDGET = 180  # 秒
+    PHASE2_BUDGET = 210  # 秒
 
     def _launch_browser(pw):
         """ブラウザ起動: Chrome → Chromiumの順にフォールバック"""
@@ -1735,12 +1748,54 @@ def _retry_with_browser(results: list[ShopPrice], query: str) -> None:
                 java_script_enabled=True,
                 extra_http_headers={
                     "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+                    "Accept-Encoding": "gzip, deflate, br, zstd",
+                    "Sec-Ch-Ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+                    "Sec-Ch-Ua-Mobile": "?0",
+                    "Sec-Ch-Ua-Platform": '"Windows"',
+                    "Sec-Fetch-Dest": "document",
+                    "Sec-Fetch-Mode": "navigate",
+                    "Sec-Fetch-Site": "none",
+                    "Sec-Fetch-User": "?1",
+                    "Upgrade-Insecure-Requests": "1",
+                    "DNT": "1",
                 },
             )
-            # ステルス: bot検出回避（最小限で安全な変更のみ）
+            # ステルス: bot検出回避（包括的）
             context.add_init_script("""
+                // webdriverフラグを隠す
                 Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-                if (window.chrome === undefined) { window.chrome = {runtime: {}}; }
+                // Chrome Runtime
+                if (window.chrome === undefined) {
+                    window.chrome = {runtime: {}, loadTimes: function(){}, csi: function(){}};
+                }
+                // pluginsを模倣
+                Object.defineProperty(navigator, 'plugins', {
+                    get: () => [
+                        {name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer'},
+                        {name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai'},
+                        {name: 'Native Client', filename: 'internal-nacl-plugin'},
+                    ],
+                });
+                // languagesを模倣
+                Object.defineProperty(navigator, 'languages', {get: () => ['ja', 'en-US', 'en']});
+                // hardwareConcurrency
+                Object.defineProperty(navigator, 'hardwareConcurrency', {get: () => 8});
+                // deviceMemory
+                Object.defineProperty(navigator, 'deviceMemory', {get: () => 8});
+                // permissions
+                const originalQuery = window.navigator.permissions.query;
+                window.navigator.permissions.query = (parameters) =>
+                    parameters.name === 'notifications'
+                        ? Promise.resolve({state: Notification.permission})
+                        : originalQuery(parameters);
+                // WebGL vendor/renderer
+                const getParam = WebGLRenderingContext.prototype.getParameter;
+                WebGLRenderingContext.prototype.getParameter = function(param) {
+                    if (param === 37445) return 'Google Inc. (NVIDIA)';
+                    if (param === 37446) return 'ANGLE (NVIDIA, NVIDIA GeForce GTX 1080, OpenGL 4.5)';
+                    return getParam.call(this, param);
+                };
             """)
 
             for idx in retry_indices:
@@ -1756,10 +1811,23 @@ def _retry_with_browser(results: list[ShopPrice], query: str) -> None:
                 page = None
                 try:
                     page = context.new_page()
-                    page.goto(r.search_url, timeout=30000, wait_until="domcontentloaded")
-                    # JS描画を待つ
-                    page.wait_for_timeout(3000)
+                    # Refererを設定（bot検出回避に重要）
+                    referer = f"{urlparse(r.search_url).scheme}://{urlparse(r.search_url).netloc}/"
+                    page.goto(r.search_url, timeout=30000,
+                              wait_until="domcontentloaded", referer=referer)
+                    # ネットワークアイドルを待つ（SPAのJS描画完了を待機）
+                    try:
+                        page.wait_for_load_state("networkidle", timeout=8000)
+                    except Exception:
+                        pass  # タイムアウトしても続行
+                    # 追加の描画待ち
+                    page.wait_for_timeout(2000)
                     html = page.content()
+
+                    # HTMLが極端に小さい場合はさらに待機（SPA遅延読み込み対策）
+                    if len(html) < 5000:
+                        page.wait_for_timeout(5000)
+                        html = page.content()
 
                     soup = BeautifulSoup(html, "lxml")
 
