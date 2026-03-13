@@ -1005,9 +1005,46 @@ def _extract_price_by_fulltext(soup: BeautifulSoup, query: str,
 
     if not candidates:
         # デバッグ: なぜ候補がないか
-        total_matches = sum(1 for _ in price_pattern.finditer(full_text))
-        logger.debug("Fulltext: %d price matches found in %d chars text, %d keywords=%s, but 0 candidates",
-                     total_matches, len(full_text), len(keywords), keywords[:5])
+        total_matches = 0
+        kw_fail = 0
+        acc_fail = 0
+        for m in price_pattern.finditer(full_text):
+            raw = m.group(1) or m.group(2) or m.group(3)
+            if not raw:
+                continue
+            digits = re.sub(r'[^\d]', '', raw)
+            if not digits:
+                continue
+            p = int(digits)
+            if not (1000 <= p <= 99_999_999):
+                continue
+            total_matches += 1
+            window = 500 if len(full_text) < 50000 else 1000
+            start = max(0, m.start() - window)
+            end = min(len(full_text_lower), m.end() + window)
+            ctx = full_text_lower[start:end]
+            mc = 0
+            for kw in keywords:
+                variants = [kw] + _KEYWORD_KATAKANA_MAP.get(kw, [])
+                if any(v.lower() in ctx for v in variants):
+                    mc += 1
+            req = max(1, (len(keywords) + 1) // 2) if len(full_text) > 100000 else max(1, len(keywords) - 1)
+            if mc < req:
+                kw_fail += 1
+                # 先頭のみ詳細ログ
+                if kw_fail == 1:
+                    narrow = full_text[max(0, m.start()-80):m.end()+20].replace('\n', ' ')
+                    logger.info("Fulltext kw-fail: price=¥%s, matched=%d/%d required=%d, context='%s'",
+                                digits, mc, len(keywords), req, narrow[:120])
+            else:
+                acc_fail += 1
+                if acc_fail == 1:
+                    ns = max(0, m.start() - 120)
+                    nc = full_text_lower[ns:m.start()]
+                    logger.info("Fulltext acc-fail: price=¥%s, narrow='%s'",
+                                digits, nc.replace('\n', ' ')[:120])
+        logger.info("Fulltext: %d prices, %d kw-fail, %d acc-fail, keywords=%s",
+                     total_matches, kw_fail, acc_fail, keywords[:5])
         return None
 
     # キーワード一致数が最も高い候補を優先
