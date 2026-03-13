@@ -380,7 +380,8 @@ def _is_relevant_product(query: str, product_name: str) -> bool:
     stop_words = {"the", "a", "an", "and", "or", "in", "on", "at", "to", "for",
                   "no", "の", "に", "を", "は", "が", "と", "で", "も", "から", "まで"}
     words = re.split(r'[\s　/／\-]+', query_lower)
-    keywords = [w for w in words if len(w) >= 2 and w not in stop_words]
+    # 1文字でも数字はバージョン/型番として保持（例: "3" in "airpods pro 3"）
+    keywords = [w for w in words if (len(w) >= 2 or w.isdigit()) and w not in stop_words]
 
     if not keywords:
         keywords = [w for w in words if len(w) >= 1]
@@ -450,6 +451,15 @@ def _is_relevant_product(query: str, product_name: str) -> bool:
         r'\bcase\b', r'\bcover\b',
     ]
     for pattern in _ACCESSORY_PATTERNS:
+        if re.search(pattern, name_lower, re.IGNORECASE):
+            return False
+
+    # === 中古・整備済み品の除外 ===
+    _USED_PATTERNS = [
+        r'整備済み', r'renewed', r'refurbished', r'中古', r'再生品',
+        r'\bused\b', r'pre[\-\s]?owned', r'訳あり', r'ジャンク',
+    ]
+    for pattern in _USED_PATTERNS:
         if re.search(pattern, name_lower, re.IGNORECASE):
             return False
 
@@ -970,7 +980,7 @@ def _extract_price_by_fulltext(soup: BeautifulSoup, query: str,
     """
     # キーワード準備（カタカナ展開込み）
     query_lower = query.lower()
-    keywords = [w for w in re.split(r'[\s　/／\-]+', query_lower) if len(w) >= 2]
+    keywords = [w for w in re.split(r'[\s　/／\-]+', query_lower) if len(w) >= 2 or w.isdigit()]
     if not keywords:
         return None
     # ページ全テキスト抽出（改行区切り）
@@ -1143,7 +1153,7 @@ def _extract_price_from_raw_html(html: str, query: str,
     get_text()では取得できない価格を生HTMLから直接抽出する。
     """
     query_lower = query.lower()
-    keywords = [w for w in re.split(r'[\s　/／\-]+', query_lower) if len(w) >= 2]
+    keywords = [w for w in re.split(r'[\s　/／\-]+', query_lower) if len(w) >= 2 or w.isdigit()]
     if not keywords:
         return None
 
@@ -1256,9 +1266,9 @@ def _extract_price_by_text(soup: BeautifulSoup, query: str,
         candidates = [c for c in candidates
                       if median_price * 0.3 <= c[0] <= median_price * 2.5]
 
-    # DOM順の最初の候補を返す（関連性順で最も適切な商品）
+    # 最安値を返す
     if candidates:
-        return candidates[0]
+        return min(candidates, key=lambda c: c[0])
     return None
 
 
@@ -1600,8 +1610,8 @@ def _search_yahoo_api(query: str, config: Config, search_url: str) -> ShopPrice 
     params = {
         "appid": config.yahoo_app_id,
         "query": query,
-        "results": 20,
-        "sort": "-score",  # 関連性順（価格順だとアクセサリが先に来る）
+        "results": 50,
+        "sort": "+price",  # 価格昇順（関連性フィルタで不要商品を除外）
         "in_stock": "true",
     }
 
@@ -1748,7 +1758,7 @@ def search_amazon(query: str, _config: Config) -> ShopPrice:
                 if img and img.get("alt"):
                     name = img["alt"]
 
-            # 関連性チェック
+            # 関連性チェック（中古・整備済み品も除外される）
             if name and not _is_relevant_product(query, name):
                 continue
 
