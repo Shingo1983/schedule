@@ -2458,7 +2458,27 @@ def _retry_with_browser(results: list[ShopPrice], query: str) -> None:
                             pass
                         html = page.content()
 
+                    # SPA検出: HTMLは大きいがテキストが少ない → 商品リストが未描画
+                    # (Joshin等: 74KB HTML, 6KB text = ヘッダーのみ描画)
                     soup = BeautifulSoup(html, "lxml")
+                    text_len = len(soup.get_text())
+                    if len(html) > 20000 and text_len < 10000:
+                        logger.debug("Phase 2: SPA detected for %s (HTML %dK, text %dK), extra wait+scroll",
+                                     r.shop_name, len(html) // 1024, text_len // 1024)
+                        try:
+                            # 段階的にスクロールして遅延コンテンツをトリガー
+                            for scroll_y in [300, 600, 900]:
+                                page.evaluate(f"window.scrollTo(0, {scroll_y})")
+                                page.wait_for_timeout(2000)
+                            # ページトップに戻ってから再度下へ（一部サイトはスクロール位置で描画）
+                            page.evaluate("window.scrollTo(0, 0)")
+                            page.wait_for_timeout(1000)
+                            page.evaluate("window.scrollBy(0, 500)")
+                            page.wait_for_timeout(3000)
+                        except Exception:
+                            pass
+                        html = page.content()
+                        soup = BeautifulSoup(html, "lxml")
 
                     # bot検出ページチェック
                     if _is_bot_blocked_page(soup):
