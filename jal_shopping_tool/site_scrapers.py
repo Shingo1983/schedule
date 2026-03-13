@@ -391,7 +391,13 @@ def _is_relevant_product(query: str, product_name: str) -> bool:
         match_count = 0
         for kw in keywords:
             variants = [kw] + _KEYWORD_KATAKANA_MAP.get(kw, [])
-            if any(v.lower() in name_lower for v in variants):
+            # 1-2文字の数字キーワード（型番/バージョン）はワードバウンダリでマッチ
+            # 例: "3" が "MTJV3" にマッチしないように（"Pro 3" にはマッチ）
+            if kw.isdigit() and len(kw) <= 2:
+                pattern = r'(?<![a-zA-Z0-9])' + re.escape(kw) + r'(?![0-9])'
+                if re.search(pattern, product_name, re.IGNORECASE):
+                    match_count += 1
+            elif any(v.lower() in name_lower for v in variants):
                 match_count += 1
         if len(keywords) == 1:
             if match_count < 1:
@@ -430,7 +436,7 @@ def _is_relevant_product(query: str, product_name: str) -> bool:
         r'(?<!充電)ケース(?!付)',
         r'カバー(?!付)',
         # 常にアクセサリ（単体で十分明確）
-        r'イヤーピース', r'イヤーチップ', r'イヤーパッド',
+        r'イヤーフック', r'イヤーピース', r'イヤーチップ', r'イヤーパッド',
         r'保護フィルム', r'ガラスフィルム', r'液晶保護',
         r'保護ケース', r'保護カバー', r'保護ガラス',
         r'ストラップ',
@@ -447,7 +453,7 @@ def _is_relevant_product(query: str, product_name: str) -> bool:
         # English
         r'\bprotective\s+case\b', r'\bsilicone\s+case\b', r'\btpu\s+case\b',
         r'\bscreen\s+protector\b', r'\bprotector\b',
-        r'\bear\s*tips?\b', r'\bsleeve\b',
+        r'\bear\s*(?:tips?|hooks?)\b', r'\bsleeve\b',
         r'\bcase\b', r'\bcover\b',
     ]
     for pattern in _ACCESSORY_PATTERNS:
@@ -1029,10 +1035,16 @@ def _extract_price_by_fulltext(soup: BeautifulSoup, query: str,
         # カタカナ展開込みでキーワードマッチ（各元キーワードごとに1回カウント）
         match_count = 0
         for kw in keywords:
-            # 元キーワード自体 or カタカナ変換のいずれかがコンテキストに存在すればOK
-            variants = [kw] + _KEYWORD_KATAKANA_MAP.get(kw, [])
-            if any(v.lower() in context for v in variants):
-                match_count += 1
+            # 1-2文字の数字キーワードはワードバウンダリでマッチ
+            if kw.isdigit() and len(kw) <= 2:
+                pattern = r'(?<![a-zA-Z0-9])' + re.escape(kw) + r'(?![0-9])'
+                if re.search(pattern, full_text[start:end], re.IGNORECASE):
+                    match_count += 1
+            else:
+                # 元キーワード自体 or カタカナ変換のいずれかがコンテキストに存在すればOK
+                variants = [kw] + _KEYWORD_KATAKANA_MAP.get(kw, [])
+                if any(v.lower() in context for v in variants):
+                    match_count += 1
         # キーワードの過半数一致を要求（大きいページでは緩和）
         if len(full_text) > 100000:
             required = max(1, (len(keywords) + 1) // 2)  # 過半数
@@ -1049,7 +1061,7 @@ def _extract_price_by_fulltext(soup: BeautifulSoup, query: str,
                 # アクセサリパターン: 「ケース」が「充電ケース付」でない場合
                 acc_patterns = [
                     r'(?<!充電)ケース(?!付)', r'カバー(?!付)', r'フィルム',
-                    r'ストラップ', r'イヤーピース', r'イヤーチップ', r'互換',
+                    r'ストラップ', r'イヤーフック', r'イヤーピース', r'イヤーチップ', r'互換',
                     r'\bcase\b', r'\bcover\b', r'\bsleeve\b',
                 ]
                 for ap in acc_patterns:
@@ -1610,8 +1622,8 @@ def _search_yahoo_api(query: str, config: Config, search_url: str) -> ShopPrice 
     params = {
         "appid": config.yahoo_app_id,
         "query": query,
-        "results": 50,
-        "sort": "+price",  # 価格昇順（関連性フィルタで不要商品を除外）
+        "results": 30,
+        "sort": "-score",  # 関連性順（価格順だとアクセサリ/ゴミが上位に来る）
         "in_stock": "true",
     }
 
