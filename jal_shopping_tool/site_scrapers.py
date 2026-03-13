@@ -619,30 +619,44 @@ def _find_prices_in_dict(obj, results: list, depth: int = 0):
 
 
 def _is_no_results_page(soup: BeautifulSoup) -> bool:
-    """検索結果が0件のページかどうかを判定"""
+    """検索結果が0件のページかどうかを判定
+
+    注意: 大きいページ（>5KB text）は結果がある可能性が高いので
+    パターンマッチを厳格化する。誤検出は価格取得の失敗に直結する。
+    """
     text = soup.get_text()
+    text_len = len(text)
+
+    # 大きいページは結果がある可能性が高い → 「0件」系の厳密パターンのみ
+    if text_len > 5000:
+        strict_patterns = [
+            r'(?<!\d)0\s*件中\s*0',
+            r'検索結果\s*[:：]?\s*(?<!\d)0\s*件',
+            r'(?<!\d)0\s*件の検索結果',
+        ]
+        for pattern in strict_patterns:
+            if re.search(pattern, text):
+                logger.debug("No results detected (strict) for %d char page", text_len)
+                return True
+        return False
+
+    # 小さいページは広めのパターンでチェック
     no_results_patterns = [
         r'(?<!\d)0\s*件中\s*0',
         r'件中\s*0\s*～\s*0\s*件',
-        r'(?<!\d)0\s*件\s*～\s*0\s*件.*?表示',
-        r'該当する商品.*?(?:ございません|みつかりません|見つかりません|ありません)',
-        r'みつかりませんでした',
+        r'該当する商品[がは]?\s*(?:ございません|ありません|見つかりません)',
         r'見つかりませんでした',
-        r'一致する.*?(?:ございません|ありません|見つかりません)',
+        r'一致する商品[がは]?\s*(?:ございません|ありません)',
         r'商品が見つかりません',
-        r'検索結果.*?ありません',
-        r'お探しの.*?見つかりません',
-        r'該当.*?(?<!\d)0\s*件',
         r'検索結果\s*[:：]?\s*(?<!\d)0\s*件',
         r'(?<!\d)0\s*件の商品',
         r'(?<!\d)0\s*件の検索結果',
         r'no\s+results?\s+found',
-        r'(?<!\d)0\s+items?\s+found',
         r'ヒットしませんでした',
-        r'条件に合う商品.*?(?:ございません|ありません)',
     ]
     for pattern in no_results_patterns:
         if re.search(pattern, text, re.IGNORECASE):
+            logger.debug("No results detected for %d char page: %s", text_len, pattern)
             return True
     return False
 
@@ -804,15 +818,25 @@ def _find_price_in_soup(soup: BeautifulSoup, selectors: list[tuple[str, str, str
         if result:
             return result
 
+    # 7. 生HTML内の価格パターン検索（テキスト抽出で消えた価格を拾う）
+    # JSフレームワーク(React/Vue/Next.js等)がデータをscriptタグやdata属性に
+    # 格納している場合、get_text()では取得できない
+    if query:
+        result = _extract_price_from_raw_html(str(soup), query, base_url)
+        if result:
+            return result
+
     # デバッグ: 全ステップ失敗時の情報
-    html_len = len(str(soup))
+    raw_html = str(soup)
+    html_len = len(raw_html)
     text = soup.get_text()
     text_len = len(text)
-    # 価格パターンの存在チェック
-    price_count = len(re.findall(r'[¥￥]\s*[\d,]+|[\d,]+\s*円|\d{4,8}\s*円', text))
+    price_in_text = len(re.findall(r'[¥￥]\s*[\d,]+|[\d,]+\s*円|\d{4,8}\s*円', text))
+    price_in_html = len(re.findall(r'[¥￥]\s*[\d,]+|[\d,]+\s*円|\d{4,8}\s*円', raw_html))
     if html_len > 10000:
-        logger.info("Price extraction failed: HTML %d chars, text %d chars, %d price patterns found",
-                     html_len, text_len, price_count)
+        logger.info("Price extraction failed: HTML %d chars, text %d chars, "
+                     "prices in text=%d, in html=%d",
+                     html_len, text_len, price_in_text, price_in_html)
 
     return None, "", ""
 
@@ -933,6 +957,83 @@ def _extract_price_by_fulltext(soup: BeautifulSoup, query: str,
 
     # URLは検索URL（フルテキストからは個別URL取得困難）
     return price, name, ""
+
+
+def _extract_price_from_raw_html(html: str, query: str,
+                                  base_url: str) -> tuple[int, str, str] | None:
+    """生HTML内の価格パターン検索（テキスト抽出で消えた価格を拾う）
+
+    JSフレームワーク(React/Vue/Next.js/Nuxt等)がデータをscriptタグや
+    data属性、JSONオブジェクト内に格納している場合に有効。
+    get_text()では取得できない価格を生HTMLから直接抽出する。
+    """
+    query_lower = query.lower()
+    keywords = [w for w in re.split(r'[\s　/／\-]+', query_lower) if len(w) >= 2]
+    if not keywords:
+        return None
+
+    # 生HTML内の価格パターン
+    price_pattern = re.compile(
+        r'"price"\s*:\s*(\d{3,8})'             # "price": 38192 (JSON)
+        r'|"price"\s*:\s*"(\d{3,8})"'          # "price": "38192" (JSON string)
+        r'|"salePrice"\s*:\s*(\d{3,8})'        # "salePrice": 38192
+        r'|"itemPrice"\s*:\s*(\d{3,8})'        # "itemPrice": 38192
+        r'|data-price="(\d{3,8})"'             # data-price="38192"
+        r'|data-item-price="(\d{3,8})"'        # data-item-price="38192"
+        r'|"lowPrice"\s*:\s*(\d{3,8})'         # "lowPrice": 38192
+        r'|"highPrice"\s*:\s*(\d{3,8})'        # "highPrice": 38192
+        r'|[¥￥]\s*([\d,]{4,})'                # ¥38,192 in HTML
+        r'|([\d,]{4,})\s*円'                   # 38,192円 in HTML
+    )
+
+    html_lower = html.lower()
+    candidates = []
+
+    for m in price_pattern.finditer(html):
+        raw = None
+        for i in range(1, 11):
+            if m.group(i):
+                raw = m.group(i)
+                break
+        if not raw:
+            continue
+
+        digits = re.sub(r'[^\d]', '', raw)
+        if not digits:
+            continue
+        price = int(digits)
+        if not (1000 <= price <= 99_999_999):
+            continue
+
+        # キーワード近接チェック（HTMLなのでタグを跨ぐ）
+        window = 2000  # HTML内はタグが多いので広めの窓
+        start = max(0, m.start() - window)
+        end = min(len(html_lower), m.end() + window)
+        context = html_lower[start:end]
+
+        match_count = sum(1 for kw in keywords if kw in context)
+        required = max(1, (len(keywords) + 1) // 2)
+        if match_count >= required:
+            candidates.append(price)
+
+    if not candidates:
+        return None
+
+    # 外れ値除去
+    candidates.sort()
+    if len(candidates) >= 3:
+        median = candidates[len(candidates) // 2]
+        candidates = [p for p in candidates if median * 0.4 <= p <= median * 2.5]
+    if len(candidates) >= 2:
+        if candidates[0] < candidates[1] * 0.5:
+            candidates = candidates[1:]
+
+    if not candidates:
+        return None
+
+    price = candidates[0]
+    logger.info("Raw HTML extraction found price: ¥%s", f"{price:,}")
+    return price, query, ""
 
 
 def _extract_price_by_text(soup: BeautifulSoup, query: str,
@@ -1755,16 +1856,20 @@ search_fancl = _make_generic_scraper(
 def search_sony(query: str, _config: Config) -> ShopPrice:
     """ソニーストア: 複数URL試行"""
     search_urls = [
-        f"https://store.sony.jp/search/?q={quote(query)}",
         f"https://www.sony.jp/search/results/?q={quote(query)}",
+        f"https://www.sony.jp/search/?q={quote(query)}",
     ]
+    selectors = [
+        (".search-result-item", ".search-result-price, .price", ".search-result-name a"),
+        ('[class*="product"]', '[class*="price"]', '[class*="name"] a, [class*="title"] a'),
+    ] + _GENERIC_SELECTORS
     for url in search_urls:
-        result = _scrape_generic("ソニーストア", url, _GENERIC_SELECTORS,
-                                 "https://store.sony.jp", query=query)
+        result = _scrape_generic("ソニーストア", url, selectors,
+                                 "https://www.sony.jp", query=query)
         if result.price is not None:
             return result
-        # HTTP 404以外のエラーはそのまま返す
-        if result.error and "HTTP 404" not in (result.error or ""):
+        # 接続エラー/404なら次のURLを試す
+        if result.error and "HTTP 404" not in (result.error or "") and "接続エラー" not in (result.error or ""):
             return result
     return ShopPrice("ソニーストア", None, "", "", search_urls[0],
                      error=result.error if result else None)
