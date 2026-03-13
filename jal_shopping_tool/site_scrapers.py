@@ -1001,7 +1001,7 @@ def _extract_price_by_fulltext(soup: BeautifulSoup, query: str,
                         is_accessory = True
                         break
             if not is_accessory:
-                candidates.append(price)
+                candidates.append((match_count, price))
 
     if not candidates:
         # デバッグ: なぜ候補がないか
@@ -1010,19 +1010,24 @@ def _extract_price_by_fulltext(soup: BeautifulSoup, query: str,
                      total_matches, len(full_text), len(keywords), keywords[:5])
         return None
 
+    # キーワード一致数が最も高い候補を優先
+    best_match = max(c[0] for c in candidates)
+    top_candidates = sorted([p for mc, p in candidates if mc >= best_match])
+
     # 外れ値除去（中央値ベース: アクセサリ/バンドル除去）
-    candidates.sort()
-    if len(candidates) >= 3:
-        median = candidates[len(candidates) // 2]
-        candidates = [p for p in candidates if median * 0.3 <= p <= median * 2.5]
-    if len(candidates) >= 2:
-        if candidates[0] < candidates[1] * 0.5:
-            candidates = candidates[1:]
+    if len(top_candidates) >= 3:
+        median = top_candidates[len(top_candidates) // 2]
+        top_candidates = [p for p in top_candidates if median * 0.3 <= p <= median * 2.5]
+    if len(top_candidates) >= 2:
+        if top_candidates[0] < top_candidates[1] * 0.5:
+            top_candidates = top_candidates[1:]
 
-    if not candidates:
-        return None
+    if not top_candidates:
+        # フォールバック: 全候補から（match_count降順、price昇順）
+        all_prices = sorted(candidates, key=lambda x: (-x[0], x[1]))
+        top_candidates = [all_prices[0][1]]
 
-    price = candidates[0]
+    price = top_candidates[0]
 
     # 商品名を推定（価格の近くにあるクエリマッチ行）
     name = query  # フォールバック
@@ -2148,6 +2153,11 @@ _SHOP_SPECIFIC_SELECTORS: dict[str, list[tuple[str, str, str]]] = {
     "dショッピング": [
         (".c-productListItem", ".c-productListItem__price", ".c-productListItem__name a"),
         ('[class*="ProductCard"]', '[class*="price"]', '[class*="name"] a'),
+    ],
+    "Joshin webショップ": [
+        (".product-list__item", ".product-list__price, .price", ".product-list__name a"),
+        (".productItem", ".productPrice, .price", ".productName a"),
+        ('[class*="product"]', '[class*="price"]', '[class*="product"] a, [class*="name"] a'),
     ],
 }
 
