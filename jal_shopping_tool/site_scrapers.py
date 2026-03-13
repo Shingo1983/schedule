@@ -646,29 +646,120 @@ def _find_price_in_soup(soup: BeautifulSoup, selectors: list[tuple[str, str, str
                 url = href if href.startswith("http") else (f"{base_url}{href}" if href.startswith("/") and base_url else "")
                 return price, name, url
 
-    # 5. テキストベース汎用抽出（CSSセレクタに依存しない最終手段）
+    # 5. テキストベース汎用抽出（DOM構造ベース）
     if query:
         result = _extract_price_by_text(soup, query, base_url)
         if result:
             return result
 
-    # デバッグ: なぜ見つからなかったか記録
-    if query and len(str(soup)) > 50000:
-        # 大きなHTMLなのに価格が見つからない場合、関連リンク数を記録
-        relevant_links = 0
-        for link in soup.find_all("a", href=True):
-            name = link.get_text(strip=True)
-            if name and len(name) >= 5 and _is_relevant_product(query, name):
-                relevant_links += 1
-                if relevant_links <= 3:
-                    logger.debug("Relevant link found but no price: %s", name[:80])
-        if relevant_links == 0:
-            logger.debug("No relevant <a> tags found in %d chars HTML for query '%s'",
-                         len(str(soup)), query)
-        else:
-            logger.debug("%d relevant links found but no nearby prices", relevant_links)
+    # 6. フルテキスト近接検索（DOM構造に一切依存しない最終手段）
+    # 800KB超のHTMLでもページのプレーンテキストから価格を見つける
+    if query:
+        result = _extract_price_by_fulltext(soup, query, base_url)
+        if result:
+            return result
 
     return None, "", ""
+
+
+def _extract_price_by_fulltext(soup: BeautifulSoup, query: str,
+                                base_url: str) -> tuple[int, str, str] | None:
+    """フルテキスト近接検索（DOM構造に完全に依存しない最終手段）
+
+    ページの全テキストを抽出し、価格パターンの近くにクエリキーワードがあるかを
+    テキスト位置ベースでチェックする。800KB超のHTMLでも動作する。
+
+    CSSセレクタやDOM走査に依存しないため、あらゆるHTML構造に対応。
+    """
+    # キーワード準備
+    query_lower = query.lower()
+    keywords = [w for w in re.split(r'[\s　/／\-]+', query_lower) if len(w) >= 2]
+    if not keywords:
+        return None
+
+    # ページ全テキスト抽出（改行区切り）
+    full_text = soup.get_text(separator='\n')
+    if len(full_text) < 100:
+        return None
+
+    full_text_lower = full_text.lower()
+
+    # 価格パターンを全テキストから検索
+    price_pattern = re.compile(r'[¥￥]\s*([\d,]+)|([\d]{1,3}(?:,\d{3})+)\s*円')
+    candidates = []
+
+    for m in price_pattern.finditer(full_text):
+        raw = m.group(1) or m.group(2)
+        digits = re.sub(r'[^\d]', '', raw)
+        if not digits:
+            continue
+        price = int(digits)
+        if not (1000 <= price <= 99_999_999):  # フルテキストでは最低¥1,000以上
+            continue
+
+        # 価格の前後300文字以内にクエリキーワードがあるか確認
+        start = max(0, m.start() - 300)
+        end = min(len(full_text_lower), m.end() + 300)
+        context = full_text_lower[start:end]
+
+        match_count = sum(1 for kw in keywords if kw in context)
+        required = max(1, len(keywords) - 1)  # ほぼ全キーワード
+        if match_count >= required:
+            # アクセサリチェック: 価格の前の行（商品名が通常ある）で判定
+            # 300文字の広いコンテキストではなく、直前の狭い範囲で判定
+            narrow_start = max(0, m.start() - 120)
+            narrow_context = full_text_lower[narrow_start:m.start()]
+            # 「充電ケース付き」は除外しない
+            is_accessory = False
+            if not any(acc in query_lower for acc in ['ケース', 'カバー', 'case', 'cover']):
+                # アクセサリパターン: 「ケース」が「充電ケース付」でない場合
+                acc_patterns = [
+                    r'(?<!充電)ケース(?!付)', r'カバー(?!付)', r'フィルム',
+                    r'ストラップ', r'イヤーピース', r'イヤーチップ', r'互換',
+                    r'\bcase\b', r'\bcover\b', r'\bsleeve\b',
+                ]
+                for ap in acc_patterns:
+                    if re.search(ap, narrow_context):
+                        is_accessory = True
+                        break
+            if not is_accessory:
+                candidates.append(price)
+
+    if not candidates:
+        return None
+
+    # 外れ値除去
+    candidates.sort()
+    if len(candidates) >= 3:
+        median = candidates[len(candidates) // 2]
+        candidates = [p for p in candidates if p >= median * 0.5]
+    if len(candidates) >= 2:
+        if candidates[0] < candidates[1] * 0.6:
+            candidates = candidates[1:]
+
+    if not candidates:
+        return None
+
+    price = candidates[0]
+
+    # 商品名を推定（価格の近くにあるクエリマッチ行）
+    name = query  # フォールバック
+    for m in price_pattern.finditer(full_text):
+        raw = m.group(1) or m.group(2)
+        p = int(re.sub(r'[^\d]', '', raw) or '0')
+        if p == price:
+            # この価格の前後から商品名行を探す
+            start = max(0, m.start() - 300)
+            context_lines = full_text[start:m.start()].split('\n')
+            for line in reversed(context_lines):
+                line = line.strip()
+                if len(line) >= 10 and _is_relevant_product(query, line):
+                    name = line[:120]
+                    break
+            break
+
+    # URLは検索URL（フルテキストからは個別URL取得困難）
+    return price, name, ""
 
 
 def _extract_price_by_text(soup: BeautifulSoup, query: str,
@@ -725,7 +816,7 @@ def _extract_prices_from_text(text: str) -> list[int]:
     return found
 
 
-def _find_price_near_element(el, max_levels: int = 6) -> int | None:
+def _find_price_near_element(el, max_levels: int = 8) -> int | None:
     """要素の親を遡って最初に見つかった価格を返す"""
     for level in range(1, max_levels + 1):
         parent = el
@@ -736,7 +827,7 @@ def _find_price_near_element(el, max_levels: int = 6) -> int | None:
 
         parent_text = parent.get_text(separator=" ", strip=True)
         # テキストが長すぎる場合は終了（上位レベルはさらに大きいため）
-        if len(parent_text) > 3000:
+        if len(parent_text) > 5000:
             break
         prices = _extract_prices_from_text(parent_text)
         if prices:
@@ -809,8 +900,8 @@ def _find_product_candidates(soup: BeautifulSoup, query: str,
                     break
                 parent = parent.parent
             parent_text = parent.get_text(separator=" ", strip=True)
-            if len(parent_text) > 2000:
-                continue
+            if len(parent_text) > 5000:
+                break
             parent_lower = parent_text.lower()
             match_count = sum(1 for kw in keywords if kw in parent_lower)
             required = max(1, (len(keywords) + 1) // 2)
@@ -1765,4 +1856,34 @@ def search_all_shops(query: str, config: Config) -> list[ShopPrice]:
     if phase2_found > phase1_found:
         logger.info("Phase 2 recovered %d additional shops", phase2_found - phase1_found)
 
+    # === Phase 3: クロスショップ価格バリデーション ===
+    # 複数ショップの価格を比較し、明らかな外れ値（アクセサリ/無関係商品）を除外
+    _validate_prices_cross_shop(results)
+
     return results
+
+
+def _validate_prices_cross_shop(results: list[ShopPrice]) -> None:
+    """クロスショップ価格バリデーション
+
+    複数ショップの結果を統計的に比較し、中央値から大きく外れた結果を
+    エラーに変換する（アクセサリ・無関係商品の誤検出対策）。
+    """
+    prices_with_idx = [(r.price, i) for i, r in enumerate(results) if r.price is not None]
+    if len(prices_with_idx) < 3:
+        return  # 3件未満では統計的判断不可
+
+    prices_only = sorted(p for p, _ in prices_with_idx)
+    median = prices_only[len(prices_only) // 2]
+
+    # 中央値の25%未満の価格は明らかな外れ値
+    threshold = median * 0.25
+    for price, idx in prices_with_idx:
+        if price < threshold:
+            r = results[idx]
+            logger.info("Cross-shop validation: %s ¥%s removed (median ¥%s, threshold ¥%s)",
+                        r.shop_name, f"{price:,}", f"{median:,}", f"{threshold:,.0f}")
+            results[idx] = ShopPrice(
+                r.shop_name, None, "", "", r.search_url,
+                error="価格異常（他店と大きく乖離）"
+            )
