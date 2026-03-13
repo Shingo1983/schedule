@@ -1060,6 +1060,14 @@ def _make_error_result(shop_name: str, search_url: str, error: str) -> ShopPrice
     return ShopPrice(shop_name, None, "", "", search_url, error=error)
 
 
+# bot対策が厳しいショップ → Phase1でセッション共有（ホームページ→検索）
+_SESSION_FIRST_SHOPS: set[str] = {
+    "ビックカメラ.com", "コジマネット", "ヤマダウェブコム",
+    "au PAY マーケット", "ノジマオンライン", "エディオンネットショップ",
+    "ケーズデンキオンラインショップ",
+}
+
+
 def _scrape_generic(shop_name: str, search_url: str,
                     selectors: list[tuple[str, str, str]],
                     base_url: str,
@@ -1070,9 +1078,11 @@ def _scrape_generic(shop_name: str, search_url: str,
     改善:
     - bot検出ページを判定して適切なエラーメッセージ
     - 検索クエリとの関連性チェック（無関係な商品を除外）
-    - bot検出時は1回リトライ（3秒待機）
+    - bot検出時はリトライ（セッション共有 or 直接）
+    - 厳しいbot対策ショップではホームページ訪問でcookie取得後に検索
     """
     max_attempts = 2
+    use_session_first = shop_name in _SESSION_FIRST_SHOPS
 
     for attempt in range(max_attempts):
         try:
@@ -1080,7 +1090,27 @@ def _scrape_generic(shop_name: str, search_url: str,
             if attempt > 0:
                 time.sleep(3 + random.uniform(0, 2))
 
-            resp = _fetch(search_url, headers=headers)
+            session = _new_session()
+            if headers:
+                session.headers.update(headers)
+            # Refererを自動設定
+            if not (headers and "Referer" in headers):
+                session.headers["Referer"] = base_url + "/"
+
+            # bot対策が厳しいショップ: ホームページを先に訪問してcookie取得
+            if use_session_first:
+                try:
+                    home_resp = session.get(base_url + "/", timeout=15)
+                    logger.debug("Session-first for %s: home status=%d, cookies=%d",
+                                 shop_name, home_resp.status_code, len(session.cookies))
+                    # セッションcookieが取れたらRefererを更新
+                    session.headers["Referer"] = base_url + "/"
+                    session.headers["Sec-Fetch-Site"] = "same-origin"
+                    time.sleep(1 + random.uniform(0, 1))
+                except Exception as e:
+                    logger.debug("Session-first homepage failed for %s: %s", shop_name, e)
+
+            resp = session.get(search_url, timeout=_TIMEOUT)
             if resp.status_code == 403:
                 if attempt < max_attempts - 1:
                     continue  # リトライ
@@ -1543,15 +1573,27 @@ def search_qoo10(query: str, _config: Config) -> ShopPrice:
 # エディオンネットショップ (HTML + JSON-LD + 埋め込みJSON)
 # ============================================================
 def search_edion(query: str, _config: Config) -> ShopPrice:
-    search_url = f"https://www.edion.com/detail_search.html?q={quote(query)}"
+    # エディオン: detail_search.html と /search/ の両方を試す
+    search_urls = [
+        f"https://www.edion.com/search/?keyword={quote(query)}",
+        f"https://www.edion.com/detail_search.html?q={quote(query)}",
+    ]
     selectors = [
+        (".goods-list-item, .goodsListItem", ".goods-price, .goodsPrice, .price",
+         ".goods-name a, .goodsName a, .product-name a"),
         (".product-item, .item-list__item", ".price, .item-price", ".product-name a, .item-name a"),
         ('[class*="product"]', '[class*="price"]', '[class*="name"] a, [class*="title"] a'),
         ('[class*="item"]', '[class*="price"]', '[class*="name"] a, [class*="title"] a'),
+        ('[class*="goods"]', '[class*="price"]', '[class*="goods"] a, [class*="name"] a'),
         (".searchResultItem", ".resultPrice", ".resultName a"),
     ]
-    return _scrape_generic("エディオンネットショップ", search_url, selectors,
-                           "https://www.edion.com", query=query)
+    for url in search_urls:
+        result = _scrape_generic("エディオンネットショップ", url, selectors,
+                                 "https://www.edion.com", query=query)
+        if result.price is not None:
+            return result
+    # 全URL失敗時は最後のURLで結果を返す
+    return ShopPrice("エディオンネットショップ", None, "", "", search_urls[0])
 
 
 # ============================================================
@@ -1784,14 +1826,59 @@ def get_manual_search_shops() -> list[str]:
     return [name for name in KNOWN_SHOPS if name not in SCRAPER_SHOP_NAMES]
 
 
+# ショップ別の追加CSSセレクタ（Phase 2で使用）
+_SHOP_SPECIFIC_SELECTORS: dict[str, list[tuple[str, str, str]]] = {
+    "ビックカメラ.com": [
+        (".bcs_listItem", ".bcs_price", ".bcs_title a"),
+        (".prod_box", ".val", ".prod_name a"),
+        (".bcs_item", ".bcs_price .val", ".bcs_title a"),
+    ],
+    "コジマネット": [
+        (".product-list-item", ".price, .itemPrice", ".product-name a, .itemName a"),
+        (".itemBox", ".itemPrice", ".itemName a"),
+        (".goods_list li", ".price", ".goods_name a"),
+    ],
+    "ヤマダウェブコム": [
+        (".searchResult__item", ".searchResult__price, .pPrice", ".searchResult__name a, .pName a"),
+        (".product", ".price, .product-price", ".product-name a"),
+        (".item", ".pPrice", ".pName a"),
+    ],
+    "エディオンネットショップ": [
+        (".goods-list-item, .goodsListItem", ".goods-price, .goodsPrice, .price",
+         ".goods-name a, .goodsName a"),
+        ('[class*="goods"]', '[class*="price"]', '[class*="goods"] a, [class*="name"] a'),
+    ],
+    "ノジマオンライン": [
+        (".catalogListItem", ".catalogPrice, .price", ".catalogName a, .product-name a"),
+        (".catalog-item", ".price", ".product-name a"),
+        ('[class*="catalog"]', '[class*="price"]', '[class*="name"] a'),
+    ],
+    "au PAY マーケット": [
+        (".itemList__item", ".itemList__price, .price", ".itemList__name a"),
+        ('[class*="ItemCard"]', '[class*="price"]', '[class*="name"] a, [class*="title"] a'),
+    ],
+    "dショッピング": [
+        (".c-productListItem", ".c-productListItem__price", ".c-productListItem__name a"),
+        ('[class*="ProductCard"]', '[class*="price"]', '[class*="name"] a'),
+    ],
+}
+
+# Phase 2で待機するCSSセレクタ（SPA描画完了の判定）
+_SHOP_WAIT_SELECTORS: dict[str, str] = {
+    "ビックカメラ.com": ".bcs_listItem, .prod_box, [class*='product']",
+    "コジマネット": ".product-list-item, .itemBox, [class*='product']",
+    "ヤマダウェブコム": ".searchResult__item, .product, [class*='product']",
+    "エディオンネットショップ": ".goods-list-item, [class*='goods'], [class*='product']",
+    "ノジマオンライン": ".catalogListItem, .catalog-item, [class*='catalog'], [class*='product']",
+    "au PAY マーケット": ".itemList__item, [class*='ItemCard'], [class*='product']",
+    "dショッピング": ".c-productListItem, [class*='ProductCard'], [class*='product']",
+}
+
+
 def _get_selectors_for_shop(shop_name: str) -> list[tuple[str, str, str]]:
     """ショップ名から対応するCSSセレクタを取得"""
-    for scraper_fn, name in SCRAPERS:
-        if name == shop_name:
-            # 各スクレイパーのselectorsを取得するため、ダミー呼び出しはせず
-            # 汎用セレクタ＋拡張セレクタを返す
-            break
-    return _GENERIC_SELECTORS + [
+    shop_sels = _SHOP_SPECIFIC_SELECTORS.get(shop_name, [])
+    return shop_sels + _GENERIC_SELECTORS + [
         ('[class*="product"]', '[class*="price"]', '[class*="name"] a, [class*="title"] a'),
         ('[class*="item"]', '[class*="price"]', '[class*="name"] a, [class*="title"] a'),
         ("li", '[class*="price"]', 'a'),
@@ -1972,6 +2059,15 @@ def _retry_with_browser(results: list[ShopPrice], query: str) -> None:
                     except Exception:
                         pass  # タイムアウトしても続行
 
+                    # ショップ固有のSPA描画完了待機
+                    wait_sel = _SHOP_WAIT_SELECTORS.get(r.shop_name)
+                    if wait_sel:
+                        try:
+                            page.wait_for_selector(wait_sel, timeout=8000)
+                            logger.debug("Phase 2: found elements for %s", r.shop_name)
+                        except Exception:
+                            logger.debug("Phase 2: wait_for_selector timeout for %s", r.shop_name)
+
                     # 人間らしい操作を模倣（bot検出回避）
                     try:
                         page.mouse.move(random.randint(100, 800), random.randint(200, 600))
@@ -1986,7 +2082,13 @@ def _retry_with_browser(results: list[ShopPrice], query: str) -> None:
 
                     # HTMLが極端に小さい場合はさらに待機（SPA遅延読み込み対策）
                     if len(html) < 5000:
-                        page.wait_for_timeout(5000)
+                        page.wait_for_timeout(8000)
+                        # さらにスクロールして遅延コンテンツをトリガー
+                        try:
+                            page.evaluate("window.scrollBy(0, 500)")
+                            page.wait_for_timeout(2000)
+                        except Exception:
+                            pass
                         html = page.content()
 
                     soup = BeautifulSoup(html, "lxml")
