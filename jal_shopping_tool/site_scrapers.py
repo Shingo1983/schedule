@@ -12,6 +12,7 @@ Phase 2: Playwright ブラウザレンダリング（Phase 1で失敗したシ�
   JavaScript描画のSPAサイトでも価格を取得可能
 """
 
+import itertools
 import json
 import re
 import logging
@@ -263,6 +264,10 @@ def _is_relevant_product(query: str, product_name: str) -> bool:
         r'対応\s*(?:ケース|カバー|フィルム|充電器)',
         # 素材+ケース（ケース製品を示す）
         r'(?:シリコン|TPU|レザー|ハード|ソフト|クリア|透明)\s*ケース',
+        # スタンドアロンのアクセサリワード（「付き」で終わらないもの）
+        # 「ケース」「カバー」単独 → アクセサリ（ただし「充電ケース付き」等は除外しない）
+        r'(?<!充電)ケース(?!付)',
+        r'カバー(?!付)',
         # 常にアクセサリ（単体で十分明確）
         r'イヤーピース', r'イヤーチップ', r'イヤーパッド',
         r'保護フィルム', r'ガラスフィルム', r'液晶保護',
@@ -271,10 +276,18 @@ def _is_relevant_product(query: str, product_name: str) -> bool:
         r'クリーナー', r'クリーニング',
         r'ステッカー', r'スキンシール', r'デコシール',
         r'交換用',
+        r'互換', r'(?:類似|模倣|コピー)\s*品',
+        r'(?:収納|持ち運び)\s*(?:ケース|ポーチ|バッグ)',
+        r'ダストガード', r'ダスト\s*カバー',
+        r'(?:充電|変換)\s*(?:ケーブル|アダプタ)',
+        r'落下防止',
+        r'ネックストラップ',
+        r'キーホルダー', r'キーチェーン',
         # English
         r'\bprotective\s+case\b', r'\bsilicone\s+case\b', r'\btpu\s+case\b',
         r'\bscreen\s+protector\b', r'\bprotector\b',
         r'\bear\s*tips?\b', r'\bsleeve\b',
+        r'\bcase\b', r'\bcover\b',
     ]
     for pattern in _ACCESSORY_PATTERNS:
         if re.search(pattern, name_lower, re.IGNORECASE):
@@ -557,7 +570,8 @@ def _find_price_in_soup(soup: BeautifulSoup, selectors: list[tuple[str, str, str
                     url = f"{base_url}{href}"
         return url
 
-    # 1. CSSセレクタで探す
+    # 1. CSSセレクタで探す（複数候補を収集し外れ値除去）
+    css_candidates = []
     for item_sel, price_sel, name_sel in selectors:
         items = soup.select(item_sel)
         if not items:
@@ -574,12 +588,22 @@ def _find_price_in_soup(soup: BeautifulSoup, selectors: list[tuple[str, str, str
             name = name_el.get_text(strip=True) if name_el else ""
 
             # 関連性チェック（queryが指定されている場合）
-            # 商品名が空 or 無関係 → スキップ
             if query and not _is_relevant_product(query, name):
-                continue  # 次の商品を試す
+                continue
 
             url = _extract_url(name_el, item)
-            return price, name, url
+            css_candidates.append((price, name, url))
+
+        if css_candidates:
+            break  # 最初にマッチしたセレクタパターンの結果を使う
+
+    if css_candidates:
+        # 複数候補がある場合、外れ値除去
+        css_candidates.sort(key=lambda x: x[0])
+        if len(css_candidates) >= 2:
+            if css_candidates[0][0] < css_candidates[1][0] * 0.6:
+                css_candidates = css_candidates[1:]
+        return css_candidates[0]
 
     # 2. JSON-LD構造化データから探す
     jsonld_items = _extract_jsonld_prices(soup)
@@ -623,12 +647,26 @@ def _find_price_in_soup(soup: BeautifulSoup, selectors: list[tuple[str, str, str
                 return price, name, url
 
     # 5. テキストベース汎用抽出（CSSセレクタに依存しない最終手段）
-    # 全ての<a>タグからクエリに関連する商品リンクを見つけ、
-    # その近くにある価格テキストを抽出する
     if query:
         result = _extract_price_by_text(soup, query, base_url)
         if result:
             return result
+
+    # デバッグ: なぜ見つからなかったか記録
+    if query and len(str(soup)) > 50000:
+        # 大きなHTMLなのに価格が見つからない場合、関連リンク数を記録
+        relevant_links = 0
+        for link in soup.find_all("a", href=True):
+            name = link.get_text(strip=True)
+            if name and len(name) >= 5 and _is_relevant_product(query, name):
+                relevant_links += 1
+                if relevant_links <= 3:
+                    logger.debug("Relevant link found but no price: %s", name[:80])
+        if relevant_links == 0:
+            logger.debug("No relevant <a> tags found in %d chars HTML for query '%s'",
+                         len(str(soup)), query)
+        else:
+            logger.debug("%d relevant links found but no nearby prices", relevant_links)
 
     return None, "", ""
 
@@ -637,75 +675,162 @@ def _extract_price_by_text(soup: BeautifulSoup, query: str,
                            base_url: str) -> tuple[int, str, str] | None:
     """テキストベースの汎用価格抽出（CSSセレクタ不要）
 
-    戦略: <a>タグのテキストからクエリに関連する商品を見つけ、
-    その親要素内の価格パターンを探す。
-    あらゆるECサイトのHTML構造に対応できる汎用的なアプローチ。
+    戦略:
+    1. <a>タグ（リンク）からクエリに関連する商品を検索
+    2. 見つからない場合、任意の要素からテキストベースで検索
+    3. 親要素内の価格パターンを探す
+    4. 統計的外れ値除去で最安値を決定
     """
-    candidates = []
-
-    # 全<a>タグの中からクエリにマッチする商品リンクを探す
-    for link in soup.find_all("a", href=True):
-        name = link.get_text(strip=True)
-        if not name or len(name) < 5:
-            continue
-        if not _is_relevant_product(query, name):
-            continue
-
-        # この商品リンクの周辺（親要素）から価格を探す
-        price = None
-        for parent_level in range(1, 8):  # 親を1〜7レベル上まで探索
-            parent = link
-            for _ in range(parent_level):
-                if parent.parent is None:
-                    break
-                parent = parent.parent
-
-            if parent is None:
-                break
-
-            # 親要素内のテキストから価格パターンを探す
-            parent_text = parent.get_text(separator=" ", strip=True)
-            # 価格パターン: ¥XX,XXX または XX,XXX円 または 税込XX,XXX
-            price_patterns = [
-                r'[¥￥]\s*([\d,]+)',
-                r'([\d]{1,3}(?:,\d{3})+)\s*円',
-                r'(?:税込|価格|特価)\s*[^\d]*([\d]{1,3}(?:,\d{3})+)',
-            ]
-            found_prices = []
-            for pattern in price_patterns:
-                for m in re.finditer(pattern, parent_text):
-                    digits = re.sub(r'[^\d]', '', m.group(1))
-                    if digits:
-                        val = int(digits)
-                        if 100 <= val <= 99_999_999:
-                            found_prices.append(val)
-
-            if found_prices:
-                # 商品の価格として最も妥当なもの（最小値）を採用
-                price = min(found_prices)
-                break
-
-        if price:
-            href = link.get("href", "")
-            if href.startswith("http"):
-                url = href
-            elif href.startswith("/") and base_url:
-                url = f"{base_url}{href}"
-            else:
-                url = ""
-            candidates.append((price, name, url))
+    candidates = _find_product_candidates(soup, query, base_url)
 
     if not candidates:
         return None
 
-    # 外れ値除去 + 最安値選択
+    # === 統計的外れ値除去 + 最安値選択 ===
     candidates.sort(key=lambda x: x[0])
+
     if len(candidates) >= 3:
+        # 中央値の50%未満は外れ値（アクセサリ・送料・偽物等）
         median_price = candidates[len(candidates) // 2][0]
-        candidates = [c for c in candidates if c[0] >= median_price * 0.3]
+        candidates = [c for c in candidates if c[0] >= median_price * 0.5]
+
+    if len(candidates) >= 2:
+        # 最安値が2番目の60%未満なら外れ値として除外
+        if candidates[0][0] < candidates[1][0] * 0.6:
+            candidates = candidates[1:]
+
     if candidates:
         return candidates[0]
     return None
+
+
+# 価格テキストパターン（共通定義）
+_PRICE_TEXT_PATTERNS = [
+    r'[¥￥]\s*([\d,]+)',
+    r'([\d]{1,3}(?:,\d{3})+)\s*円',
+    r'(?:税込|価格|特価|販売価格)\s*[^\d]*([\d]{1,3}(?:,\d{3})+)',
+]
+
+
+def _extract_prices_from_text(text: str) -> list[int]:
+    """テキストから価格パターンを全て抽出"""
+    found = []
+    for pattern in _PRICE_TEXT_PATTERNS:
+        for m in re.finditer(pattern, text):
+            digits = re.sub(r'[^\d]', '', m.group(1))
+            if digits:
+                val = int(digits)
+                if 100 <= val <= 99_999_999:
+                    found.append(val)
+    return found
+
+
+def _find_price_near_element(el, max_levels: int = 6) -> int | None:
+    """要素の親を遡って最初に見つかった価格を返す"""
+    for level in range(1, max_levels + 1):
+        parent = el
+        for _ in range(level):
+            if parent.parent is None:
+                return None
+            parent = parent.parent
+
+        parent_text = parent.get_text(separator=" ", strip=True)
+        # テキストが長すぎる場合は終了（上位レベルはさらに大きいため）
+        if len(parent_text) > 3000:
+            break
+        prices = _extract_prices_from_text(parent_text)
+        if prices:
+            return min(prices)
+    return None
+
+
+def _find_product_candidates(soup: BeautifulSoup, query: str,
+                             base_url: str) -> list[tuple[int, str, str]]:
+    """商品候補をテキストベースで収集"""
+    candidates = []
+    seen_names = set()
+
+    # 戦略1: <a>タグのテキストから商品を探す（最も信頼性が高い）
+    for link in soup.find_all("a", href=True):
+        name = link.get_text(strip=True)
+        if not name or len(name) < 5 or name in seen_names:
+            continue
+        if not _is_relevant_product(query, name):
+            continue
+        seen_names.add(name)
+
+        price = _find_price_near_element(link)
+        if not price:
+            continue
+
+        href = link.get("href", "")
+        if href.startswith("http"):
+            url = href
+        elif href.startswith("/") and base_url:
+            url = f"{base_url}{href}"
+        else:
+            url = ""
+        candidates.append((price, name, url))
+
+        if len(candidates) >= 20:
+            break
+
+    if candidates:
+        return candidates
+
+    # 戦略2: リンクがなくても価格付きの商品テキストを探す
+    # 一部サイトは<div>や<span>に商品名を入れ、<a>には入れない
+    query_lower = query.lower()
+    keywords = [w for w in re.split(r'[\s　/／\-]+', query_lower)
+                if len(w) >= 2]
+    if not keywords:
+        return []
+
+    # 価格要素を探してその近くに商品名があるか確認
+    # テキスト内に価格パターンがある要素をregexで先にフィルタ
+    price_elements = []
+    for tag in itertools.islice(
+        soup.find_all(string=re.compile(r'[¥￥][\d,]+|[\d,]+円')), 100
+    ):
+        if tag.parent:
+            price_elements.append(tag.parent)
+    for price_el in price_elements[:50]:
+        price_text = price_el.get_text(strip=True)
+        prices = _extract_prices_from_text(price_text)
+        if not prices:
+            continue
+        price = min(prices)
+
+        # 親要素からテキストを取得し、商品名にクエリキーワードが含まれるか確認
+        for level in range(1, 6):
+            parent = price_el
+            for _ in range(level):
+                if parent.parent is None:
+                    break
+                parent = parent.parent
+            parent_text = parent.get_text(separator=" ", strip=True)
+            if len(parent_text) > 2000:
+                continue
+            parent_lower = parent_text.lower()
+            match_count = sum(1 for kw in keywords if kw in parent_lower)
+            required = max(1, (len(keywords) + 1) // 2)
+            if match_count >= required:
+                # 商品名としてリンクテキストか親テキストの先頭を使う
+                link = parent.find("a")
+                name = link.get_text(strip=True) if link else parent_text[:100]
+                if _is_relevant_product(query, name):
+                    url = ""
+                    if link and link.get("href", "").startswith("http"):
+                        url = link["href"]
+                    elif link and link.get("href", "").startswith("/") and base_url:
+                        url = f"{base_url}{link['href']}"
+                    candidates.append((price, name, url))
+                break
+
+        if len(candidates) >= 20:
+            break
+
+    return candidates
 
 
 def _make_error_result(shop_name: str, search_url: str, error: str) -> ShopPrice:
@@ -1092,7 +1217,7 @@ def search_biccamera(query: str, _config: Config) -> ShopPrice:
 # コジマネット (スクレイピング)
 # ============================================================
 def search_kojima(query: str, _config: Config) -> ShopPrice:
-    search_url = f"https://www.kojima.net/ec/prod_list.html?keyword={quote(query)}&sort=price&order=asc"
+    search_url = f"https://www.kojima.net/ec/prod_list.html?keyword={quote(query)}"
     selectors = [
         (".product-list-item", ".price, .itemPrice, .product-price", ".product-name a, .itemName a"),
         (".itemBox", ".itemPrice", ".itemName a"),
@@ -1172,7 +1297,7 @@ def search_seven(query: str, _config: Config) -> ShopPrice:
 # Qoo10 (HTML + JSON-LD + 埋め込みJSON)
 # ============================================================
 def search_qoo10(query: str, _config: Config) -> ShopPrice:
-    search_url = f"https://www.qoo10.jp/s/{quote(query)}?sort=prc"
+    search_url = f"https://www.qoo10.jp/s/{quote(query)}"
     selectors = [
         (".sc-prd", ".prc .prc-dc, .prc", ".tit a, .sbj a"),
         (".item_g", ".price, .prc", ".sbj a"),
@@ -1191,7 +1316,7 @@ def search_qoo10(query: str, _config: Config) -> ShopPrice:
 # エディオンネットショップ (HTML + JSON-LD + 埋め込みJSON)
 # ============================================================
 def search_edion(query: str, _config: Config) -> ShopPrice:
-    search_url = f"https://www.edion.com/detail_search.html?q={quote(query)}&sort=price_asc"
+    search_url = f"https://www.edion.com/detail_search.html?q={quote(query)}"
     selectors = [
         (".product-item, .item-list__item", ".price, .item-price", ".product-name a, .item-name a"),
         ('[class*="product"]', '[class*="price"]', '[class*="name"] a, [class*="title"] a'),
