@@ -280,7 +280,18 @@ class JalShop:
         """ショップの検索URLを生成"""
         if self.search_url_template:
             from urllib.parse import quote
-            return self.search_url_template.replace("{query}", quote(query))
+            import re as _re
+            # 全角スペース→半角、全角英数→半角
+            q = query.replace('\u3000', ' ')
+            normalized = []
+            for ch in q:
+                cp = ord(ch)
+                if 0xFF01 <= cp <= 0xFF5E:
+                    normalized.append(chr(cp - 0xFEE0))
+                else:
+                    normalized.append(ch)
+            q = _re.sub(r'\s+', ' ', ''.join(normalized)).strip()
+            return self.search_url_template.replace("{query}", quote(q))
         return ""
 
     def calc_miles(self, price: int) -> int:

@@ -30,6 +30,25 @@ from bs4 import BeautifulSoup
 
 from .config import Config
 
+
+def _normalize_query(query: str) -> str:
+    """検索クエリの正規化（全角→半角スペース、連続スペース除去等）"""
+    # 全角スペース → 半角スペース
+    q = query.replace('\u3000', ' ')
+    # 全角英数 → 半角英数
+    normalized = []
+    for ch in q:
+        cp = ord(ch)
+        # 全角英数字 (Ａ-Ｚ, ａ-ｚ, ０-９)
+        if 0xFF01 <= cp <= 0xFF5E:
+            normalized.append(chr(cp - 0xFEE0))
+        else:
+            normalized.append(ch)
+    q = ''.join(normalized)
+    # 連続スペースを1つにまとめ
+    q = re.sub(r'\s+', ' ', q).strip()
+    return q
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -171,8 +190,14 @@ def _detect_product_genres(query: str) -> set[str]:
             "ssd", "hdd", "メモリ", "usb", "充電器", "モニター", "ディスプレイ",
             "プリンター", "ルーター", "wifi", "ドライヤー", "掃除機",
             "冷蔵庫", "洗濯機", "エアコン", "電子レンジ", "炊飯器",
+            "換気扇", "食洗機", "食器洗い", "浴室乾燥", "給湯器", "温水器",
+            "ダクト", "レンジフード", "ih", "ガスコンロ",
             "galaxy", "pixel", "xperia", "aquos", "dyson", "sony", "bose",
             "bluetooth", "ワイヤレス",
+            # 家電メーカー名
+            "三菱", "パナソニック", "panasonic", "東芝", "toshiba", "日立", "hitachi",
+            "シャープ", "sharp", "ダイキン", "daikin", "三菱電機", "富士通",
+            "toto", "lixil", "リクシル", "inax", "ノーリツ", "noritz", "リンナイ", "rinnai",
         ]),
         ("clothing", [
             "シャツ", "tシャツ", "パンツ", "ジーンズ", "デニム", "ジャケット",
@@ -215,6 +240,10 @@ def _detect_product_genres(query: str) -> set[str]:
     for genre, keywords in _GENRE_KEYWORDS:
         if any(kw in q for kw in keywords):
             genres.add(genre)
+
+    # 型番パターン検出（英数字+ハイフンの型番 → 家電量販店向け商品）
+    if not genres and re.search(r'[A-Za-z]{1,5}[\-]?\d{2,}[A-Za-z]*\d*', query):
+        genres.add("electronics")
 
     return genres if genres else {"all"}
 
@@ -762,18 +791,15 @@ def _find_price_in_soup(soup: BeautifulSoup, selectors: list[tuple[str, str, str
             break  # 最初にマッチしたセレクタパターンの結果を使う
 
     if css_candidates:
-        # DOM順（=検索関連性順）を維持し、外れ値のみ除去
-        # 検索結果は通常サイト側で関連性順にソート済み
-        # → 最初の候補が最も適切な商品である可能性が高い
+        # 外れ値除去後、最安値を返す
         if len(css_candidates) >= 3:
             prices = sorted(c[0] for c in css_candidates)
             median_price = prices[len(prices) // 2]
             # 中央値の30%-250%の範囲外を外れ値として除去
             css_candidates = [c for c in css_candidates
                               if median_price * 0.3 <= c[0] <= median_price * 2.5]
-        # DOM順の最初の候補を返す（関連性順で最も適切な商品）
         if css_candidates:
-            return css_candidates[0]
+            return min(css_candidates, key=lambda c: c[0])
 
     # 2. JSON-LD構造化データから探す
     jsonld_items = _extract_jsonld_prices(soup)
@@ -1671,7 +1697,8 @@ def search_amazon(query: str, _config: Config) -> ShopPrice:
         logger.info("Amazon: found %d search results, HTML %d chars",
                      len(results_found), len(resp.text))
 
-        # 名前取得できない場合のフォールバック用
+        # 全候補を収集して最安値を返す
+        all_candidates = []
         first_valid_price_result = None
 
         for result in results_found:
@@ -1723,17 +1750,6 @@ def search_amazon(query: str, _config: Config) -> ShopPrice:
 
             # 関連性チェック
             if name and not _is_relevant_product(query, name):
-                logger.info("Amazon: skipping irrelevant '%s'", name[:50])
-                continue
-
-            # 名前が空でも価格が有効なら候補として保存
-            if not name and first_valid_price_result is None:
-                link_el = result.select_one("h2 a, a.a-link-normal")
-                url = ""
-                if link_el and link_el.get("href"):
-                    href = link_el["href"]
-                    url = f"https://www.amazon.co.jp{href}" if href.startswith("/") else href
-                first_valid_price_result = ShopPrice("Amazon.co.jp", price, "(商品名取得不可)", url, search_url)
                 continue
 
             link_el = result.select_one("h2 a")
@@ -1742,7 +1758,21 @@ def search_amazon(query: str, _config: Config) -> ShopPrice:
                 href = link_el["href"]
                 url = f"https://www.amazon.co.jp{href}" if href.startswith("/") else href
 
-            return ShopPrice("Amazon.co.jp", price, name, url, search_url)
+            if name:
+                all_candidates.append((price, name, url))
+            elif first_valid_price_result is None:
+                first_valid_price_result = ShopPrice("Amazon.co.jp", price, "(商品名取得不可)", url, search_url)
+
+        # 最安値を返す（候補がある場合）
+        if all_candidates:
+            # 外れ値除去（中央値の30%未満を除外 — アクセサリ等）
+            prices = sorted(c[0] for c in all_candidates)
+            if len(prices) >= 3:
+                median = prices[len(prices) // 2]
+                all_candidates = [c for c in all_candidates if c[0] >= median * 0.3]
+            if all_candidates:
+                best = min(all_candidates, key=lambda c: c[0])
+                return ShopPrice("Amazon.co.jp", best[0], best[1], best[2], search_url)
 
         # 名前付き商品が見つからなかった場合、名前なしでも価格があれば返す
         if first_valid_price_result:
@@ -2046,10 +2076,12 @@ search_ksdenki = _make_generic_scraper(
 
 def search_nojima(query: str, _config: Config) -> ShopPrice:
     """ノジマオンライン: 複数URLパターン試行"""
+    q = quote(_normalize_query(query))
     search_urls = [
-        f"https://online.nojima.co.jp/commodity/list/?searchWord={quote(query)}",
-        f"https://online.nojima.co.jp/app/catalog/list/init?searchWord={quote(query)}",
-        f"https://online.nojima.co.jp/search/?q={quote(query)}",
+        f"https://online.nojima.co.jp/search?keyword={q}",
+        f"https://online.nojima.co.jp/commodity/list/?searchWord={q}",
+        f"https://online.nojima.co.jp/app/catalog/list/init?searchWord={q}",
+        f"https://online.nojima.co.jp/search/?q={q}",
     ]
     selectors = [
         # ノジマ固有
@@ -2540,6 +2572,9 @@ def search_all_shops(query: str, config: Config) -> list[ShopPrice]:
     - リクエスト間に分散遅延を追加（0〜3秒のランダム遅延）
     - bot検出ページの判定とリトライ
     """
+    # クエリ正規化（全角→半角スペース・英数字）
+    query = _normalize_query(query)
+
     results: list[ShopPrice] = []
 
     # === Phase 0: 商品ジャンル推定 → 不要ショップのスキップ ===
