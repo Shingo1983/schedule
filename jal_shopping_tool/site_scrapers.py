@@ -804,6 +804,16 @@ def _find_price_in_soup(soup: BeautifulSoup, selectors: list[tuple[str, str, str
         if result:
             return result
 
+    # デバッグ: 全ステップ失敗時の情報
+    html_len = len(str(soup))
+    text = soup.get_text()
+    text_len = len(text)
+    # 価格パターンの存在チェック
+    price_count = len(re.findall(r'[¥￥]\s*[\d,]+|[\d,]+\s*円|\d{4,8}\s*円', text))
+    if html_len > 10000:
+        logger.info("Price extraction failed: HTML %d chars, text %d chars, %d price patterns found",
+                     html_len, text_len, price_count)
+
     return None, "", ""
 
 
@@ -839,6 +849,8 @@ def _extract_price_by_fulltext(soup: BeautifulSoup, query: str,
 
     for m in price_pattern.finditer(full_text):
         raw = m.group(1) or m.group(2) or m.group(3)
+        if not raw:
+            continue
         digits = re.sub(r'[^\d]', '', raw)
         if not digits:
             continue
@@ -846,13 +858,19 @@ def _extract_price_by_fulltext(soup: BeautifulSoup, query: str,
         if not (1000 <= price <= 99_999_999):  # フルテキストでは最低¥1,000以上
             continue
 
-        # 価格の前後500文字以内にクエリキーワードがあるか確認
-        start = max(0, m.start() - 500)
-        end = min(len(full_text_lower), m.end() + 500)
+        # 価格の前後の文字数はページサイズに応じて調整
+        # 大きいページはテキストが散在するため広い窓が必要
+        window = 500 if len(full_text) < 50000 else 1000
+        start = max(0, m.start() - window)
+        end = min(len(full_text_lower), m.end() + window)
         context = full_text_lower[start:end]
 
         match_count = sum(1 for kw in keywords if kw in context)
-        required = max(1, len(keywords) - 1)  # ほぼ全キーワード
+        # キーワードの過半数一致を要求（大きいページでは緩和）
+        if len(full_text) > 100000:
+            required = max(1, (len(keywords) + 1) // 2)  # 過半数
+        else:
+            required = max(1, len(keywords) - 1)  # ほぼ全キーワード
         if match_count >= required:
             # アクセサリチェック: 価格の前の行（商品名が通常ある）で判定
             # 300文字の広いコンテキストではなく、直前の狭い範囲で判定
@@ -875,6 +893,10 @@ def _extract_price_by_fulltext(soup: BeautifulSoup, query: str,
                 candidates.append(price)
 
     if not candidates:
+        # デバッグ: なぜ候補がないか
+        total_matches = sum(1 for _ in price_pattern.finditer(full_text))
+        logger.debug("Fulltext: %d price matches found in %d chars text, %d keywords=%s, but 0 candidates",
+                     total_matches, len(full_text), len(keywords), keywords[:5])
         return None
 
     # 外れ値除去
@@ -894,7 +916,9 @@ def _extract_price_by_fulltext(soup: BeautifulSoup, query: str,
     # 商品名を推定（価格の近くにあるクエリマッチ行）
     name = query  # フォールバック
     for m in price_pattern.finditer(full_text):
-        raw = m.group(1) or m.group(2)
+        raw = m.group(1) or m.group(2) or m.group(3)
+        if not raw:
+            continue
         p = int(re.sub(r'[^\d]', '', raw) or '0')
         if p == price:
             # この価格の前後から商品名行を探す
@@ -1552,10 +1576,10 @@ def search_joshin(query: str, _config: Config) -> ShopPrice:
 # au PAY マーケット (HTML + JSON-LD + 埋め込みJSON)
 # ============================================================
 def search_aupay(query: str, _config: Config) -> ShopPrice:
-    # au PAY マーケット: wowma.jpとwowma.jpの2ドメインを試行
+    # au PAY マーケット: wowma.jpの複数URLパターン
     search_urls = [
         f"https://wowma.jp/itemlist?e_scope=O&at=FP&non_gr=ex&keyword={quote(query)}&categ_id=0",
-        f"https://wowma.jp/search?keyword={quote(query)}",
+        f"https://wowma.jp/itemlist?keyword={quote(query)}",
     ]
     selectors = [
         (".itemList__item", ".itemList__price, .price", ".itemList__name a, .product-name a"),
@@ -1728,11 +1752,22 @@ search_fancl = _make_generic_scraper(
     "https://www.fancl.co.jp",
 )
 
-search_sony = _make_generic_scraper(
-    "ソニーストア",
-    "https://search.sony.jp/ja_all/search.x?q={query}",
-    "https://www.sony.jp",
-)
+def search_sony(query: str, _config: Config) -> ShopPrice:
+    """ソニーストア: 複数URL試行"""
+    search_urls = [
+        f"https://store.sony.jp/search/?q={quote(query)}",
+        f"https://www.sony.jp/search/results/?q={quote(query)}",
+    ]
+    for url in search_urls:
+        result = _scrape_generic("ソニーストア", url, _GENERIC_SELECTORS,
+                                 "https://store.sony.jp", query=query)
+        if result.price is not None:
+            return result
+        # HTTP 404以外のエラーはそのまま返す
+        if result.error and "HTTP 404" not in (result.error or ""):
+            return result
+    return ShopPrice("ソニーストア", None, "", "", search_urls[0],
+                     error=result.error if result else None)
 
 search_ksdenki = _make_generic_scraper(
     "ケーズデンキオンラインショップ",
@@ -1744,19 +1779,27 @@ search_ksdenki = _make_generic_scraper(
 def search_nojima(query: str, _config: Config) -> ShopPrice:
     """ノジマオンライン: 複数URLパターン試行"""
     search_urls = [
+        f"https://online.nojima.co.jp/commodity/list/?searchWord={quote(query)}",
         f"https://online.nojima.co.jp/app/catalog/list/init?searchWord={quote(query)}",
-        f"https://online.nojima.co.jp/search?keyword={quote(query)}",
+        f"https://online.nojima.co.jp/search/?q={quote(query)}",
     ]
     selectors = [
-        (".catalogListItem", ".catalogPrice, .price", ".catalogName a, .product-name a"),
-        (".catalog-item", ".price", ".product-name a"),
+        # ノジマ固有
+        (".catalogListItem, .list-item", ".catalogPrice, .price, .item-price",
+         ".catalogName a, .item-name a, .product-name a"),
+        (".commodity-item", ".commodity-price, .price", ".commodity-name a"),
         ('[class*="catalog"]', '[class*="price"]', '[class*="name"] a'),
+        ('[class*="commodity"]', '[class*="price"]', '[class*="name"] a'),
     ] + _GENERIC_SELECTORS
     for url in search_urls:
         result = _scrape_generic("ノジマオンライン", url, selectors,
                                  "https://online.nojima.co.jp", query=query)
         if result.price is not None:
             return result
+        # HTTP 404なら次のURLを試す、それ以外のエラーなら返す
+        if result.error and "HTTP 404" not in (result.error or ""):
+            if "接続エラー" not in (result.error or ""):
+                return result
     return ShopPrice("ノジマオンライン", None, "", "", search_urls[0],
                      error=result.error if result else None)
 
@@ -2161,7 +2204,9 @@ def _retry_with_browser(results: list[ShopPrice], query: str) -> None:
                                     r.shop_name, len(html))
 
                 except Exception as e:
-                    logger.warning("Browser retry error for %s: %s", r.shop_name, e)
+                    import traceback
+                    logger.warning("Browser retry error for %s: %s\n%s",
+                                   r.shop_name, e, traceback.format_exc())
                 finally:
                     if page:
                         try:
@@ -2271,13 +2316,23 @@ def _validate_prices_cross_shop(results: list[ShopPrice]) -> None:
     prices_only = sorted(p for p, _ in prices_with_idx)
     median = prices_only[len(prices_only) // 2]
 
-    # 中央値の25%未満の価格は明らかな外れ値
-    threshold = median * 0.25
+    # 中央値の25%未満の価格は明らかな外れ値（下限）
+    lower_threshold = median * 0.25
+    # 中央値の2.2倍超は明らかな外れ値（上限: セット品・別商品の可能性）
+    upper_threshold = median * 2.2
     for price, idx in prices_with_idx:
-        if price < threshold:
+        removed = False
+        if price < lower_threshold:
+            removed = True
+            reason = f"価格が低すぎ（中央値¥{median:,}の25%未満）"
+        elif price > upper_threshold and len(prices_only) >= 4:
+            # 上限チェックは4件以上ある場合のみ（少数だと誤判定リスク）
+            removed = True
+            reason = f"価格が高すぎ（中央値¥{median:,}の2.2倍超）"
+        if removed:
             r = results[idx]
-            logger.info("Cross-shop validation: %s ¥%s removed (median ¥%s, threshold ¥%s)",
-                        r.shop_name, f"{price:,}", f"{median:,}", f"{threshold:,.0f}")
+            logger.info("Cross-shop validation: %s ¥%s removed (%s)",
+                        r.shop_name, f"{price:,}", reason)
             results[idx] = ShopPrice(
                 r.shop_name, None, "", "", r.search_url,
                 error="価格異常（他店と大きく乖離）"
