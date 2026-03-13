@@ -856,6 +856,16 @@ def _find_price_in_soup(soup: BeautifulSoup, selectors: list[tuple[str, str, str
         logger.info("Price extraction failed: HTML %d chars, text %d chars, "
                      "prices in text=%d, in html=%d",
                      html_len, text_len, price_in_text, price_in_html)
+        # 見つかった価格パターンをサンプル表示（何が見つかっているか確認）
+        if price_in_text > 0 and price_in_text <= 5:
+            samples = re.findall(r'.{0,20}(?:[¥￥]\s*[\d,]+|[\d,]+\s*円|\d{4,8}\s*円).{0,20}', text)
+            logger.info("  Price samples in text: %s", [s.strip()[:60] for s in samples[:3]])
+        if price_in_html > 0 and price_in_html <= 5 and price_in_html != price_in_text:
+            html_samples = re.findall(
+                r'.{0,30}(?:"price"\s*[=:]\s*[\d",]+|data-price\s*=\s*"?\d+|&yen;\s*[\d,]+).{0,30}',
+                raw_html)
+            if html_samples:
+                logger.info("  Price samples in HTML: %s", [s.strip()[:80] for s in html_samples[:3]])
         # 大きいHTMLで価格が全くない場合はHTML冒頭をログ出力（デバッグ用）
         if price_in_html == 0 and html_len > 50000:
             # scriptタグ内のコンテンツサンプルを出力
@@ -961,6 +971,16 @@ def _extract_price_by_fulltext(soup: BeautifulSoup, query: str,
             continue
         price = int(digits)
         if not (1000 <= price <= 99_999_999):  # フルテキストでは最低¥1,000以上
+            continue
+
+        # 非商品価格の除外（送料閾値、ポイント、配送料など）
+        narrow_price_ctx = full_text_lower[max(0, m.start() - 60):min(len(full_text_lower), m.end() + 60)]
+        _NON_PRODUCT_PATTERNS = [
+            r'配送料', r'送料', r'以上で.*無料', r'以上で.*負担',
+            r'ポイント', r'point', r'還元', r'付与',
+            r'off\b', r'割引', r'クーポン', r'coupon',
+        ]
+        if any(re.search(p, narrow_price_ctx) for p in _NON_PRODUCT_PATTERNS):
             continue
 
         # 価格の前後の文字数はページサイズに応じて調整
@@ -1146,6 +1166,17 @@ def _extract_price_from_raw_html(html: str, query: str,
         start = max(0, m.start() - window)
         end = min(len(html_lower), m.end() + window)
         context = html_lower[start:end]
+
+        # 非商品価格の除外（送料閾値、ポイント、配送料など）
+        narrow_ctx = html_lower[max(0, m.start() - 100):min(len(html_lower), m.end() + 100)]
+        _NON_PRODUCT_PATTERNS = [
+            r'配送料', r'送料', r'以上で.*無料', r'以上で.*負担',
+            r'ポイント', r'point', r'還元', r'付与',
+            r'off\b', r'割引', r'クーポン', r'coupon',
+        ]
+        is_non_product = any(re.search(p, narrow_ctx) for p in _NON_PRODUCT_PATTERNS)
+        if is_non_product:
+            continue
 
         # カタカナ展開込みでキーワードマッチ
         match_count = 0
@@ -2207,6 +2238,7 @@ _SHOP_WAIT_SELECTORS: dict[str, str] = {
     "ノジマオンライン": ".catalogListItem, .catalog-item, [class*='catalog'], [class*='product']",
     "au PAY マーケット": ".itemList__item, [class*='ItemCard'], [class*='product']",
     "dショッピング": ".c-productListItem, [class*='ProductCard'], [class*='product']",
+    "Joshin webショップ": ".productList__item, .lineup_box, [class*='product']",
 }
 
 
