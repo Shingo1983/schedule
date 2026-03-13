@@ -810,12 +810,16 @@ def _extract_price_by_fulltext(soup: BeautifulSoup, query: str,
 
     full_text_lower = full_text.lower()
 
-    # 価格パターンを全テキストから検索
-    price_pattern = re.compile(r'[¥￥]\s*([\d,]+)|([\d]{1,3}(?:,\d{3})+)\s*円')
+    # 価格パターンを全テキストから検索（カンマあり/なし両対応）
+    price_pattern = re.compile(
+        r'[¥￥]\s*([\d,]+)'           # ¥39,800 or ¥39800
+        r'|([\d]{1,3}(?:,\d{3})+)\s*円'  # 39,800円
+        r'|(\d{4,8})\s*円'            # 39800円（カンマなし）
+    )
     candidates = []
 
     for m in price_pattern.finditer(full_text):
-        raw = m.group(1) or m.group(2)
+        raw = m.group(1) or m.group(2) or m.group(3)
         digits = re.sub(r'[^\d]', '', raw)
         if not digits:
             continue
@@ -823,9 +827,9 @@ def _extract_price_by_fulltext(soup: BeautifulSoup, query: str,
         if not (1000 <= price <= 99_999_999):  # フルテキストでは最低¥1,000以上
             continue
 
-        # 価格の前後300文字以内にクエリキーワードがあるか確認
-        start = max(0, m.start() - 300)
-        end = min(len(full_text_lower), m.end() + 300)
+        # 価格の前後500文字以内にクエリキーワードがあるか確認
+        start = max(0, m.start() - 500)
+        end = min(len(full_text_lower), m.end() + 500)
         context = full_text_lower[start:end]
 
         match_count = sum(1 for kw in keywords if kw in context)
@@ -921,11 +925,12 @@ def _extract_price_by_text(soup: BeautifulSoup, query: str,
     return None
 
 
-# 価格テキストパターン（共通定義）
+# 価格テキストパターン（共通定義 - カンマあり/なし両対応）
 _PRICE_TEXT_PATTERNS = [
     r'[¥￥]\s*([\d,]+)',
     r'([\d]{1,3}(?:,\d{3})+)\s*円',
-    r'(?:税込|価格|特価|販売価格)\s*[^\d]*([\d]{1,3}(?:,\d{3})+)',
+    r'(\d{4,8})\s*円',  # カンマなし: 39800円
+    r'(?:税込|価格|特価|販売価格)\s*[^\d]*([\d,]{4,})',
 ]
 
 
@@ -1084,7 +1089,12 @@ def _scrape_generic(shop_name: str, search_url: str,
                 if attempt < max_attempts - 1:
                     continue  # リトライ
                 return _make_error_result(shop_name, search_url, "サーバー混雑（手動で検索してください）")
-            if resp.status_code != 200:
+            if resp.status_code == 202:
+                # HTTP 202 = サーバー処理中（Akamai等）→ 少し待ってリトライ
+                if attempt < max_attempts - 1:
+                    time.sleep(2)
+                    continue
+            if resp.status_code not in (200, 202):
                 return _make_error_result(shop_name, search_url, f"HTTP {resp.status_code}")
 
             soup = _soup(resp)
@@ -1414,7 +1424,7 @@ def search_amazon(query: str, _config: Config) -> ShopPrice:
 # ビックカメラ.com (スクレイピング)
 # ============================================================
 def search_biccamera(query: str, _config: Config) -> ShopPrice:
-    search_url = f"https://www.biccamera.com/bc/category/?q={quote(query)}&rowPerPage=25&sort=PRICE_ASC"
+    search_url = f"https://www.biccamera.com/bc/category/?q={quote(query)}&rowPerPage=25"
     selectors = [
         (".bcs_listItem", ".bcs_price", ".bcs_title a"),
         (".prod_box", ".val", ".prod_name a"),
@@ -1840,6 +1850,10 @@ def _retry_with_browser(results: list[ShopPrice], query: str) -> None:
             "--disable-http2",
             "--no-sandbox",
             "--disable-blink-features=AutomationControlled",
+            "--disable-features=IsolateOrigins,site-per-process",
+            "--disable-site-isolation-trials",
+            "--disable-web-security",
+            "--window-size=1920,1080",
         ]
         # まず実際のChromeを試す（最もリアルなフィンガープリント）
         try:
@@ -1939,7 +1953,12 @@ def _retry_with_browser(results: list[ShopPrice], query: str) -> None:
                     try:
                         page.goto(base_url + "/", timeout=15000,
                                   wait_until="domcontentloaded")
-                        page.wait_for_timeout(1500)
+                        page.wait_for_timeout(2000)
+                        # ホームページでもbot検出があれば待機
+                        home_html = page.content()
+                        if len(home_html) < 3000:
+                            # Cloudflare等のチャレンジ完了を待つ
+                            page.wait_for_timeout(5000)
                     except Exception:
                         pass  # ホームページ失敗でも続行
 
@@ -1952,8 +1971,17 @@ def _retry_with_browser(results: list[ShopPrice], query: str) -> None:
                         page.wait_for_load_state("networkidle", timeout=10000)
                     except Exception:
                         pass  # タイムアウトしても続行
-                    # 追加の描画待ち
-                    page.wait_for_timeout(2000)
+
+                    # 人間らしい操作を模倣（bot検出回避）
+                    try:
+                        page.mouse.move(random.randint(100, 800), random.randint(200, 600))
+                        page.wait_for_timeout(500)
+                        page.evaluate("window.scrollBy(0, 300)")
+                        page.wait_for_timeout(1000)
+                    except Exception:
+                        pass
+
+                    page.wait_for_timeout(1500)
                     html = page.content()
 
                     # HTMLが極端に小さい場合はさらに待機（SPA遅延読み込み対策）
