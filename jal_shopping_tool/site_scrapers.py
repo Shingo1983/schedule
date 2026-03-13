@@ -425,6 +425,20 @@ def _is_relevant_product(query: str, product_name: str) -> bool:
 def _is_bot_blocked_page(soup: BeautifulSoup) -> bool:
     """bot検出/アクセス制限ページかどうかを判定"""
     text = soup.get_text()
+
+    # HTMLが極端に短い場合のチャレンジページ検出
+    html_str = str(soup)
+    if len(html_str) < 2500:
+        # Cloudflare/Akamai/PerimeterXのJSチャレンジ
+        challenge_markers = [
+            'cf-browser-verification', 'cf_chl_opt', 'cf-challenge',
+            '_Incapsula_', 'reese84', 'px-captcha',
+            'akamai', 'ak_bmsc', 'bm_sz',
+        ]
+        for marker in challenge_markers:
+            if marker in html_str:
+                return True
+
     block_patterns = [
         r'一時的なアクセス増加',
         r'一時的に.*アクセス.*制限',
@@ -441,6 +455,11 @@ def _is_bot_blocked_page(soup: BeautifulSoup) -> bool:
         r'Checking your browser',
         r'Just a moment',
         r'Enable JavaScript and cookies',
+        r'Pardon Our Interruption',
+        r'Are you a robot',
+        r'あなたがロボットでない',
+        r'不正なアクセス',
+        r'ブラウザの確認',
     ]
     for pattern in block_patterns:
         if re.search(pattern, text, re.IGNORECASE):
@@ -1490,7 +1509,11 @@ def search_kojima(query: str, _config: Config) -> ShopPrice:
 # ヤマダウェブコム (スクレイピング)
 # ============================================================
 def search_yamada(query: str, _config: Config) -> ShopPrice:
-    search_url = f"https://www.yamada-denkiweb.com/search/{quote(query)}/"
+    # ヤマダ: /search/query/ と ?keyword= の2パターンを試行
+    search_urls = [
+        f"https://www.yamada-denkiweb.com/search?keyword={quote(query)}",
+        f"https://www.yamada-denkiweb.com/search/{quote(query)}/",
+    ]
     selectors = [
         (".searchResult__item", ".searchResult__price, .pPrice", ".searchResult__name a, .pName a"),
         (".product", ".price, .product-price", ".product-name a"),
@@ -1498,10 +1521,15 @@ def search_yamada(query: str, _config: Config) -> ShopPrice:
         ('[class*="c-product"]', '[class*="price"]', '[class*="name"] a, [class*="title"] a'),
         ("li.product-item", ".price-box .price", ".product-item-link"),
     ]
-    return _scrape_generic("ヤマダウェブコム", search_url, selectors,
-                           "https://www.yamada-denkiweb.com",
-                           headers={"Referer": "https://www.yamada-denkiweb.com/"},
-                           query=query)
+    for url in search_urls:
+        result = _scrape_generic("ヤマダウェブコム", url, selectors,
+                                 "https://www.yamada-denkiweb.com",
+                                 headers={"Referer": "https://www.yamada-denkiweb.com/"},
+                                 query=query)
+        if result.price is not None:
+            return result
+    return ShopPrice("ヤマダウェブコム", None, "", "", search_urls[0],
+                     error=result.error if result else None)
 
 
 # ============================================================
@@ -1524,15 +1552,24 @@ def search_joshin(query: str, _config: Config) -> ShopPrice:
 # au PAY マーケット (HTML + JSON-LD + 埋め込みJSON)
 # ============================================================
 def search_aupay(query: str, _config: Config) -> ShopPrice:
-    search_url = f"https://wowma.jp/itemlist?e_scope=O&at=FP&non_gr=ex&keyword={quote(query)}&categ_id=0"
+    # au PAY マーケット: wowma.jpとwowma.jpの2ドメインを試行
+    search_urls = [
+        f"https://wowma.jp/itemlist?e_scope=O&at=FP&non_gr=ex&keyword={quote(query)}&categ_id=0",
+        f"https://wowma.jp/search?keyword={quote(query)}",
+    ]
     selectors = [
         (".itemList__item", ".itemList__price, .price", ".itemList__name a, .product-name a"),
         (".product-item", ".product-price, .price", ".product-name a"),
         ('[class*="ItemCard"]', '[class*="price"]', '[class*="name"] a, [class*="title"] a'),
         (".item", ".price", "a.item-name"),
-    ]
-    return _scrape_generic("au PAY マーケット", search_url, selectors,
-                           "https://wowma.jp", query=query)
+    ] + _GENERIC_SELECTORS
+    for url in search_urls:
+        result = _scrape_generic("au PAY マーケット", url, selectors,
+                                 "https://wowma.jp", query=query)
+        if result.price is not None:
+            return result
+    return ShopPrice("au PAY マーケット", None, "", "", search_urls[0],
+                     error=result.error if result else None)
 
 
 # ============================================================
@@ -1704,11 +1741,24 @@ search_ksdenki = _make_generic_scraper(
     headers={"Referer": "https://www.ksdenki.com/shop/", "Sec-Fetch-Site": "same-origin"},
 )
 
-search_nojima = _make_generic_scraper(
-    "ノジマオンライン",
-    "https://online.nojima.co.jp/app/catalog/list/init?searchWord={query}",
-    "https://online.nojima.co.jp",
-)
+def search_nojima(query: str, _config: Config) -> ShopPrice:
+    """ノジマオンライン: 複数URLパターン試行"""
+    search_urls = [
+        f"https://online.nojima.co.jp/app/catalog/list/init?searchWord={quote(query)}",
+        f"https://online.nojima.co.jp/search?keyword={quote(query)}",
+    ]
+    selectors = [
+        (".catalogListItem", ".catalogPrice, .price", ".catalogName a, .product-name a"),
+        (".catalog-item", ".price", ".product-name a"),
+        ('[class*="catalog"]', '[class*="price"]', '[class*="name"] a'),
+    ] + _GENERIC_SELECTORS
+    for url in search_urls:
+        result = _scrape_generic("ノジマオンライン", url, selectors,
+                                 "https://online.nojima.co.jp", query=query)
+        if result.price is not None:
+            return result
+    return ShopPrice("ノジマオンライン", None, "", "", search_urls[0],
+                     error=result.error if result else None)
 
 search_matsukiyo = _make_generic_scraper(
     "マツモトキヨシオンラインストア",
