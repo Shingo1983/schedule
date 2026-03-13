@@ -757,16 +757,16 @@ def _find_price_in_soup(soup: BeautifulSoup, selectors: list[tuple[str, str, str
             break  # 最初にマッチしたセレクタパターンの結果を使う
 
     if css_candidates:
-        # 複数候補がある場合、統計的に外れ値を除去
-        css_candidates.sort(key=lambda x: x[0])
+        # DOM順（=検索関連性順）を維持し、外れ値のみ除去
+        # 検索結果は通常サイト側で関連性順にソート済み
+        # → 最初の候補が最も適切な商品である可能性が高い
         if len(css_candidates) >= 3:
-            # 中央値ベースの外れ値除去（アクセサリ/バンドル対策）
-            median_price = css_candidates[len(css_candidates) // 2][0]
+            prices = sorted(c[0] for c in css_candidates)
+            median_price = prices[len(prices) // 2]
+            # 中央値の30%-250%の範囲外を外れ値として除去
             css_candidates = [c for c in css_candidates
                               if median_price * 0.3 <= c[0] <= median_price * 2.5]
-        if len(css_candidates) >= 2:
-            if css_candidates[0][0] < css_candidates[1][0] * 0.5:
-                css_candidates = css_candidates[1:]
+        # DOM順の最初の候補を返す（関連性順で最も適切な商品）
         if css_candidates:
             return css_candidates[0]
 
@@ -1080,18 +1080,14 @@ def _extract_price_by_text(soup: BeautifulSoup, query: str,
     if not candidates:
         return None
 
-    # === 統計的外れ値除去（中央値ベース: アクセサリ/バンドル除去） ===
-    candidates.sort(key=lambda x: x[0])
-
+    # === 外れ値除去（中央値ベース: DOM順維持） ===
     if len(candidates) >= 3:
-        median_price = candidates[len(candidates) // 2][0]
+        prices = sorted(c[0] for c in candidates)
+        median_price = prices[len(prices) // 2]
         candidates = [c for c in candidates
                       if median_price * 0.3 <= c[0] <= median_price * 2.5]
 
-    if len(candidates) >= 2:
-        if candidates[0][0] < candidates[1][0] * 0.5:
-            candidates = candidates[1:]
-
+    # DOM順の最初の候補を返す（関連性順で最も適切な商品）
     if candidates:
         return candidates[0]
     return None
@@ -1689,16 +1685,27 @@ def search_yamada(query: str, _config: Config) -> ShopPrice:
 # Joshin webショップ (スクレイピング)
 # ============================================================
 def search_joshin(query: str, _config: Config) -> ShopPrice:
-    # Joshin: パラメータはQK（KWではない）、PID=srhzsが必要
-    search_url = f"https://joshinweb.jp/servlet/emall.odr_wp?QS=&REQUEST_CODE=1&category_id=&SHP=0&QK={quote(query)}&PID=srhzs"
+    # Joshin: 複数URLパターン試行（servletは遅いのでシンプルなURLを優先）
+    search_urls = [
+        f"https://joshinweb.jp/search?keyword={quote(query)}",
+        f"https://joshinweb.jp/servlet/emall.odr_wp?QS=&REQUEST_CODE=1&category_id=&SHP=0&QK={quote(query)}&PID=srhzs",
+    ]
     selectors = [
         (".productList__item", ".productList__price", ".productList__name a"),
         (".lineup_box", ".lineup_price", ".lineup_name a"),
         (".item", ".price", ".item-name a, .name a"),
         ("li.product-item", ".price-box .price", ".product-item-link"),
     ]
-    return _scrape_generic("Joshin webショップ", search_url, selectors,
-                           "https://joshinweb.jp", query=query)
+    for url in search_urls:
+        result = _scrape_generic("Joshin webショップ", url, selectors,
+                                 "https://joshinweb.jp", query=query)
+        if result.price is not None:
+            return result
+        if result.error and "HTTP 404" not in (result.error or ""):
+            if "タイムアウト" not in (result.error or ""):
+                return result
+    return ShopPrice("Joshin webショップ", None, "", "", search_urls[0],
+                     error=result.error if result else None)
 
 
 # ============================================================
@@ -2316,7 +2323,8 @@ def _retry_with_browser(results: list[ShopPrice], query: str) -> None:
                     price, name, url = _find_price_in_soup(soup, selectors, base, query=query)
                     if price:
                         results[idx] = ShopPrice(r.shop_name, price, name, url, r.search_url)
-                        logger.info("Browser retry success: %s = %d", r.shop_name, price)
+                        logger.info("Browser retry success: %s = ¥%s (%s)",
+                                    r.shop_name, f"{price:,}", name[:50])
                     else:
                         logger.info("Browser retry: no price found for %s (HTML %d chars)",
                                     r.shop_name, len(html))
@@ -2395,7 +2403,8 @@ def search_all_shops(query: str, config: Config) -> list[ShopPrice]:
                 result = future.result(timeout=_TIMEOUT + 10)
                 results.append(result)
                 if result.price:
-                    logger.info("Phase1 OK: %s = ¥%s", name, f"{result.price:,}")
+                    logger.info("Phase1 OK: %s = ¥%s (%s)",
+                                name, f"{result.price:,}", result.product_name[:50])
                 elif result.error:
                     logger.info("Phase1 ERR: %s = %s", name, result.error)
                 else:
