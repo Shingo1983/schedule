@@ -357,7 +357,12 @@ def _is_relevant_product(query: str, product_name: str) -> bool:
         keywords = [w for w in words if len(w) >= 1]
 
     if keywords:
-        match_count = sum(1 for kw in keywords if kw in name_lower)
+        # カタカナ展開込みでキーワードマッチ
+        match_count = 0
+        for kw in keywords:
+            variants = [kw] + _KEYWORD_KATAKANA_MAP.get(kw, [])
+            if any(v.lower() in name_lower for v in variants):
+                match_count += 1
         if len(keywords) == 1:
             if match_count < 1:
                 return False
@@ -863,6 +868,61 @@ def _find_price_in_soup(soup: BeautifulSoup, selectors: list[tuple[str, str, str
     return None, "", ""
 
 
+# 英語→カタカナのキーワード展開マップ（日本のECサイトはカタカナ表記が多い）
+_KEYWORD_KATAKANA_MAP: dict[str, list[str]] = {
+    "airpods": ["エアーポッズ", "エアポッズ", "エアーポッド", "エアポッド"],
+    "iphone": ["アイフォン", "アイフォーン", "アイホン"],
+    "ipad": ["アイパッド"],
+    "macbook": ["マックブック"],
+    "apple": ["アップル"],
+    "samsung": ["サムスン"],
+    "galaxy": ["ギャラクシー"],
+    "sony": ["ソニー"],
+    "nintendo": ["ニンテンドー", "任天堂"],
+    "switch": ["スイッチ"],
+    "playstation": ["プレイステーション", "プレステ"],
+    "xbox": ["エックスボックス"],
+    "pro": ["プロ"],
+    "max": ["マックス"],
+    "mini": ["ミニ"],
+    "plus": ["プラス"],
+    "ultra": ["ウルトラ"],
+    "pixel": ["ピクセル"],
+    "google": ["グーグル"],
+    "bluetooth": ["ブルートゥース"],
+    "wireless": ["ワイヤレス"],
+    "noise": ["ノイズ"],
+    "cancelling": ["キャンセリング"],
+    "headphones": ["ヘッドホン", "ヘッドフォン"],
+    "earbuds": ["イヤーバッズ", "イヤバッズ"],
+    "earphone": ["イヤホン", "イヤフォン"],
+    "speaker": ["スピーカー"],
+    "keyboard": ["キーボード"],
+    "mouse": ["マウス"],
+    "monitor": ["モニター", "モニタ"],
+    "camera": ["カメラ"],
+    "lens": ["レンズ"],
+    "watch": ["ウォッチ"],
+    "tablet": ["タブレット"],
+    "laptop": ["ラップトップ", "ノートパソコン"],
+    "desktop": ["デスクトップ"],
+    "dyson": ["ダイソン"],
+    "panasonic": ["パナソニック"],
+    "sharp": ["シャープ"],
+    "toshiba": ["東芝"],
+    "hitachi": ["日立"],
+}
+
+
+def _expand_keywords(keywords: list[str]) -> list[str]:
+    """英語キーワードにカタカナ展開を追加"""
+    expanded = list(keywords)
+    for kw in keywords:
+        katakana_variants = _KEYWORD_KATAKANA_MAP.get(kw, [])
+        expanded.extend(katakana_variants)
+    return expanded
+
+
 def _extract_price_by_fulltext(soup: BeautifulSoup, query: str,
                                 base_url: str) -> tuple[int, str, str] | None:
     """フルテキスト近接検索（DOM構造に完全に依存しない最終手段）
@@ -872,12 +932,11 @@ def _extract_price_by_fulltext(soup: BeautifulSoup, query: str,
 
     CSSセレクタやDOM走査に依存しないため、あらゆるHTML構造に対応。
     """
-    # キーワード準備
+    # キーワード準備（カタカナ展開込み）
     query_lower = query.lower()
     keywords = [w for w in re.split(r'[\s　/／\-]+', query_lower) if len(w) >= 2]
     if not keywords:
         return None
-
     # ページ全テキスト抽出（改行区切り）
     full_text = soup.get_text(separator='\n')
     if len(full_text) < 100:
@@ -911,7 +970,13 @@ def _extract_price_by_fulltext(soup: BeautifulSoup, query: str,
         end = min(len(full_text_lower), m.end() + window)
         context = full_text_lower[start:end]
 
-        match_count = sum(1 for kw in keywords if kw in context)
+        # カタカナ展開込みでキーワードマッチ（各元キーワードごとに1回カウント）
+        match_count = 0
+        for kw in keywords:
+            # 元キーワード自体 or カタカナ変換のいずれかがコンテキストに存在すればOK
+            variants = [kw] + _KEYWORD_KATAKANA_MAP.get(kw, [])
+            if any(v.lower() in context for v in variants):
+                match_count += 1
         # キーワードの過半数一致を要求（大きいページでは緩和）
         if len(full_text) > 100000:
             required = max(1, (len(keywords) + 1) // 2)  # 過半数
@@ -1040,7 +1105,12 @@ def _extract_price_from_raw_html(html: str, query: str,
         end = min(len(html_lower), m.end() + window)
         context = html_lower[start:end]
 
-        match_count = sum(1 for kw in keywords if kw in context)
+        # カタカナ展開込みでキーワードマッチ
+        match_count = 0
+        for kw in keywords:
+            variants = [kw] + _KEYWORD_KATAKANA_MAP.get(kw, [])
+            if any(v.lower() in context for v in variants):
+                match_count += 1
         required = max(1, (len(keywords) + 1) // 2)
         if match_count >= required:
             candidates.append(price)
