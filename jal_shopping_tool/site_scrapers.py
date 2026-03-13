@@ -132,7 +132,7 @@ _SHOP_CATEGORIES: dict[str, set[str]] = {
     "dショッピング": {"all"},
     "セブンネットショッピング": {"all"},
     "JAL Mall": {"all"},
-    "LOHACO": {"all", "daily"},
+    "LOHACO": {"daily", "home"},  # 日用品メイン（電子機器なし）
     # ファッション
     "ユニクロオンラインストア": {"clothing"},
     "GU オンラインストア": {"clothing"},
@@ -2003,8 +2003,8 @@ search_bellemaison = _make_generic_scraper(
 
 search_lohaco = _make_generic_scraper(
     "LOHACO",
-    "https://lohaco.jp/search/?keyword={query}",
-    "https://lohaco.jp",
+    "https://lohaco.yahoo.co.jp/search?p={query}",
+    "https://lohaco.yahoo.co.jp",
 )
 
 search_nitori = _make_generic_scraper(
