@@ -109,6 +109,130 @@ class ShopPrice:
     error: str | None = None  # エラーメッセージ
 
 
+# ---------------------------------------------------------------------------
+# ショップカテゴリ × 商品ジャンル マッチング
+# ---------------------------------------------------------------------------
+# 各ショップの取扱ジャンル定義
+_SHOP_CATEGORIES: dict[str, set[str]] = {
+    # 家電量販店
+    "ビックカメラ.com": {"electronics", "appliances", "camera", "gaming", "daily"},
+    "Joshin webショップ": {"electronics", "appliances", "gaming"},
+    "ケーズデンキオンラインショップ": {"electronics", "appliances"},
+    "コジマネット": {"electronics", "appliances"},
+    "エディオンネットショップ": {"electronics", "appliances"},
+    "ノジマオンライン": {"electronics", "appliances"},
+    "ヤマダウェブコム": {"electronics", "appliances", "daily"},
+    "ソニーストア": {"electronics", "audio", "gaming"},
+    # 総合EC（何でも売っている）
+    "Amazon.co.jp": {"all"},
+    "Yahoo!ショッピング": {"all"},
+    "楽天市場": {"all"},
+    "au PAY マーケット": {"all"},
+    "Qoo10": {"all"},
+    "dショッピング": {"all"},
+    "セブンネットショッピング": {"all"},
+    "JAL Mall": {"all"},
+    "LOHACO": {"all", "daily"},
+    # ファッション
+    "ユニクロオンラインストア": {"clothing"},
+    "GU オンラインストア": {"clothing"},
+    "ZOZOTOWN": {"clothing", "fashion"},
+    "BUYMA": {"fashion", "luxury", "clothing"},
+    "ABC-MARTオンラインストア": {"shoes", "fashion"},
+    "ベルメゾンネット": {"clothing", "home"},
+    # 美容・健康
+    "DHCオンラインショップ": {"beauty", "health"},
+    "ファンケルオンライン": {"beauty", "health"},
+    "マツモトキヨシオンラインストア": {"beauty", "health", "daily"},
+    "@cosme SHOPPING": {"beauty", "cosmetics"},
+    "iHerb": {"health", "supplements"},
+    # インテリア・家具
+    "ニトリネット": {"furniture", "home"},
+    "無印良品ネットストア": {"home", "clothing", "daily"},
+    # その他
+    "ショップジャパン": {"home", "fitness"},
+}
+
+
+def _detect_product_genres(query: str) -> set[str]:
+    """検索クエリから商品ジャンルを推定する
+
+    Returns:
+        ジャンルのset。推定できない場合は {"all"} を返す（全ショップ対象）。
+    """
+    q = query.lower()
+
+    _GENRE_KEYWORDS: list[tuple[str, list[str]]] = [
+        ("electronics", [
+            "airpods", "iphone", "ipad", "macbook", "mac", "apple watch",
+            "イヤホン", "ヘッドホン", "スピーカー", "テレビ", "パソコン", "ノートpc",
+            "スマホ", "スマートフォン", "タブレット", "カメラ", "レンズ",
+            "ps5", "switch", "xbox", "ゲーム機", "コントローラー",
+            "ssd", "hdd", "メモリ", "usb", "充電器", "モニター", "ディスプレイ",
+            "プリンター", "ルーター", "wifi", "ドライヤー", "掃除機",
+            "冷蔵庫", "洗濯機", "エアコン", "電子レンジ", "炊飯器",
+            "galaxy", "pixel", "xperia", "aquos", "dyson", "sony", "bose",
+            "bluetooth", "ワイヤレス",
+        ]),
+        ("clothing", [
+            "シャツ", "tシャツ", "パンツ", "ジーンズ", "デニム", "ジャケット",
+            "コート", "ワンピース", "スカート", "セーター", "ニット",
+            "ダウン", "パーカー", "スウェット", "下着", "靴下", "ソックス",
+        ]),
+        ("fashion", [
+            "バッグ", "財布", "アクセサリー", "ネックレス", "リング", "指輪",
+            "ブランド", "サングラス", "帽子", "マフラー", "ストール",
+        ]),
+        ("shoes", [
+            "スニーカー", "ブーツ", "サンダル", "パンプス", "ローファー",
+            "nike", "adidas", "new balance", "converse",
+        ]),
+        ("beauty", [
+            "化粧水", "乳液", "美容液", "ファンデーション", "口紅", "リップ",
+            "マスカラ", "アイシャドウ", "コスメ", "化粧品", "スキンケア",
+            "シャンプー", "トリートメント", "ボディソープ", "日焼け止め",
+            "クレンジング", "洗顔",
+        ]),
+        ("health", [
+            "サプリメント", "ビタミン", "プロテイン", "青汁", "乳酸菌",
+            "マスク", "体温計", "血圧計",
+        ]),
+        ("furniture", [
+            "ソファ", "テーブル", "デスク", "椅子", "チェア", "ベッド",
+            "マットレス", "棚", "ラック", "カーテン", "カーペット", "ラグ",
+        ]),
+        ("home", [
+            "収納", "キッチン", "フライパン", "鍋", "食器", "タオル",
+            "寝具", "枕", "布団", "照明", "時計",
+        ]),
+        ("daily", [
+            "洗剤", "柔軟剤", "ティッシュ", "トイレットペーパー",
+            "歯ブラシ", "歯磨き粉", "石鹸",
+        ]),
+    ]
+
+    genres = set()
+    for genre, keywords in _GENRE_KEYWORDS:
+        if any(kw in q for kw in keywords):
+            genres.add(genre)
+
+    return genres if genres else {"all"}
+
+
+def _is_shop_relevant(shop_name: str, genres: set[str]) -> bool:
+    """ショップが検索ジャンルに関連するか判定
+
+    ジャンル不明（"all"）の場合は全ショップ対象。
+    ショップが"all"カテゴリの場合は常に対象。
+    """
+    if "all" in genres:
+        return True
+    shop_cats = _SHOP_CATEGORIES.get(shop_name, {"all"})
+    if "all" in shop_cats:
+        return True
+    return bool(genres & shop_cats)
+
+
 def _new_session() -> requests.Session:
     """毎回新しいHTTPセッションを作成
     cloudscraper利用可能時はCloudflare/bot検出を自動回避
@@ -265,8 +389,10 @@ def _is_relevant_product(query: str, product_name: str) -> bool:
         # 素材+ケース（ケース製品を示す）
         r'(?:シリコン|TPU|レザー|ハード|ソフト|クリア|透明)\s*ケース',
         # スタンドアロンのアクセサリワード（「付き」で終わらないもの）
-        # 「ケース」「カバー」単独 → アクセサリ（ただし「充電ケース付き」等は除外しない）
-        r'ケース(?!付)',
+        # 「ケース」「カバー」単独 → アクセサリ
+        # ただし「充電ケース」は本体の同梱品説明の場合あり → 除外
+        # 「充電ケース付き」「充電ケース（USB-C）」等は本体商品の記述
+        r'(?<!充電)ケース(?!付)',
         r'カバー(?!付)',
         # 常にアクセサリ（単体で十分明確）
         r'イヤーピース', r'イヤーチップ', r'イヤーパッド',
@@ -1687,17 +1813,13 @@ def _retry_with_browser(results: list[ShopPrice], query: str) -> None:
         else:
             retry_normal.append(i)
 
-    # 電子機器系ショップを優先（価格比較の本命）
-    _PRIORITY_SHOPS = {
-        "ビックカメラ.com", "ヨドバシ.com", "Joshin webショップ",
-        "ケーズデンキオンラインショップ", "コジマネット", "エディオンネットショップ",
-        "ノジマオンライン", "ヤマダウェブコム", "楽天市場", "Qoo10",
-        "au PAY マーケット", "セブンネットショッピング", "dショッピング",
-    }
+    # ジャンル関連ショップを優先（動的判断）
+    genres = _detect_product_genres(query)
     retry_priority = []
     retry_other = []
     for i in (retry_normal + retry_timeout):
-        if results[i].shop_name in _PRIORITY_SHOPS:
+        shop_name = results[i].shop_name
+        if _is_shop_relevant(shop_name, genres):
             retry_priority.append(i)
         else:
             retry_other.append(i)
@@ -1710,7 +1832,7 @@ def _retry_with_browser(results: list[ShopPrice], query: str) -> None:
 
     # Phase 2 全体の時間制限（3分）
     phase2_start = time.time()
-    PHASE2_BUDGET = 210  # 秒
+    PHASE2_BUDGET = 300  # 秒（ホームページ訪問を含むため余裕を持つ）
 
     def _launch_browser(pw):
         """ブラウザ起動: Chrome → Chromiumの順にフォールバック"""
@@ -1811,13 +1933,23 @@ def _retry_with_browser(results: list[ShopPrice], query: str) -> None:
                 page = None
                 try:
                     page = context.new_page()
-                    # Refererを設定（bot検出回避に重要）
-                    referer = f"{urlparse(r.search_url).scheme}://{urlparse(r.search_url).netloc}/"
+                    base_url = f"{urlparse(r.search_url).scheme}://{urlparse(r.search_url).netloc}"
+
+                    # まずホームページにアクセス（cookie/セッション取得 + bot検出回避）
+                    try:
+                        page.goto(base_url + "/", timeout=15000,
+                                  wait_until="domcontentloaded")
+                        page.wait_for_timeout(1500)
+                    except Exception:
+                        pass  # ホームページ失敗でも続行
+
+                    # 検索ページへ遷移
                     page.goto(r.search_url, timeout=30000,
-                              wait_until="domcontentloaded", referer=referer)
+                              wait_until="domcontentloaded",
+                              referer=base_url + "/")
                     # ネットワークアイドルを待つ（SPAのJS描画完了を待機）
                     try:
-                        page.wait_for_load_state("networkidle", timeout=8000)
+                        page.wait_for_load_state("networkidle", timeout=10000)
                     except Exception:
                         pass  # タイムアウトしても続行
                     # 追加の描画待ち
@@ -1890,10 +2022,25 @@ def search_all_shops(query: str, config: Config) -> list[ShopPrice]:
     """
     results: list[ShopPrice] = []
 
+    # === Phase 0: 商品ジャンル推定 → 不要ショップのスキップ ===
+    genres = _detect_product_genres(query)
+    skipped_shops = set()
+    for _, name in SCRAPERS:
+        if not _is_shop_relevant(name, genres):
+            skipped_shops.add(name)
+    if skipped_shops:
+        logger.info("Genre filter: %s → skipping %d shops (%s)",
+                     genres, len(skipped_shops),
+                     ", ".join(sorted(skipped_shops)))
+
     # === Phase 1: cloudscraper（並列実行・分散遅延付き） ===
     with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as executor:
         future_to_name: dict = {}
         for i, (scraper_fn, name) in enumerate(SCRAPERS):
+            if name in skipped_shops:
+                results.append(ShopPrice(name, None, "", "", "",
+                                         error="取扱ジャンル外"))
+                continue
             # 各ショップは別ドメインなので遅延は最小限
             delay = random.uniform(0, 0.5)
             future = executor.submit(_delayed_scrape, scraper_fn, query, config, delay)
