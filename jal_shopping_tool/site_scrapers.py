@@ -757,12 +757,18 @@ def _find_price_in_soup(soup: BeautifulSoup, selectors: list[tuple[str, str, str
             break  # 最初にマッチしたセレクタパターンの結果を使う
 
     if css_candidates:
-        # 複数候補がある場合、外れ値除去
+        # 複数候補がある場合、統計的に外れ値を除去
         css_candidates.sort(key=lambda x: x[0])
+        if len(css_candidates) >= 3:
+            # 中央値ベースの外れ値除去（アクセサリ/バンドル対策）
+            median_price = css_candidates[len(css_candidates) // 2][0]
+            css_candidates = [c for c in css_candidates
+                              if median_price * 0.3 <= c[0] <= median_price * 2.5]
         if len(css_candidates) >= 2:
-            if css_candidates[0][0] < css_candidates[1][0] * 0.6:
+            if css_candidates[0][0] < css_candidates[1][0] * 0.5:
                 css_candidates = css_candidates[1:]
-        return css_candidates[0]
+        if css_candidates:
+            return css_candidates[0]
 
     # 2. JSON-LD構造化データから探す
     jsonld_items = _extract_jsonld_prices(soup)
@@ -832,11 +838,27 @@ def _find_price_in_soup(soup: BeautifulSoup, selectors: list[tuple[str, str, str
     text = soup.get_text()
     text_len = len(text)
     price_in_text = len(re.findall(r'[¥￥]\s*[\d,]+|[\d,]+\s*円|\d{4,8}\s*円', text))
-    price_in_html = len(re.findall(r'[¥￥]\s*[\d,]+|[\d,]+\s*円|\d{4,8}\s*円', raw_html))
+    # HTMLでは追加の価格パターンもチェック（JS変数、data属性、HTMLエンティティ）
+    price_in_html = len(re.findall(
+        r'[¥￥]\s*[\d,]+|[\d,]+\s*円|\d{4,8}\s*円'
+        r'|"price"\s*[=:]\s*[\d",]+'
+        r'|data-price\s*=\s*"?\d+'
+        r'|&yen;\s*[\d,]+'
+        r'|\\u00a5\s*[\d,]+',
+        raw_html
+    ))
     if html_len > 10000:
         logger.info("Price extraction failed: HTML %d chars, text %d chars, "
                      "prices in text=%d, in html=%d",
                      html_len, text_len, price_in_text, price_in_html)
+        # 大きいHTMLで価格が全くない場合はHTML冒頭をログ出力（デバッグ用）
+        if price_in_html == 0 and html_len > 50000:
+            # scriptタグ内のコンテンツサンプルを出力
+            scripts = soup.find_all("script")
+            script_with_data = [s for s in scripts if s.string and len(s.string) > 500]
+            if script_with_data:
+                sample = script_with_data[0].string[:300]
+                logger.info("  Largest script sample: %s...", sample.replace('\n', ' ')[:200])
 
     return None, "", ""
 
@@ -923,13 +945,13 @@ def _extract_price_by_fulltext(soup: BeautifulSoup, query: str,
                      total_matches, len(full_text), len(keywords), keywords[:5])
         return None
 
-    # 外れ値除去
+    # 外れ値除去（中央値ベース: アクセサリ/バンドル除去）
     candidates.sort()
     if len(candidates) >= 3:
         median = candidates[len(candidates) // 2]
-        candidates = [p for p in candidates if p >= median * 0.5]
+        candidates = [p for p in candidates if median * 0.3 <= p <= median * 2.5]
     if len(candidates) >= 2:
-        if candidates[0] < candidates[1] * 0.6:
+        if candidates[0] < candidates[1] * 0.5:
             candidates = candidates[1:]
 
     if not candidates:
@@ -972,26 +994,33 @@ def _extract_price_from_raw_html(html: str, query: str,
     if not keywords:
         return None
 
-    # 生HTML内の価格パターン
+    # 生HTML内の価格パターン（JS変数、JSON、data属性、HTMLエンティティ）
     price_pattern = re.compile(
-        r'"price"\s*:\s*(\d{3,8})'             # "price": 38192 (JSON)
-        r'|"price"\s*:\s*"(\d{3,8})"'          # "price": "38192" (JSON string)
-        r'|"salePrice"\s*:\s*(\d{3,8})'        # "salePrice": 38192
-        r'|"itemPrice"\s*:\s*(\d{3,8})'        # "itemPrice": 38192
-        r'|data-price="(\d{3,8})"'             # data-price="38192"
-        r'|data-item-price="(\d{3,8})"'        # data-item-price="38192"
-        r'|"lowPrice"\s*:\s*(\d{3,8})'         # "lowPrice": 38192
-        r'|"highPrice"\s*:\s*(\d{3,8})'        # "highPrice": 38192
+        r'"price"\s*:\s*(\d{3,8})'             # "price": 38192 (JSON number)
+        r'|"price"\s*:\s*"([\d,]{3,8})"'       # "price": "38,192" (JSON string with commas)
+        r'|"salePrice"\s*:\s*"?([\d,]{3,8})"?' # "salePrice": 38192 or "38,192"
+        r'|"itemPrice"\s*:\s*"?([\d,]{3,8})"?' # "itemPrice": 38192
+        r'|"sellingPrice"\s*:\s*"?([\d,]{3,8})"?'  # "sellingPrice"
+        r'|"displayPrice"\s*:\s*"?([\d,]{3,8})"?'  # "displayPrice"
+        r'|"amount"\s*:\s*"?([\d,]{3,8})"?'    # "amount": 38192
+        r'|data-price="([\d,]{3,8})"'          # data-price="38192"
+        r'|data-item-price="([\d,]{3,8})"'     # data-item-price="38192"
+        r'|"lowPrice"\s*:\s*"?([\d,]{3,8})"?'  # "lowPrice": 38192
         r'|[¥￥]\s*([\d,]{4,})'                # ¥38,192 in HTML
         r'|([\d,]{4,})\s*円'                   # 38,192円 in HTML
+        r'|&yen;\s*([\d,]{4,})'                # &yen;38,192 (HTML entity)
+        r'|&#165;\s*([\d,]{4,})'               # &#165;38,192 (numeric entity)
     )
+
+    # グループ数を計算
+    _NUM_GROUPS = 14
 
     html_lower = html.lower()
     candidates = []
 
     for m in price_pattern.finditer(html):
         raw = None
-        for i in range(1, 11):
+        for i in range(1, _NUM_GROUPS + 1):
             if m.group(i):
                 raw = m.group(i)
                 break
@@ -1051,17 +1080,16 @@ def _extract_price_by_text(soup: BeautifulSoup, query: str,
     if not candidates:
         return None
 
-    # === 統計的外れ値除去 + 最安値選択 ===
+    # === 統計的外れ値除去（中央値ベース: アクセサリ/バンドル除去） ===
     candidates.sort(key=lambda x: x[0])
 
     if len(candidates) >= 3:
-        # 中央値の50%未満は外れ値（アクセサリ・送料・偽物等）
         median_price = candidates[len(candidates) // 2][0]
-        candidates = [c for c in candidates if c[0] >= median_price * 0.5]
+        candidates = [c for c in candidates
+                      if median_price * 0.3 <= c[0] <= median_price * 2.5]
 
     if len(candidates) >= 2:
-        # 最安値が2番目の60%未満なら外れ値として除外
-        if candidates[0][0] < candidates[1][0] * 0.6:
+        if candidates[0][0] < candidates[1][0] * 0.5:
             candidates = candidates[1:]
 
     if candidates:
@@ -1208,7 +1236,7 @@ def _make_error_result(shop_name: str, search_url: str, error: str) -> ShopPrice
 _SESSION_FIRST_SHOPS: set[str] = {
     "ビックカメラ.com", "コジマネット", "ヤマダウェブコム",
     "au PAY マーケット", "ノジマオンライン", "エディオンネットショップ",
-    "ケーズデンキオンラインショップ",
+    "ケーズデンキオンラインショップ", "Joshin webショップ",
 }
 
 
@@ -1853,26 +1881,11 @@ search_fancl = _make_generic_scraper(
     "https://www.fancl.co.jp",
 )
 
-def search_sony(query: str, _config: Config) -> ShopPrice:
-    """ソニーストア: 複数URL試行"""
-    search_urls = [
-        f"https://www.sony.jp/search/results/?q={quote(query)}",
-        f"https://www.sony.jp/search/?q={quote(query)}",
-    ]
-    selectors = [
-        (".search-result-item", ".search-result-price, .price", ".search-result-name a"),
-        ('[class*="product"]', '[class*="price"]', '[class*="name"] a, [class*="title"] a'),
-    ] + _GENERIC_SELECTORS
-    for url in search_urls:
-        result = _scrape_generic("ソニーストア", url, selectors,
-                                 "https://www.sony.jp", query=query)
-        if result.price is not None:
-            return result
-        # 接続エラー/404なら次のURLを試す
-        if result.error and "HTTP 404" not in (result.error or "") and "接続エラー" not in (result.error or ""):
-            return result
-    return ShopPrice("ソニーストア", None, "", "", search_urls[0],
-                     error=result.error if result else None)
+search_sony = _make_generic_scraper(
+    "ソニーストア",
+    "https://pur.store.sony.jp/search/?q={query}",
+    "https://pur.store.sony.jp",
+)
 
 search_ksdenki = _make_generic_scraper(
     "ケーズデンキオンラインショップ",
