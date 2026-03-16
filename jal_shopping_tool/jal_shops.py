@@ -178,7 +178,7 @@ KNOWN_SHOPS = {
         "mile_rate_desc": "200円につき1マイル",
         "yen_per_mile": 200,
         "category": "総合通販",
-        "search_url_template": "https://www.qoo10.jp/s/{query}",
+        "search_url_template": "https://www.qoo10.jp/s/{query}?keyword={query}",
     },
     "エディオンネットショップ": {
         "shop_id": "10100",

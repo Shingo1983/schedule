@@ -62,7 +62,7 @@ def create_app() -> Flask:
                     "category": shop.category,
                     "yen_per_mile": shop.yen_per_mile,
                     "miles_10k": miles_10k,
-                    "lsp_10k": round(lsp_10k, 1),
+                    "lsp_10k": f"{lsp_10k:.2f}",
                 })
 
         # 全ショップ数（ショップ一覧ページと同じ数）
@@ -131,6 +131,14 @@ def create_app() -> Flask:
     def currency_float_filter(value):
         try:
             return f"¥{float(value):,.0f}"
+        except (ValueError, TypeError):
+            return str(value)
+
+    @app.template_filter("format_lsp")
+    def format_lsp_filter(value):
+        """LSP値を小数点以下2桁で統一表示（0.8 → 0.80）"""
+        try:
+            return f"{float(value):.2f}"
         except (ValueError, TypeError):
             return str(value)
 

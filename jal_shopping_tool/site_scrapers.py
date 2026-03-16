@@ -191,7 +191,7 @@ _JSON_HEADERS = {
 }
 
 # リクエストタイムアウト（秒）
-_TIMEOUT = 25
+_TIMEOUT = 15
 
 # 並列実行のワーカー数（各ショップは別ドメインなので並列OK）
 _MAX_WORKERS = 10
@@ -2335,7 +2335,7 @@ def search_seven(query: str, _config: Config) -> ShopPrice:
 # Qoo10 (HTML + JSON-LD + 埋め込みJSON)
 # ============================================================
 def search_qoo10(query: str, _config: Config) -> ShopPrice:
-    search_url = f"https://www.qoo10.jp/s/{quote(query)}"
+    search_url = f"https://www.qoo10.jp/s/{quote(query)}?keyword={quote(query)}"
     selectors = [
         (".sc-prd", ".prc .prc-dc, .prc", ".tit a, .sbj a"),
         (".item_g", ".price, .prc", ".sbj a"),
@@ -2954,7 +2954,7 @@ def _retry_with_browser(results: list[ShopPrice], query: str) -> None:
 
     # Phase 2 全体の時間制限（3分）
     phase2_start = time.time()
-    PHASE2_BUDGET = 300  # 秒（ホームページ訪問を含むため余裕を持つ）
+    PHASE2_BUDGET = 180  # 秒（高速化のため短縮）
 
     def _launch_browser(pw):
         """ブラウザ起動: Chrome → Chromiumの順にフォールバック"""
@@ -3063,24 +3063,24 @@ def _retry_with_browser(results: list[ShopPrice], query: str) -> None:
 
                     # まずホームページにアクセス（cookie/セッション取得 + bot検出回避）
                     try:
-                        page.goto(base_url + "/", timeout=15000,
+                        page.goto(base_url + "/", timeout=10000,
                                   wait_until="domcontentloaded")
-                        page.wait_for_timeout(2000)
+                        page.wait_for_timeout(800)
                         # ホームページでもbot検出があれば待機
                         home_html = page.content()
                         if len(home_html) < 3000:
                             # Cloudflare等のチャレンジ完了を待つ
-                            page.wait_for_timeout(5000)
+                            page.wait_for_timeout(3000)
                     except Exception:
                         pass  # ホームページ失敗でも続行
 
                     # 検索ページへ遷移
-                    page.goto(r.search_url, timeout=30000,
+                    page.goto(r.search_url, timeout=20000,
                               wait_until="domcontentloaded",
                               referer=base_url + "/")
                     # ネットワークアイドルを待つ（SPAのJS描画完了を待機）
                     try:
-                        page.wait_for_load_state("networkidle", timeout=10000)
+                        page.wait_for_load_state("networkidle", timeout=6000)
                     except Exception:
                         pass  # タイムアウトしても続行
 
@@ -3088,7 +3088,7 @@ def _retry_with_browser(results: list[ShopPrice], query: str) -> None:
                     wait_sel = _SHOP_WAIT_SELECTORS.get(r.shop_name)
                     if wait_sel:
                         try:
-                            page.wait_for_selector(wait_sel, timeout=8000)
+                            page.wait_for_selector(wait_sel, timeout=5000)
                             logger.debug("Phase 2: found elements for %s", r.shop_name)
                         except Exception:
                             logger.debug("Phase 2: wait_for_selector timeout for %s", r.shop_name)
@@ -3096,22 +3096,21 @@ def _retry_with_browser(results: list[ShopPrice], query: str) -> None:
                     # 人間らしい操作を模倣（bot検出回避）
                     try:
                         page.mouse.move(random.randint(100, 800), random.randint(200, 600))
-                        page.wait_for_timeout(500)
                         page.evaluate("window.scrollBy(0, 300)")
-                        page.wait_for_timeout(1000)
+                        page.wait_for_timeout(500)
                     except Exception:
                         pass
 
-                    page.wait_for_timeout(1500)
+                    page.wait_for_timeout(800)
                     html = page.content()
 
                     # HTMLが極端に小さい場合はさらに待機（SPA遅延読み込み対策）
                     if len(html) < 5000:
-                        page.wait_for_timeout(8000)
+                        page.wait_for_timeout(4000)
                         # さらにスクロールして遅延コンテンツをトリガー
                         try:
                             page.evaluate("window.scrollBy(0, 500)")
-                            page.wait_for_timeout(2000)
+                            page.wait_for_timeout(1000)
                         except Exception:
                             pass
                         html = page.content()
@@ -3127,12 +3126,12 @@ def _retry_with_browser(results: list[ShopPrice], query: str) -> None:
                             # 段階的にスクロールして遅延コンテンツをトリガー
                             for scroll_y in [300, 600, 900]:
                                 page.evaluate(f"window.scrollTo(0, {scroll_y})")
-                                page.wait_for_timeout(2000)
-                            # ページトップに戻ってから再度下へ（一部サイトはスクロール位置で描画）
+                                page.wait_for_timeout(1000)
+                            # ページトップに戻ってから再度下へ
                             page.evaluate("window.scrollTo(0, 0)")
-                            page.wait_for_timeout(1000)
+                            page.wait_for_timeout(500)
                             page.evaluate("window.scrollBy(0, 500)")
-                            page.wait_for_timeout(3000)
+                            page.wait_for_timeout(1500)
                         except Exception:
                             pass
                         html = page.content()

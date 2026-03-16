@@ -27,7 +27,7 @@
                         <br><span class="shop-note">{{ shop.note }}</span>
                         {% endif %}
                     </td>
-                    <td>{{ shop.mile_rate_desc }}</td>
+                    <td>{{ shop.mile_rate_desc }}<br><span class="text-small text-muted">1LSP/¥{{ (shop.yen_per_mile * 100) | int }}購入</span></td>
                     <td><span class="badge">{{ shop.category }}</span></td>
                     <td>
                         {% if shop.name in scraper_names %}
@@ -37,7 +37,7 @@
                         {% endif %}
                     </td>
                     <td>
-                        {{ shop.calc_miles(10000) }}マイル / {{ shop.calc_lsp(10000) | round(1) }} LSP
+                        {{ shop.calc_miles(10000) }}マイル / {{ shop.calc_lsp(10000) | format_lsp }} LSP
                     </td>
                     <td><a href="{{ shop.url }}" target="_blank" rel="noopener" class="btn btn-small btn-outline">経由する</a></td>
                 </tr>

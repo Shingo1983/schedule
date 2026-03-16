@@ -75,7 +75,7 @@
         <p>
             {{ analysis.cheapest.shop_name }}が最安値です。
             {% if analysis.cheapest.lsp_earned > 0 %}
-            JALマイレージパーク経由で {{ analysis.cheapest.lsp_earned | round(2) }} LSP も獲得できます。
+            JALマイレージパーク経由で {{ analysis.cheapest.lsp_earned | format_lsp }} LSP も獲得できます。
             {% endif %}
         </p>
     </div>
@@ -134,15 +134,18 @@
                     </td>
                     <td class="col-rate">
                         <span class="text-small">{{ c.mile_rate_desc }}</span>
+                        {% if c.yen_per_mile > 0 %}
+                        <br><span class="text-small text-muted">1LSP/¥{{ (c.yen_per_mile * 100) | int }}購入</span>
+                        {% endif %}
                     </td>
                     <td class="col-lsp">
-                        <strong>{{ c.lsp_earned | round(2) }}</strong>
+                        <strong>{{ c.lsp_earned | format_lsp }}</strong>
                     </td>
                     <td class="col-lsp-diff">
                         {% if c.lsp_diff > 0 %}
-                        <span class="diff-plus-lsp">+{{ c.lsp_diff | round(2) }}</span>
+                        <span class="diff-plus-lsp">+{{ c.lsp_diff | format_lsp }}</span>
                         {% elif c.lsp_diff < 0 %}
-                        <span class="diff-minus-lsp">{{ c.lsp_diff | round(2) }}</span>
+                        <span class="diff-minus-lsp">{{ c.lsp_diff | format_lsp }}</span>
                         {% else %}
                         -
                         {% endif %}
@@ -189,7 +192,7 @@
                 {% for c in scraper_not_found %}
                 <tr>
                     <td><strong>{{ c.shop_name }}</strong></td>
-                    <td class="text-small">{{ c.mile_rate_desc }}</td>
+                    <td class="text-small">{{ c.mile_rate_desc }}{% if c.yen_per_mile > 0 %}<br><span class="text-muted">1LSP/¥{{ (c.yen_per_mile * 100) | int }}購入</span>{% endif %}</td>
                     <td>
                         <input type="number"
                                class="manual-price-input"
@@ -239,7 +242,7 @@
                 {% for ms in manual_shops %}
                 <tr>
                     <td><strong>{{ ms.name }}</strong></td>
-                    <td class="text-small">{{ ms.mile_rate_desc }}</td>
+                    <td class="text-small">{{ ms.mile_rate_desc }}<br><span class="text-muted">1LSP/¥{{ (ms.yen_per_mile * 100) | int }}購入</span></td>
                     <td><span class="badge">{{ ms.category }}</span></td>
                     <td class="text-small">
                         {{ ms.miles_10k }}マイル / {{ ms.lsp_10k }} LSP
