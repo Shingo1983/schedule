@@ -426,6 +426,8 @@ def _is_relevant_product(query: str, product_name: str) -> bool:
 
     if keywords:
         # カタカナ展開込みでキーワードマッチ（双方向: 英語→カタカナ、カタカナ→英語）
+        # スペース除去版も用意（"C E Ferulic" → "ceferulic" で "ce" マッチ対応）
+        name_lower_nospace = re.sub(r'[\s　\-]+', '', name_lower)
         match_count = 0
         for kw in keywords:
             variants = [kw] + _KEYWORD_KATAKANA_MAP.get(kw, []) + _KEYWORD_REVERSE_MAP.get(kw, [])
@@ -435,7 +437,8 @@ def _is_relevant_product(query: str, product_name: str) -> bool:
                 pattern = r'(?<![a-zA-Z0-9])' + re.escape(kw) + r'(?![0-9])'
                 if re.search(pattern, product_name, re.IGNORECASE):
                     match_count += 1
-            elif any(v.lower() in name_lower for v in variants):
+            elif any(v.lower() in name_lower or v.lower() in name_lower_nospace
+                     for v in variants):
                 match_count += 1
         if len(keywords) == 1:
             if match_count < 1:
@@ -1158,6 +1161,8 @@ def _extract_price_by_fulltext(soup: BeautifulSoup, query: str,
             else:
                 # 元キーワード自体 or カタカナ変換 or 逆引き英語 のいずれかが存在すればOK
                 variants = [kw] + _KEYWORD_KATAKANA_MAP.get(kw, []) + _KEYWORD_REVERSE_MAP.get(kw, [])
+                # スペース除去版も用意（"C E Ferulic" → "ceferulic" で "ce" マッチ対応）
+                context_nospace = re.sub(r'[\s　\-]+', '', context)
                 found_outside_echo = False
                 for v in variants:
                     v_lower = v.lower()
@@ -1173,6 +1178,10 @@ def _extract_price_by_fulltext(soup: BeautifulSoup, query: str,
                             break
                         search_start = pos + 1
                     if found_outside_echo:
+                        break
+                    # スペース除去版でも試行（"C E" → "ce" マッチ）
+                    if v_lower in context_nospace:
+                        found_outside_echo = True
                         break
                 if found_outside_echo:
                     match_count += 1
@@ -1911,6 +1920,9 @@ def search_amazon(query: str, _config: Config) -> ShopPrice:
 
             # 関連性チェック（中古・整備済み品も除外される）
             if name and not _is_relevant_product(query, name):
+                if len(all_candidates) == 0 and first_valid_price_result is None:
+                    logger.info("Amazon: rejected '%s' (¥%s) by relevance filter",
+                                name[:80], f"{price:,}")
                 continue
 
             link_el = result.select_one("h2 a")
@@ -2752,6 +2764,9 @@ def _retry_with_browser(results: list[ShopPrice], query: str) -> None:
                                         continue
                                     pname = prod.get("text", "")[:200]
                                     if query and pname and not _is_relevant_product(query, pname):
+                                        if best_price is None:
+                                            logger.info("Amazon JS rejected: '%s' (¥%s)",
+                                                        pname[:80], f"{p:,}")
                                         continue
                                     if best_price is None or p < best_price:
                                         best_price = p
