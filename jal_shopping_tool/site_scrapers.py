@@ -2872,16 +2872,30 @@ def _try_qoo10_js(page, results: list, idx: int, r, query: str) -> bool | str:
                 continue
             # Prefer clean nameText over messy full textContent
             pname = prod.get("nameText", "")
+            full_text = prod.get("text", "")[:300]
             if not pname:
                 # Strip prices, shipping info, etc. from full text to get cleaner name
-                raw = prod.get("text", "")[:200]
+                raw = full_text[:200]
                 # Remove common noise: prices (¥1,234 / 1,234円), shipping, point info
                 pname = re.sub(
                     r'[\d,]+\s*円|¥[\d,]+|送料[無料込別]*|ポイント.*?倍|'
                     r'\d+%\s*OFF|クーポン|カート|お気に入り|レビュー\s*\d+',
                     ' ', raw)
                 pname = re.sub(r'\s+', ' ', pname).strip()[:100]
-            if check_query and not _is_relevant_product(check_query, pname):
+            # 関連性チェックはnameTextとfull_textの両方で試行
+            # （Qoo10等でnameTextがブランド名のみに切り詰められている場合の対策）
+            relevance_texts = [pname]
+            if full_text and full_text != pname:
+                relevance_texts.append(full_text)
+            is_relevant = False
+            if check_query:
+                for rtxt in relevance_texts:
+                    if _is_relevant_product(check_query, rtxt):
+                        is_relevant = True
+                        break
+            else:
+                is_relevant = True
+            if not is_relevant:
                 if rejected_count < 3:
                     logger.info("Qoo10 JS rejected: '%s' (¥%s)", pname[:80], f"{p:,}")
                 rejected_count += 1
@@ -3061,18 +3075,22 @@ def _retry_with_browser(results: list[ShopPrice], query: str) -> None:
                     page = context.new_page()
                     base_url = f"{urlparse(r.search_url).scheme}://{urlparse(r.search_url).netloc}"
 
-                    # まずホームページにアクセス（cookie/セッション取得 + bot検出回避）
-                    try:
-                        page.goto(base_url + "/", timeout=10000,
-                                  wait_until="domcontentloaded")
-                        page.wait_for_timeout(800)
-                        # ホームページでもbot検出があれば待機
-                        home_html = page.content()
-                        if len(home_html) < 3000:
-                            # Cloudflare等のチャレンジ完了を待つ
-                            page.wait_for_timeout(3000)
-                    except Exception:
-                        pass  # ホームページ失敗でも続行
+                    # ホームページ訪問が必要なショップのみ（bot検出が厳しいサイト）
+                    # 大半のショップは直接検索URLで問題ないためスキップして高速化
+                    _NEEDS_HOME_VISIT = {
+                        "ファンケルオンライン", "@cosme SHOPPING",
+                        "au PAY マーケット", "dショッピング",
+                    }
+                    if r.shop_name in _NEEDS_HOME_VISIT:
+                        try:
+                            page.goto(base_url + "/", timeout=10000,
+                                      wait_until="domcontentloaded")
+                            page.wait_for_timeout(800)
+                            home_html = page.content()
+                            if len(home_html) < 3000:
+                                page.wait_for_timeout(3000)
+                        except Exception:
+                            pass
 
                     # 検索ページへ遷移
                     page.goto(r.search_url, timeout=20000,
