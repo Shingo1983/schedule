@@ -94,6 +94,42 @@ def _simplify_query(query: str) -> str | None:
         return None
     return simplified
 
+def _build_english_query(query: str) -> str | None:
+    """カタカナ/日本語キーワードを英語に変換したクエリを構築。
+
+    _KEYWORD_REVERSE_MAP を使い、カタカナ語を英語に逆引きする。
+    変換できた語が1つ以上あり、元クエリと異なる場合にのみ返す。
+
+    例: "スキンシューティカルズ CE フェルリック セラム 30ml"
+      → "skinceuticals CE ferulic serum 30ml"
+    """
+    words = re.split(r'[\s　]+', query)
+    if not words:
+        return None
+
+    converted = []
+    any_converted = False
+    for w in words:
+        w_lower = w.lower()
+        # _KEYWORD_REVERSE_MAP はインポート後に構築されるため遅延参照
+        eng_variants = _KEYWORD_REVERSE_MAP.get(w_lower, [])
+        if eng_variants:
+            converted.append(eng_variants[0])  # 最初の英語候補を使う
+            any_converted = True
+        else:
+            # サイズ表記等はそのまま保持
+            converted.append(w)
+
+    if not any_converted:
+        return None
+
+    result = ' '.join(converted)
+    # 元クエリと同じなら None
+    if result.lower() == query.lower():
+        return None
+    return result
+
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -559,7 +595,13 @@ def _is_relevant_product(query: str, product_name: str) -> bool:
 
 
 def _is_bot_blocked_page(soup: BeautifulSoup) -> bool:
-    """bot検出/アクセス制限ページかどうかを判定"""
+    """bot検出/アクセス制限ページかどうかを判定
+
+    注意: テキストが十分にある大きなページ（商品一覧等）では
+    block_patterns の誤検出を防ぐため、パターンを本文の主要コンテンツ
+    と照合しない（ヘッダー/フッターの「しばらくお待ちください」等で
+    誤判定されるのを防止）。
+    """
     text = soup.get_text()
 
     # HTMLが極端に短い場合のチャレンジページ検出
@@ -597,6 +639,15 @@ def _is_bot_blocked_page(soup: BeautifulSoup) -> bool:
         r'不正なアクセス',
         r'ブラウザの確認',
     ]
+
+    # 大きなページ（実コンテンツあり）ではブロックパターンを適用しない。
+    # au PAY マーケット等は正常なページでも「しばらくお待ちください」等の
+    # テキストがヘッダー/フッターに含まれ、誤検出の原因になる。
+    # 閾値: テキスト5000文字以上 = 実際の商品一覧がある可能性が高い
+    text_len = len(text.strip())
+    if text_len > 5000:
+        return False
+
     for pattern in block_patterns:
         if re.search(pattern, text, re.IGNORECASE):
             return True
@@ -2069,6 +2120,74 @@ def search_amazon(query: str, _config: Config) -> ShopPrice:
             except Exception as retry_err:
                 logger.debug("Amazon retry error: %s", retry_err)
 
+        # === 英語クエリでリトライ ===
+        # カタカナブランド名を英語に変換して再検索（Amazon は英語名でインデックスしていることが多い）
+        # 例: "スキンシューティカルズ CE フェルリック" → "skinceuticals CE ferulic"
+        english_query = _build_english_query(query)
+        if english_query:
+            logger.info("Amazon: retrying with English query '%s'", english_query)
+            eng_url = f"https://www.amazon.co.jp/s?k={quote(english_query)}"
+            try:
+                resp_eng = _fetch(eng_url)
+                if resp_eng.status_code == 200:
+                    soup_eng = _soup(resp_eng)
+                    if not _is_bot_blocked_page(soup_eng):
+                        eng_results = soup_eng.select('[data-component-type="s-search-result"]')
+                        logger.info("Amazon English retry: found %d search results", len(eng_results))
+                        eng_candidates = []
+                        for result in eng_results:
+                            sponsored = result.select_one('.s-label-popover-default')
+                            if sponsored and 'スポンサー' in sponsored.get_text():
+                                continue
+                            price_whole = result.select_one(".a-price .a-price-whole")
+                            if not price_whole:
+                                continue
+                            p = _parse_price(price_whole.get_text())
+                            if not p:
+                                continue
+                            n = ""
+                            for name_sel in ["h2 a span", "h2 span", "h2 a",
+                                             ".a-text-normal",
+                                             'span[class*="a-size-medium"]',
+                                             'span[class*="a-size-base-plus"]']:
+                                title_el = result.select_one(name_sel)
+                                if title_el:
+                                    n = title_el.get_text(strip=True)
+                                    if n:
+                                        break
+                            if not n:
+                                h2 = result.select_one("h2")
+                                if h2:
+                                    n = h2.get_text(strip=True)
+                            if not n:
+                                img = result.select_one("img.s-image")
+                                if img and img.get("alt"):
+                                    n = img["alt"]
+                            # 英語クエリに対する関連性チェック
+                            if n and not _is_relevant_product(english_query, n):
+                                logger.info("Amazon English retry rejected: '%s' (¥%s)",
+                                            n[:80], f"{p:,}")
+                                continue
+                            link_el = result.select_one("h2 a")
+                            u = ""
+                            if link_el and link_el.get("href"):
+                                href = link_el["href"]
+                                u = f"https://www.amazon.co.jp{href}" if href.startswith("/") else href
+                            if n:
+                                eng_candidates.append((p, n, u))
+
+                        if eng_candidates:
+                            prices = sorted(c[0] for c in eng_candidates)
+                            if len(prices) >= 3:
+                                median = prices[len(prices) // 2]
+                                eng_candidates = [c for c in eng_candidates if c[0] >= median * 0.3]
+                            if eng_candidates:
+                                best = min(eng_candidates, key=lambda c: c[0])
+                                logger.info("Amazon English retry OK: ¥%s (%s)", f"{best[0]:,}", best[1][:50])
+                                return ShopPrice("Amazon.co.jp", best[0], best[1], best[2], eng_url)
+            except Exception as eng_err:
+                logger.debug("Amazon English retry error: %s", eng_err)
+
         return ShopPrice("Amazon.co.jp", None, "", "", search_url)
 
     except Exception as e:
@@ -2170,10 +2289,14 @@ def search_joshin(query: str, _config: Config) -> ShopPrice:
 # au PAY マーケット (HTML + JSON-LD + 埋め込みJSON)
 # ============================================================
 def search_aupay(query: str, _config: Config) -> ShopPrice:
-    # au PAY マーケット: wowma.jpの複数URLパターン
+    # au PAY マーケット: wowma.jp の複数URLパターン
+    # 注: au PAY は bot 対策が厳しく cloudscraper では空ページ（524文字等）を
+    # 返すことが多い。Phase 2 (Playwright) での再試行に期待。
     search_urls = [
         f"https://wowma.jp/itemlist?e_scope=O&at=FP&non_gr=ex&keyword={quote(query)}&categ_id=0",
         f"https://wowma.jp/itemlist?keyword={quote(query)}",
+        # API風のURLパターン（JSON応答が返る場合がある）
+        f"https://wowma.jp/api/search/items?keyword={quote(query)}&limit=20&offset=0",
     ]
     selectors = [
         (".itemList__item", ".itemList__price, .price", ".itemList__name a, .product-name a"),
@@ -2181,13 +2304,16 @@ def search_aupay(query: str, _config: Config) -> ShopPrice:
         ('[class*="ItemCard"]', '[class*="price"]', '[class*="name"] a, [class*="title"] a'),
         (".item", ".price", "a.item-name"),
     ] + _GENERIC_SELECTORS
+    last_error = None
     for url in search_urls:
         result = _scrape_generic("au PAY マーケット", url, selectors,
                                  "https://wowma.jp", query=query)
         if result.price is not None:
             return result
+        if result.error:
+            last_error = result.error
     return ShopPrice("au PAY マーケット", None, "", "", search_urls[0],
-                     error=result.error if result else None)
+                     error=last_error)
 
 
 # ============================================================
@@ -2653,8 +2779,15 @@ def _try_amazon_js(page, results: list, idx: int, r, query: str) -> bool:
         return False
 
 
-def _try_qoo10_js(page, results: list, idx: int, r, query: str) -> bool:
-    """Qoo10 Phase 2 JS抽出（個別商品の関連性チェック付き）"""
+def _try_qoo10_js(page, results: list, idx: int, r, query: str) -> bool | str:
+    """Qoo10 Phase 2 JS抽出（個別商品の関連性チェック付き）
+
+    Returns:
+        True: 価格抽出成功
+        False: 商品が見つからなかった（汎用フォールバックへ）
+        "items_no_match": 商品は見つかったが関連性チェックで全滅
+                          （汎用フォールバックをスキップすべき）
+    """
     try:
         js_products = page.evaluate("""
             () => {
@@ -2692,8 +2825,30 @@ def _try_qoo10_js(page, results: list, idx: int, r, query: str) -> bool:
                     const link = el.querySelector('a[href]');
                     const priceEl = el.querySelector(
                         '[class*="price"], [class*="prc"], [class*="Price"]');
+                    // Try to extract a clean product name from title/name elements
+                    const nameEl = el.querySelector(
+                        '[class*="tit"] a, [class*="sbj"] a, [class*="name"] a, '
+                        + '[class*="Tit"] a, [class*="Sbj"] a, [class*="Name"] a, '
+                        + 'a[class*="tit"], a[class*="sbj"], a[class*="name"], '
+                        + 'h3 a, h4 a, .goods_name a, .title a, '
+                        + '[class*="prd_name"] a, [class*="item-name"] a');
+                    let nameText = nameEl ? nameEl.textContent.replace(/\\s+/g, ' ').trim() : '';
+                    // Fallback: try img alt or a[title] for product name
+                    if (!nameText) {
+                        const imgEl = el.querySelector('img[alt]');
+                        if (imgEl && imgEl.alt && imgEl.alt.length > 5) {
+                            nameText = imgEl.alt.trim();
+                        }
+                    }
+                    if (!nameText) {
+                        const titleLink = el.querySelector('a[title]');
+                        if (titleLink && titleLink.title && titleLink.title.length > 5) {
+                            nameText = titleLink.title.trim();
+                        }
+                    }
                     return {
                         text: el.textContent.replace(/\\s+/g, ' ').trim().substring(0, 300),
+                        nameText: nameText.substring(0, 200),
                         href: link ? link.href : '',
                         priceText: priceEl ? priceEl.textContent.trim() : '',
                     };
@@ -2707,6 +2862,7 @@ def _try_qoo10_js(page, results: list, idx: int, r, query: str) -> bool:
         best_price = None
         best_name = ""
         best_url = ""
+        rejected_count = 0
         for prod in js_products:
             ptext = prod.get("priceText", "") or prod.get("text", "")
             p = _parse_price(ptext)
@@ -2714,8 +2870,21 @@ def _try_qoo10_js(page, results: list, idx: int, r, query: str) -> bool:
                 p = _parse_price(prod.get("text", ""))
             if not p or p > 99_999_999:
                 continue
-            pname = prod.get("text", "")[:100]
+            # Prefer clean nameText over messy full textContent
+            pname = prod.get("nameText", "")
+            if not pname:
+                # Strip prices, shipping info, etc. from full text to get cleaner name
+                raw = prod.get("text", "")[:200]
+                # Remove common noise: prices (¥1,234 / 1,234円), shipping, point info
+                pname = re.sub(
+                    r'[\d,]+\s*円|¥[\d,]+|送料[無料込別]*|ポイント.*?倍|'
+                    r'\d+%\s*OFF|クーポン|カート|お気に入り|レビュー\s*\d+',
+                    ' ', raw)
+                pname = re.sub(r'\s+', ' ', pname).strip()[:100]
             if check_query and not _is_relevant_product(check_query, pname):
+                if rejected_count < 3:
+                    logger.info("Qoo10 JS rejected: '%s' (¥%s)", pname[:80], f"{p:,}")
+                rejected_count += 1
                 continue
             if best_price is None or p < best_price:
                 best_price = p
@@ -2726,8 +2895,15 @@ def _try_qoo10_js(page, results: list, idx: int, r, query: str) -> bool:
             logger.info("Browser retry success (JS): %s = ¥%s (%s)",
                         r.shop_name, f"{best_price:,}", best_name[:50])
             return True
-        logger.info("Browser retry: Qoo10 JS found %d items but no matching price",
-                    len(js_products))
+        logger.info("Browser retry: Qoo10 JS found %d items, %d rejected by relevance, no match",
+                    len(js_products), rejected_count)
+        # Signal that items existed but none matched — caller should skip generic fallback.
+        # Also skip if items were found but prices couldn't be parsed (the page has products,
+        # so generic fallback would just pick up noise like mini/sample sizes).
+        if len(js_products) >= 3:
+            return "items_no_match"
+        if len(js_products) > 0 and rejected_count > 0:
+            return "items_no_match"
         return False
     except Exception as js_err:
         logger.debug("Qoo10 JS extraction failed: %s", js_err)
@@ -2982,7 +3158,12 @@ def _retry_with_browser(results: list[ShopPrice], query: str) -> None:
                     elif r.shop_name == "Qoo10":
                         js_extracted = _try_qoo10_js(page, results, idx, r, query)
 
-                    if not js_extracted:
+                    if js_extracted == "items_no_match":
+                        # Qoo10 JS found products but none passed relevance check
+                        # Skip generic fallback to avoid picking up wrong/noise prices
+                        logger.info("Browser retry: skipping generic fallback for %s "
+                                    "(JS found items but none matched)", r.shop_name)
+                    elif not js_extracted:
                         # 汎用抽出（CSS + JSON-LD + fulltext）
                         price, name, url = _find_price_in_soup(soup, selectors, base, query=query)
                         if price:
