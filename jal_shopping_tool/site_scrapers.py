@@ -394,6 +394,19 @@ def _is_relevant_product(query: str, product_name: str) -> bool:
         if re.search(pattern, name_lower, re.IGNORECASE):
             return False
 
+    # === クエリエコーバック検出 ===
+    # 検索結果0件時にページがクエリを見出しに表示し、無関係商品の価格が
+    # 近くにあるケースを防止（例: ユニクロ/GUの「〇〇の検索結果」）
+    # 商品名がクエリとほぼ同一（余分な文字が少ない）なら実商品ではない
+    _q_normalized = re.sub(r'[\s　\-/／「」『』【】()（）]+', '', query_lower)
+    _n_normalized = re.sub(r'[\s　\-/／「」『』【】()（）]+', '', name_lower)
+    if _q_normalized and _n_normalized:
+        # 商品名がクエリとほぼ同じ（前後の装飾文字程度の差）→ エコーバック
+        if (_n_normalized == _q_normalized
+                or _n_normalized.startswith(_q_normalized)
+                and len(_n_normalized) - len(_q_normalized) < 10):
+            return False
+
     # === キーワードマッチ（先にチェック — 無関係商品を先に弾く） ===
     stop_words = {"the", "a", "an", "and", "or", "in", "on", "at", "to", "for",
                   "no", "の", "に", "を", "は", "が", "と", "で", "も", "から", "まで"}
@@ -2677,10 +2690,17 @@ def search_all_shops(query: str, config: Config) -> list[ShopPrice]:
 
 
 def _validate_prices_cross_shop(results: list[ShopPrice]) -> None:
-    """クロスショップ価格バリデーション
+    """クロスショップ価格バリデーション（2パス方式）
 
     複数ショップの結果を統計的に比較し、中央値から大きく外れた結果を
     エラーに変換する（アクセサリ・無関係商品の誤検出対策）。
+
+    2パス方式:
+    1. 明らかな下限外れ値（非商品ページの誤検出）を先に除去
+    2. 残りで中央値を再計算し、上限チェック
+
+    高級品のサイズ違い・並行輸入等で正当な3-4倍の価格差がありうるため、
+    上限閾値は控えめに設定。
     """
     prices_with_idx = [(r.price, i) for i, r in enumerate(results) if r.price is not None]
     if len(prices_with_idx) < 3:
@@ -2689,21 +2709,35 @@ def _validate_prices_cross_shop(results: list[ShopPrice]) -> None:
     prices_only = sorted(p for p, _ in prices_with_idx)
     median = prices_only[len(prices_only) // 2]
 
-    # 中央値の25%未満の価格は明らかな外れ値（下限）
-    lower_threshold = median * 0.25
-    # 中央値の2.2倍超は明らかな外れ値（上限: セット品・別商品の可能性）
-    upper_threshold = median * 2.2
+    # === Pass 1: 下限外れ値を除去 ===
+    # 中央値の20%未満は明らかな外れ値（非商品ページの誤検出等）
+    lower_threshold = median * 0.20
+    removed_indices = set()
     for price, idx in prices_with_idx:
-        removed = False
         if price < lower_threshold:
-            removed = True
-            reason = f"価格が低すぎ（中央値¥{median:,}の25%未満）"
-        elif price > upper_threshold and len(prices_only) >= 4:
-            # 上限チェックは4件以上ある場合のみ（少数だと誤判定リスク）
-            removed = True
-            reason = f"価格が高すぎ（中央値¥{median:,}の2.2倍超）"
-        if removed:
             r = results[idx]
+            reason = f"価格が低すぎ（中央値¥{median:,}の20%未満）"
+            logger.info("Cross-shop validation: %s ¥%s removed (%s)",
+                        r.shop_name, f"{price:,}", reason)
+            results[idx] = ShopPrice(
+                r.shop_name, None, "", "", r.search_url,
+                error="価格異常（他店と大きく乖離）"
+            )
+            removed_indices.add(idx)
+
+    # === Pass 2: 中央値を再計算して上限チェック ===
+    remaining = [(p, i) for p, i in prices_with_idx if i not in removed_indices]
+    if len(remaining) < 5:
+        return  # 5件未満では上限チェックしない（少数だと誤判定リスク大）
+
+    remaining_prices = sorted(p for p, _ in remaining)
+    median2 = remaining_prices[len(remaining_prices) // 2]
+    # 中央値の3.5倍超は外れ値（サイズ違い・セット品等の正当な差を考慮）
+    upper_threshold = median2 * 3.5
+    for price, idx in remaining:
+        if price > upper_threshold:
+            r = results[idx]
+            reason = f"価格が高すぎ（中央値¥{median2:,}の3.5倍超）"
             logger.info("Cross-shop validation: %s ¥%s removed (%s)",
                         r.shop_name, f"{price:,}", reason)
             results[idx] = ShopPrice(
