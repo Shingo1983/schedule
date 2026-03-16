@@ -418,10 +418,10 @@ def _is_relevant_product(query: str, product_name: str) -> bool:
         keywords = [w for w in words if len(w) >= 1]
 
     if keywords:
-        # カタカナ展開込みでキーワードマッチ
+        # カタカナ展開込みでキーワードマッチ（双方向: 英語→カタカナ、カタカナ→英語）
         match_count = 0
         for kw in keywords:
-            variants = [kw] + _KEYWORD_KATAKANA_MAP.get(kw, [])
+            variants = [kw] + _KEYWORD_KATAKANA_MAP.get(kw, []) + _KEYWORD_REVERSE_MAP.get(kw, [])
             # 1-2文字の数字キーワード（型番/バージョン）はワードバウンダリでマッチ
             # 例: "3" が "MTJV3" にマッチしないように（"Pro 3" にはマッチ）
             if kw.isdigit() and len(kw) <= 2:
@@ -994,7 +994,57 @@ _KEYWORD_KATAKANA_MAP: dict[str, list[str]] = {
     "sharp": ["シャープ"],
     "toshiba": ["東芝"],
     "hitachi": ["日立"],
+    # コスメ・美容
+    "serum": ["セラム"],
+    "cream": ["クリーム"],
+    "lotion": ["ローション"],
+    "essence": ["エッセンス"],
+    "moisturizer": ["モイスチャライザー"],
+    "cleanser": ["クレンザー"],
+    "toner": ["トナー", "トーナー"],
+    "sunscreen": ["サンスクリーン"],
+    "foundation": ["ファンデーション"],
+    "mascara": ["マスカラ"],
+    "lipstick": ["リップスティック"],
+    "concealer": ["コンシーラー"],
+    "primer": ["プライマー"],
+    "retinol": ["レチノール"],
+    "collagen": ["コラーゲン"],
+    "hyaluronic": ["ヒアルロニック"],
+    "ceramide": ["セラミド"],
+    "niacinamide": ["ナイアシンアミド"],
+    "vitamin": ["ビタミン"],
+    "peptide": ["ペプチド"],
+    "ferulic": ["フェルリック"],
+    "antioxidant": ["アンチオキシダント"],
+    "skinceuticals": ["スキンシューティカルズ"],
+    "lancome": ["ランコム"],
+    "clinique": ["クリニーク"],
+    "estee": ["エスティ"],
+    "lauder": ["ローダー"],
+    "shiseido": ["資生堂", "シセイドウ"],
+    "sulwhasoo": ["ソルファス"],
+    "laneige": ["ラネージュ"],
+    "innisfree": ["イニスフリー"],
+    # ファッション・雑貨
+    "sneakers": ["スニーカー"],
+    "boots": ["ブーツ"],
+    "jacket": ["ジャケット"],
+    "shirt": ["シャツ"],
+    "dress": ["ドレス", "ワンピース"],
+    "backpack": ["バックパック", "リュック"],
+    "wallet": ["ウォレット"],
+    # 食品・健康
+    "supplement": ["サプリメント", "サプリ"],
+    "protein": ["プロテイン"],
+    "organic": ["オーガニック"],
 }
+
+# 逆引きマップ自動生成（カタカナ→英語）— 双方向マッチング用
+_KEYWORD_REVERSE_MAP: dict[str, list[str]] = {}
+for _eng, _kata_list in _KEYWORD_KATAKANA_MAP.items():
+    for _kata in _kata_list:
+        _KEYWORD_REVERSE_MAP.setdefault(_kata.lower(), []).append(_eng)
 
 
 def _expand_keywords(keywords: list[str]) -> list[str]:
@@ -1064,7 +1114,7 @@ def _extract_price_by_fulltext(soup: BeautifulSoup, query: str,
         end = min(len(full_text_lower), m.end() + window)
         context = full_text_lower[start:end]
 
-        # カタカナ展開込みでキーワードマッチ（各元キーワードごとに1回カウント）
+        # カタカナ展開込みでキーワードマッチ（双方向: 英語→カタカナ、カタカナ→英語）
         match_count = 0
         for kw in keywords:
             # 1-2文字の数字キーワードはワードバウンダリでマッチ
@@ -1073,8 +1123,8 @@ def _extract_price_by_fulltext(soup: BeautifulSoup, query: str,
                 if re.search(pattern, full_text[start:end], re.IGNORECASE):
                     match_count += 1
             else:
-                # 元キーワード自体 or カタカナ変換のいずれかがコンテキストに存在すればOK
-                variants = [kw] + _KEYWORD_KATAKANA_MAP.get(kw, [])
+                # 元キーワード自体 or カタカナ変換 or 逆引き英語 のいずれかが存在すればOK
+                variants = [kw] + _KEYWORD_KATAKANA_MAP.get(kw, []) + _KEYWORD_REVERSE_MAP.get(kw, [])
                 if any(v.lower() in context for v in variants):
                     match_count += 1
         # キーワードの過半数一致を要求（大きいページでは緩和）
@@ -2314,6 +2364,21 @@ _SHOP_SPECIFIC_SELECTORS: dict[str, list[tuple[str, str, str]]] = {
         (".productItem", ".productPrice, .price", ".productName a"),
         ('[class*="product"]', '[class*="price"]', '[class*="product"] a, [class*="name"] a'),
     ],
+    "Qoo10": [
+        # 2026年版: Qoo10はSPA化が進んでおり複数パターン
+        (".sc-prd", ".prc .prc-dc, .prc", ".tit a, .sbj a"),
+        (".item_g", ".price, .prc", ".sbj a"),
+        ('[class*="goods"]', '[class*="price"], [class*="prc"]',
+         '[class*="name"] a, [class*="sbj"] a, [class*="tit"] a'),
+        (".gd_list li, .lst_cont li", ".prc, .price", ".tit a, .sbj a, .name a"),
+        ('[class*="product"]', '[class*="price"]', '[class*="title"] a, [class*="name"] a'),
+        (".goods_item", ".price", ".goods_name a, .title a"),
+        # SPA描画後の追加パターン
+        ('[data-gd-no]', '[class*="price"], [class*="prc"]', 'a[class*="name"], a[class*="tit"], a[href]'),
+        (".search-item, .search-result-item", ".price, .sale-price", ".item-name a, .product-name a"),
+        ('[class*="SearchResult"]', '[class*="price"], [class*="Price"]',
+         '[class*="name"] a, [class*="Name"] a, [class*="title"] a'),
+    ],
 }
 
 # Phase 2で待機するCSSセレクタ（SPA描画完了の判定）
@@ -2326,6 +2391,7 @@ _SHOP_WAIT_SELECTORS: dict[str, str] = {
     "au PAY マーケット": ".itemList__item, [class*='ItemCard'], [class*='product']",
     "dショッピング": ".c-productListItem, [class*='ProductCard'], [class*='product']",
     "Joshin webショップ": ".productList__item, .lineup_box, [class*='product']",
+    "Qoo10": ".sc-prd, .item_g, [class*='goods'], [data-gd-no], [class*='SearchResult'], [class*='product']",
 }
 
 
@@ -2581,6 +2647,89 @@ def _retry_with_browser(results: list[ShopPrice], query: str) -> None:
                         results[idx] = ShopPrice(r.shop_name, price, name, url, r.search_url)
                         logger.info("Browser retry success: %s = ¥%s (%s)",
                                     r.shop_name, f"{price:,}", name[:50])
+                    elif r.shop_name == "Qoo10":
+                        # Qoo10 SPA fallback: JS評価で直接DOM内の商品データを取得
+                        try:
+                            js_products = page.evaluate("""
+                                () => {
+                                    // 幅広いセレクタで商品要素を探す
+                                    const selectors = [
+                                        '[data-gd-no]',
+                                        '.sc-prd', '.item_g', '.goods_item',
+                                        '[class*="SearchResult"] [class*="item"]',
+                                        '[class*="goods"]',
+                                        '[class*="product-card"]',
+                                        '[class*="ProductCard"]',
+                                    ];
+                                    let items = [];
+                                    for (const sel of selectors) {
+                                        const found = document.querySelectorAll(sel);
+                                        if (found.length > 0 && found.length < 200) {
+                                            items = Array.from(found);
+                                            break;
+                                        }
+                                    }
+                                    if (items.length === 0) {
+                                        // 最終手段: 価格要素から親をたどる
+                                        const priceEls = document.querySelectorAll(
+                                            '[class*="price"], [class*="prc"], [class*="Price"]');
+                                        for (const el of Array.from(priceEls).slice(0, 30)) {
+                                            let parent = el.parentElement;
+                                            for (let i = 0; i < 5 && parent; i++) {
+                                                const link = parent.querySelector('a[href]');
+                                                if (link && link.href && parent.textContent.length < 500) {
+                                                    items.push(parent);
+                                                    break;
+                                                }
+                                                parent = parent.parentElement;
+                                            }
+                                        }
+                                    }
+                                    return items.slice(0, 20).map(el => {
+                                        const link = el.querySelector('a[href]');
+                                        const priceEl = el.querySelector(
+                                            '[class*="price"], [class*="prc"], [class*="Price"]');
+                                        return {
+                                            text: el.textContent.replace(/\\s+/g, ' ').trim().substring(0, 300),
+                                            href: link ? link.href : '',
+                                            priceText: priceEl ? priceEl.textContent.trim() : '',
+                                        };
+                                    });
+                                }
+                            """)
+                            if js_products:
+                                best_price = None
+                                best_name = ""
+                                best_url = ""
+                                for prod in js_products:
+                                    ptext = prod.get("priceText", "") or prod.get("text", "")
+                                    p = _parse_price(ptext)
+                                    if not p:
+                                        # テキスト全体から価格抽出
+                                        p = _parse_price(prod.get("text", ""))
+                                    if not p or p > 99_999_999:
+                                        continue
+                                    pname = prod.get("text", "")[:100]
+                                    if query and not _is_relevant_product(query, pname):
+                                        continue
+                                    if best_price is None or p < best_price:
+                                        best_price = p
+                                        best_name = pname
+                                        best_url = prod.get("href", "")
+                                if best_price:
+                                    results[idx] = ShopPrice(r.shop_name, best_price, best_name, best_url, r.search_url)
+                                    logger.info("Browser retry success (JS): %s = ¥%s (%s)",
+                                                r.shop_name, f"{best_price:,}", best_name[:50])
+                                else:
+                                    logger.info("Browser retry: Qoo10 JS found %d items but no matching price",
+                                                len(js_products))
+                            else:
+                                logger.info("Browser retry: no price found for %s (HTML %d chars)",
+                                            r.shop_name, len(html))
+                        except Exception as js_err:
+                            logger.debug("Qoo10 JS extraction failed: %s", js_err)
+                            logger.info("Browser retry: no price found for %s (HTML %d chars)",
+                                        r.shop_name, len(html))
                     else:
                         logger.info("Browser retry: no price found for %s (HTML %d chars)",
                                     r.shop_name, len(html))
