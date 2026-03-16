@@ -2382,6 +2382,14 @@ def get_manual_search_shops() -> list[str]:
 
 # ショップ別の追加CSSセレクタ（Phase 2で使用）
 _SHOP_SPECIFIC_SELECTORS: dict[str, list[tuple[str, str, str]]] = {
+    "Amazon.co.jp": [
+        ('[data-component-type="s-search-result"]',
+         ".a-price .a-price-whole",
+         "h2 a span, h2 span, h2 a, .a-text-normal"),
+        ('[data-component-type="s-search-result"]',
+         ".a-price .a-offscreen",
+         'span[class*="a-size-medium"], span[class*="a-size-base-plus"]'),
+    ],
     "ビックカメラ.com": [
         (".bcs_listItem", ".bcs_price", ".bcs_title a"),
         (".prod_box", ".val", ".prod_name a"),
@@ -2439,6 +2447,7 @@ _SHOP_SPECIFIC_SELECTORS: dict[str, list[tuple[str, str, str]]] = {
 
 # Phase 2で待機するCSSセレクタ（SPA描画完了の判定）
 _SHOP_WAIT_SELECTORS: dict[str, str] = {
+    "Amazon.co.jp": '[data-component-type="s-search-result"], .s-result-item, .s-main-slot',
     "ビックカメラ.com": ".bcs_listItem, .prod_box, [class*='product']",
     "コジマネット": ".product-list-item, .itemBox, [class*='product']",
     "ヤマダウェブコム": ".searchResult__item, .product, [class*='product']",
@@ -2703,6 +2712,65 @@ def _retry_with_browser(results: list[ShopPrice], query: str) -> None:
                         results[idx] = ShopPrice(r.shop_name, price, name, url, r.search_url)
                         logger.info("Browser retry success: %s = ¥%s (%s)",
                                     r.shop_name, f"{price:,}", name[:50])
+                    elif r.shop_name == "Amazon.co.jp":
+                        # Amazon SPA fallback: JS評価で直接DOM内の検索結果を取得
+                        try:
+                            js_products = page.evaluate("""
+                                () => {
+                                    const items = document.querySelectorAll(
+                                        '[data-component-type="s-search-result"]');
+                                    return Array.from(items).slice(0, 20).map(el => {
+                                        // スポンサー商品を除外
+                                        const sponsor = el.querySelector('.s-label-popover-default');
+                                        if (sponsor && sponsor.textContent.includes('スポンサー')) {
+                                            return null;
+                                        }
+                                        const priceEl = el.querySelector('.a-price .a-price-whole')
+                                            || el.querySelector('.a-price .a-offscreen');
+                                        const nameEl = el.querySelector('h2 a span')
+                                            || el.querySelector('h2 span')
+                                            || el.querySelector('h2 a')
+                                            || el.querySelector('.a-text-normal');
+                                        const linkEl = el.querySelector('h2 a');
+                                        const imgEl = el.querySelector('img.s-image');
+                                        return {
+                                            text: (nameEl ? nameEl.textContent.trim() : '')
+                                                || (imgEl ? imgEl.alt || '' : ''),
+                                            href: linkEl ? linkEl.href : '',
+                                            priceText: priceEl ? priceEl.textContent.trim() : '',
+                                        };
+                                    }).filter(x => x !== null);
+                                }
+                            """)
+                            if js_products:
+                                best_price = None
+                                best_name = ""
+                                best_url = ""
+                                for prod in js_products:
+                                    p = _parse_price(prod.get("priceText", ""))
+                                    if not p or p > 99_999_999:
+                                        continue
+                                    pname = prod.get("text", "")[:200]
+                                    if query and pname and not _is_relevant_product(query, pname):
+                                        continue
+                                    if best_price is None or p < best_price:
+                                        best_price = p
+                                        best_name = pname
+                                        best_url = prod.get("href", "")
+                                if best_price:
+                                    results[idx] = ShopPrice(r.shop_name, best_price, best_name, best_url, r.search_url)
+                                    logger.info("Browser retry success (JS): %s = ¥%s (%s)",
+                                                r.shop_name, f"{best_price:,}", best_name[:50])
+                                else:
+                                    logger.info("Browser retry: Amazon JS found %d items but no matching price",
+                                                len(js_products))
+                            else:
+                                logger.info("Browser retry: no price found for %s (HTML %d chars)",
+                                            r.shop_name, len(html))
+                        except Exception as js_err:
+                            logger.debug("Amazon JS extraction failed: %s", js_err)
+                            logger.info("Browser retry: no price found for %s (HTML %d chars)",
+                                        r.shop_name, len(html))
                     elif r.shop_name == "Qoo10":
                         # Qoo10 SPA fallback: JS評価で直接DOM内の商品データを取得
                         try:
