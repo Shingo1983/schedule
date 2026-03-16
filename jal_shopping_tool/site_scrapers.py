@@ -2044,8 +2044,10 @@ def search_amazon(query: str, _config: Config) -> ShopPrice:
                                 img = result.select_one("img.s-image")
                                 if img and img.get("alt"):
                                     n = img["alt"]
-                            # 簡略クエリの元クエリに対する関連性チェック
-                            if n and not _is_relevant_product(query, n):
+                            # 簡略クエリに対する関連性チェック（元クエリでは厳しすぎる）
+                            if n and not _is_relevant_product(simplified, n):
+                                logger.info("Amazon retry rejected: '%s' (¥%s)",
+                                            n[:80], f"{p:,}")
                                 continue
                             link_el = result.select_one("h2 a")
                             u = ""
@@ -2592,6 +2594,146 @@ def _get_selectors_for_shop(shop_name: str) -> list[tuple[str, str, str]]:
     ]
 
 
+def _try_amazon_js(page, results: list, idx: int, r, query: str) -> bool:
+    """Amazon Phase 2 JS抽出（個別商品の関連性チェック付き）"""
+    try:
+        js_products = page.evaluate("""
+            () => {
+                const items = document.querySelectorAll(
+                    '[data-component-type="s-search-result"]');
+                return Array.from(items).slice(0, 20).map(el => {
+                    const sponsor = el.querySelector('.s-label-popover-default');
+                    if (sponsor && sponsor.textContent.includes('スポンサー')) return null;
+                    const priceEl = el.querySelector('.a-price .a-price-whole')
+                        || el.querySelector('.a-price .a-offscreen');
+                    const nameEl = el.querySelector('h2 a span')
+                        || el.querySelector('h2 span') || el.querySelector('h2 a')
+                        || el.querySelector('.a-text-normal');
+                    const linkEl = el.querySelector('h2 a');
+                    const imgEl = el.querySelector('img.s-image');
+                    return {
+                        text: (nameEl ? nameEl.textContent.trim() : '')
+                            || (imgEl ? imgEl.alt || '' : ''),
+                        href: linkEl ? linkEl.href : '',
+                        priceText: priceEl ? priceEl.textContent.trim() : '',
+                    };
+                }).filter(x => x !== null);
+            }
+        """)
+        if not js_products:
+            return False
+        # 簡略クエリで関連性チェック（元クエリは厳しすぎる）
+        check_query = _simplify_query(query) or query
+        best_price = None
+        best_name = ""
+        best_url = ""
+        for prod in js_products:
+            p = _parse_price(prod.get("priceText", ""))
+            if not p or p > 99_999_999:
+                continue
+            pname = prod.get("text", "")[:200]
+            if check_query and pname and not _is_relevant_product(check_query, pname):
+                if best_price is None:
+                    logger.info("Amazon JS rejected: '%s' (¥%s)", pname[:80], f"{p:,}")
+                continue
+            if best_price is None or p < best_price:
+                best_price = p
+                best_name = pname
+                best_url = prod.get("href", "")
+        if best_price:
+            results[idx] = ShopPrice(r.shop_name, best_price, best_name, best_url, r.search_url)
+            logger.info("Browser retry success (JS): %s = ¥%s (%s)",
+                        r.shop_name, f"{best_price:,}", best_name[:50])
+            return True
+        logger.info("Browser retry: Amazon JS found %d items but no matching price",
+                    len(js_products))
+        return False
+    except Exception as js_err:
+        logger.debug("Amazon JS extraction failed: %s", js_err)
+        return False
+
+
+def _try_qoo10_js(page, results: list, idx: int, r, query: str) -> bool:
+    """Qoo10 Phase 2 JS抽出（個別商品の関連性チェック付き）"""
+    try:
+        js_products = page.evaluate("""
+            () => {
+                const selectors = [
+                    '[data-gd-no]',
+                    '.sc-prd', '.item_g', '.goods_item',
+                    '[class*="SearchResult"] [class*="item"]',
+                    '[class*="goods"]',
+                    '[class*="product-card"]', '[class*="ProductCard"]',
+                ];
+                let items = [];
+                for (const sel of selectors) {
+                    const found = document.querySelectorAll(sel);
+                    if (found.length > 0 && found.length < 200) {
+                        items = Array.from(found);
+                        break;
+                    }
+                }
+                if (items.length === 0) {
+                    const priceEls = document.querySelectorAll(
+                        '[class*="price"], [class*="prc"], [class*="Price"]');
+                    for (const el of Array.from(priceEls).slice(0, 30)) {
+                        let parent = el.parentElement;
+                        for (let i = 0; i < 5 && parent; i++) {
+                            const link = parent.querySelector('a[href]');
+                            if (link && link.href && parent.textContent.length < 500) {
+                                items.push(parent);
+                                break;
+                            }
+                            parent = parent.parentElement;
+                        }
+                    }
+                }
+                return items.slice(0, 20).map(el => {
+                    const link = el.querySelector('a[href]');
+                    const priceEl = el.querySelector(
+                        '[class*="price"], [class*="prc"], [class*="Price"]');
+                    return {
+                        text: el.textContent.replace(/\\s+/g, ' ').trim().substring(0, 300),
+                        href: link ? link.href : '',
+                        priceText: priceEl ? priceEl.textContent.trim() : '',
+                    };
+                });
+            }
+        """)
+        if not js_products:
+            return False
+        # 簡略クエリで関連性チェック
+        check_query = _simplify_query(query) or query
+        best_price = None
+        best_name = ""
+        best_url = ""
+        for prod in js_products:
+            ptext = prod.get("priceText", "") or prod.get("text", "")
+            p = _parse_price(ptext)
+            if not p:
+                p = _parse_price(prod.get("text", ""))
+            if not p or p > 99_999_999:
+                continue
+            pname = prod.get("text", "")[:100]
+            if check_query and not _is_relevant_product(check_query, pname):
+                continue
+            if best_price is None or p < best_price:
+                best_price = p
+                best_name = pname
+                best_url = prod.get("href", "")
+        if best_price:
+            results[idx] = ShopPrice(r.shop_name, best_price, best_name, best_url, r.search_url)
+            logger.info("Browser retry success (JS): %s = ¥%s (%s)",
+                        r.shop_name, f"{best_price:,}", best_name[:50])
+            return True
+        logger.info("Browser retry: Qoo10 JS found %d items but no matching price",
+                    len(js_products))
+        return False
+    except Exception as js_err:
+        logger.debug("Qoo10 JS extraction failed: %s", js_err)
+        return False
+
+
 def _retry_with_browser(results: list[ShopPrice], query: str) -> None:
     """Phase 2: Playwright ブラウザレンダリングで失敗したショップを再試行
 
@@ -2829,159 +2971,27 @@ def _retry_with_browser(results: list[ShopPrice], query: str) -> None:
 
                     selectors = _get_selectors_for_shop(r.shop_name)
                     base = f"{urlparse(r.search_url).scheme}://{urlparse(r.search_url).netloc}"
-                    price, name, url = _find_price_in_soup(soup, selectors, base, query=query)
-                    if price:
-                        results[idx] = ShopPrice(r.shop_name, price, name, url, r.search_url)
-                        logger.info("Browser retry success: %s = ¥%s (%s)",
-                                    r.shop_name, f"{price:,}", name[:50])
-                    elif r.shop_name == "Amazon.co.jp":
-                        # Amazon SPA fallback: JS評価で直接DOM内の検索結果を取得
-                        try:
-                            js_products = page.evaluate("""
-                                () => {
-                                    const items = document.querySelectorAll(
-                                        '[data-component-type="s-search-result"]');
-                                    return Array.from(items).slice(0, 20).map(el => {
-                                        // スポンサー商品を除外
-                                        const sponsor = el.querySelector('.s-label-popover-default');
-                                        if (sponsor && sponsor.textContent.includes('スポンサー')) {
-                                            return null;
-                                        }
-                                        const priceEl = el.querySelector('.a-price .a-price-whole')
-                                            || el.querySelector('.a-price .a-offscreen');
-                                        const nameEl = el.querySelector('h2 a span')
-                                            || el.querySelector('h2 span')
-                                            || el.querySelector('h2 a')
-                                            || el.querySelector('.a-text-normal');
-                                        const linkEl = el.querySelector('h2 a');
-                                        const imgEl = el.querySelector('img.s-image');
-                                        return {
-                                            text: (nameEl ? nameEl.textContent.trim() : '')
-                                                || (imgEl ? imgEl.alt || '' : ''),
-                                            href: linkEl ? linkEl.href : '',
-                                            priceText: priceEl ? priceEl.textContent.trim() : '',
-                                        };
-                                    }).filter(x => x !== null);
-                                }
-                            """)
-                            if js_products:
-                                best_price = None
-                                best_name = ""
-                                best_url = ""
-                                for prod in js_products:
-                                    p = _parse_price(prod.get("priceText", ""))
-                                    if not p or p > 99_999_999:
-                                        continue
-                                    pname = prod.get("text", "")[:200]
-                                    if query and pname and not _is_relevant_product(query, pname):
-                                        if best_price is None:
-                                            logger.info("Amazon JS rejected: '%s' (¥%s)",
-                                                        pname[:80], f"{p:,}")
-                                        continue
-                                    if best_price is None or p < best_price:
-                                        best_price = p
-                                        best_name = pname
-                                        best_url = prod.get("href", "")
-                                if best_price:
-                                    results[idx] = ShopPrice(r.shop_name, best_price, best_name, best_url, r.search_url)
-                                    logger.info("Browser retry success (JS): %s = ¥%s (%s)",
-                                                r.shop_name, f"{best_price:,}", best_name[:50])
-                                else:
-                                    logger.info("Browser retry: Amazon JS found %d items but no matching price",
-                                                len(js_products))
-                            else:
-                                logger.info("Browser retry: no price found for %s (HTML %d chars)",
-                                            r.shop_name, len(html))
-                        except Exception as js_err:
-                            logger.debug("Amazon JS extraction failed: %s", js_err)
-                            logger.info("Browser retry: no price found for %s (HTML %d chars)",
-                                        r.shop_name, len(html))
+
+                    # === SPA優先: Amazon/Qoo10はJS抽出を先に試行 ===
+                    # 汎用抽出（_find_price_in_soup）は最安値を返すが、SPAサイトでは
+                    # 無関係な安い商品を拾いやすい。JS抽出は個別商品の関連性チェック付き。
+                    js_extracted = False
+
+                    if r.shop_name == "Amazon.co.jp":
+                        js_extracted = _try_amazon_js(page, results, idx, r, query)
                     elif r.shop_name == "Qoo10":
-                        # Qoo10 SPA fallback: JS評価で直接DOM内の商品データを取得
-                        try:
-                            js_products = page.evaluate("""
-                                () => {
-                                    // 幅広いセレクタで商品要素を探す
-                                    const selectors = [
-                                        '[data-gd-no]',
-                                        '.sc-prd', '.item_g', '.goods_item',
-                                        '[class*="SearchResult"] [class*="item"]',
-                                        '[class*="goods"]',
-                                        '[class*="product-card"]',
-                                        '[class*="ProductCard"]',
-                                    ];
-                                    let items = [];
-                                    for (const sel of selectors) {
-                                        const found = document.querySelectorAll(sel);
-                                        if (found.length > 0 && found.length < 200) {
-                                            items = Array.from(found);
-                                            break;
-                                        }
-                                    }
-                                    if (items.length === 0) {
-                                        // 最終手段: 価格要素から親をたどる
-                                        const priceEls = document.querySelectorAll(
-                                            '[class*="price"], [class*="prc"], [class*="Price"]');
-                                        for (const el of Array.from(priceEls).slice(0, 30)) {
-                                            let parent = el.parentElement;
-                                            for (let i = 0; i < 5 && parent; i++) {
-                                                const link = parent.querySelector('a[href]');
-                                                if (link && link.href && parent.textContent.length < 500) {
-                                                    items.push(parent);
-                                                    break;
-                                                }
-                                                parent = parent.parentElement;
-                                            }
-                                        }
-                                    }
-                                    return items.slice(0, 20).map(el => {
-                                        const link = el.querySelector('a[href]');
-                                        const priceEl = el.querySelector(
-                                            '[class*="price"], [class*="prc"], [class*="Price"]');
-                                        return {
-                                            text: el.textContent.replace(/\\s+/g, ' ').trim().substring(0, 300),
-                                            href: link ? link.href : '',
-                                            priceText: priceEl ? priceEl.textContent.trim() : '',
-                                        };
-                                    });
-                                }
-                            """)
-                            if js_products:
-                                best_price = None
-                                best_name = ""
-                                best_url = ""
-                                for prod in js_products:
-                                    ptext = prod.get("priceText", "") or prod.get("text", "")
-                                    p = _parse_price(ptext)
-                                    if not p:
-                                        # テキスト全体から価格抽出
-                                        p = _parse_price(prod.get("text", ""))
-                                    if not p or p > 99_999_999:
-                                        continue
-                                    pname = prod.get("text", "")[:100]
-                                    if query and not _is_relevant_product(query, pname):
-                                        continue
-                                    if best_price is None or p < best_price:
-                                        best_price = p
-                                        best_name = pname
-                                        best_url = prod.get("href", "")
-                                if best_price:
-                                    results[idx] = ShopPrice(r.shop_name, best_price, best_name, best_url, r.search_url)
-                                    logger.info("Browser retry success (JS): %s = ¥%s (%s)",
-                                                r.shop_name, f"{best_price:,}", best_name[:50])
-                                else:
-                                    logger.info("Browser retry: Qoo10 JS found %d items but no matching price",
-                                                len(js_products))
-                            else:
-                                logger.info("Browser retry: no price found for %s (HTML %d chars)",
-                                            r.shop_name, len(html))
-                        except Exception as js_err:
-                            logger.debug("Qoo10 JS extraction failed: %s", js_err)
+                        js_extracted = _try_qoo10_js(page, results, idx, r, query)
+
+                    if not js_extracted:
+                        # 汎用抽出（CSS + JSON-LD + fulltext）
+                        price, name, url = _find_price_in_soup(soup, selectors, base, query=query)
+                        if price:
+                            results[idx] = ShopPrice(r.shop_name, price, name, url, r.search_url)
+                            logger.info("Browser retry success: %s = ¥%s (%s)",
+                                        r.shop_name, f"{price:,}", name[:50])
+                        else:
                             logger.info("Browser retry: no price found for %s (HTML %d chars)",
                                         r.shop_name, len(html))
-                    else:
-                        logger.info("Browser retry: no price found for %s (HTML %d chars)",
-                                    r.shop_name, len(html))
 
                 except Exception as e:
                     import traceback
@@ -3109,8 +3119,9 @@ def search_all_shops(query: str, config: Config) -> list[ShopPrice]:
                         result = future.result(timeout=_TIMEOUT + 10)
                         if result.price is not None:
                             # 元クエリに対する関連性チェック
+                            # 簡略クエリで関連性チェック（元クエリの全キーワードは不要）
                             if (result.product_name
-                                    and _is_relevant_product(query, result.product_name)):
+                                    and _is_relevant_product(simplified_query, result.product_name)):
                                 results[idx] = result
                                 logger.info("Phase1.5 OK: %s = ¥%s (%s)",
                                             name, f"{result.price:,}",
