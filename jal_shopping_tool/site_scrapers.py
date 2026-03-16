@@ -1002,10 +1002,14 @@ _KEYWORD_KATAKANA_MAP: dict[str, list[str]] = {
     "toshiba": ["東芝"],
     "hitachi": ["日立"],
     # コスメ・美容
-    "serum": ["セラム"],
+    "serum": ["セラム", "美容液"],
+    "セラム": ["美容液", "serum", "essence", "エッセンス"],
+    "美容液": ["セラム", "serum", "エッセンス"],
     "cream": ["クリーム"],
-    "lotion": ["ローション"],
-    "essence": ["エッセンス"],
+    "lotion": ["ローション", "化粧水"],
+    "化粧水": ["ローション", "lotion", "トナー"],
+    "essence": ["エッセンス", "美容液", "セラム"],
+    "エッセンス": ["美容液", "セラム", "essence"],
     "moisturizer": ["モイスチャライザー"],
     "cleanser": ["クレンザー"],
     "toner": ["トナー", "トーナー"],
@@ -1172,9 +1176,11 @@ def _extract_price_by_fulltext(soup: BeautifulSoup, query: str,
                         break
                 if found_outside_echo:
                     match_count += 1
-        # キーワードの過半数一致を要求（大きいページでは緩和）
+        # キーワードの一致数を要求（キーワード数・ページサイズに応じて緩和）
         if len(full_text) > 100000:
             required = max(1, (len(keywords) + 1) // 2)  # 過半数
+        elif len(keywords) >= 5:
+            required = max(2, len(keywords) - 2)  # 5+キーワード: 2つまで欠落許容
         else:
             required = max(1, len(keywords) - 1)  # ほぼ全キーワード
         if match_count >= required:
@@ -1223,7 +1229,12 @@ def _extract_price_by_fulltext(soup: BeautifulSoup, query: str,
                 variants = [kw] + _KEYWORD_KATAKANA_MAP.get(kw, [])
                 if any(v.lower() in ctx for v in variants):
                     mc += 1
-            req = max(1, (len(keywords) + 1) // 2) if len(full_text) > 100000 else max(1, len(keywords) - 1)
+            if len(full_text) > 100000:
+                req = max(1, (len(keywords) + 1) // 2)
+            elif len(keywords) >= 5:
+                req = max(2, len(keywords) - 2)
+            else:
+                req = max(1, len(keywords) - 1)
             if mc < req:
                 kw_fail += 1
                 # 先頭のみ詳細ログ
