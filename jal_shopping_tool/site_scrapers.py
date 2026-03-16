@@ -217,6 +217,11 @@ def _detect_product_genres(query: str) -> set[str]:
             "マスカラ", "アイシャドウ", "コスメ", "化粧品", "スキンケア",
             "シャンプー", "トリートメント", "ボディソープ", "日焼け止め",
             "クレンジング", "洗顔",
+            # コスメブランド・成分名
+            "セラム", "serum", "クリーム", "ローション", "エッセンス",
+            "レチノール", "ヒアルロン", "ナイアシンアミド", "ビタミンc",
+            "スキンシューティカルズ", "skinceuticals", "ランコム", "クリニーク",
+            "エスティ", "資生堂", "フェルリック", "ferulic",
         ]),
         ("health", [
             "サプリメント", "ビタミン", "プロテイン", "青汁", "乳酸菌",
@@ -403,8 +408,10 @@ def _is_relevant_product(query: str, product_name: str) -> bool:
     if _q_normalized and _n_normalized:
         # 商品名がクエリとほぼ同じ（前後の装飾文字程度の差）→ エコーバック
         if (_n_normalized == _q_normalized
-                or _n_normalized.startswith(_q_normalized)
-                and len(_n_normalized) - len(_q_normalized) < 10):
+                or (_n_normalized.startswith(_q_normalized)
+                    and len(_n_normalized) - len(_q_normalized) < 10)
+                or (_q_normalized in _n_normalized
+                    and len(_n_normalized) - len(_q_normalized) < 15)):
             return False
 
     # === キーワードマッチ（先にチェック — 無関係商品を先に弾く） ===
@@ -1077,6 +1084,21 @@ def _extract_price_by_fulltext(soup: BeautifulSoup, query: str,
 
     full_text_lower = full_text.lower()
 
+    # === 検索クエリエコーバック領域を特定 ===
+    # 検索結果ページでは「〇〇の検索結果」等の見出しにクエリが表示される。
+    # この領域のキーワードを商品名と誤認しないよう、エコー位置を記録する。
+    _q_normalized_ft = re.sub(r'[\s　\-/／]+', '', query_lower)
+    _echo_zones: list[tuple[int, int]] = []  # (start, end) of query echo regions
+    if _q_normalized_ft and len(_q_normalized_ft) >= 6:
+        # full_text_lower内で、クエリの正規化版が出現する位置を検出
+        # スペースを許容するパターンを構築（各文字間にオプションのスペース）
+        _echo_pat_chars = []
+        for ch in _q_normalized_ft:
+            _echo_pat_chars.append(re.escape(ch))
+        _echo_pat = r'[\s　]*'.join(_echo_pat_chars)
+        for _em in re.finditer(_echo_pat, full_text_lower):
+            _echo_zones.append((_em.start(), _em.end()))
+
     # 価格パターンを全テキストから検索（カンマあり/なし両対応）
     price_pattern = re.compile(
         r'[¥￥]\s*([\d,]+)'           # ¥39,800 or ¥39800
@@ -1115,17 +1137,40 @@ def _extract_price_by_fulltext(soup: BeautifulSoup, query: str,
         context = full_text_lower[start:end]
 
         # カタカナ展開込みでキーワードマッチ（双方向: 英語→カタカナ、カタカナ→英語）
+        # ただしエコーバック領域内のみでマッチするキーワードは除外
         match_count = 0
         for kw in keywords:
             # 1-2文字の数字キーワードはワードバウンダリでマッチ
             if kw.isdigit() and len(kw) <= 2:
                 pattern = r'(?<![a-zA-Z0-9])' + re.escape(kw) + r'(?![0-9])'
-                if re.search(pattern, full_text[start:end], re.IGNORECASE):
+                found_outside_echo = False
+                for _dm in re.finditer(pattern, full_text[start:end], re.IGNORECASE):
+                    abs_pos = start + _dm.start()
+                    if not any(ez[0] <= abs_pos < ez[1] for ez in _echo_zones):
+                        found_outside_echo = True
+                        break
+                if found_outside_echo:
                     match_count += 1
             else:
                 # 元キーワード自体 or カタカナ変換 or 逆引き英語 のいずれかが存在すればOK
                 variants = [kw] + _KEYWORD_KATAKANA_MAP.get(kw, []) + _KEYWORD_REVERSE_MAP.get(kw, [])
-                if any(v.lower() in context for v in variants):
+                found_outside_echo = False
+                for v in variants:
+                    v_lower = v.lower()
+                    # context内の全出現位置をチェック
+                    search_start = 0
+                    while True:
+                        pos = context.find(v_lower, search_start)
+                        if pos < 0:
+                            break
+                        abs_pos = start + pos
+                        if not any(ez[0] <= abs_pos < ez[1] for ez in _echo_zones):
+                            found_outside_echo = True
+                            break
+                        search_start = pos + 1
+                    if found_outside_echo:
+                        break
+                if found_outside_echo:
                     match_count += 1
         # キーワードの過半数一致を要求（大きいページでは緩和）
         if len(full_text) > 100000:
