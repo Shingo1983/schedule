@@ -376,6 +376,24 @@ def _is_relevant_product(query: str, product_name: str) -> bool:
     name_lower = product_name.lower()
     query_lower = query.lower()
 
+    # === 非商品ページ除外（FAQ・ヘルプ・お問い合わせ等） ===
+    # 検索結果がない場合にFAQやヘルプページを返すサイト対策
+    _NON_PRODUCT_PATTERNS = [
+        r'お問い合わせ',
+        r'よくある質問',
+        r'ヘルプ',
+        r'(?:ご利用|使い方)\s*ガイド',
+        r'カスタマーサービス',
+        r'サポート(?:ページ|センター)',
+        r'FAQ',
+        r'\bhelp\b',
+        r'\bcontact\b',
+        r'\bsupport\b',
+    ]
+    for pattern in _NON_PRODUCT_PATTERNS:
+        if re.search(pattern, name_lower, re.IGNORECASE):
+            return False
+
     # === キーワードマッチ（先にチェック — 無関係商品を先に弾く） ===
     stop_words = {"the", "a", "an", "and", "or", "in", "on", "at", "to", "for",
                   "no", "の", "に", "を", "は", "が", "と", "で", "も", "から", "まで"}
@@ -1017,12 +1035,13 @@ def _extract_price_by_fulltext(soup: BeautifulSoup, query: str,
 
         # 非商品価格の除外（送料閾値、ポイント、配送料など）
         narrow_price_ctx = full_text_lower[max(0, m.start() - 60):min(len(full_text_lower), m.end() + 60)]
-        _NON_PRODUCT_PATTERNS = [
+        _NON_PRODUCT_PATTERNS_FULLTEXT = [
             r'配送料', r'送料', r'以上で.*無料', r'以上で.*負担',
             r'ポイント', r'point', r'還元', r'付与',
             r'off\b', r'割引', r'クーポン', r'coupon',
+            r'お問い合わせ', r'よくある質問', r'ヘルプ', r'FAQ',
         ]
-        if any(re.search(p, narrow_price_ctx) for p in _NON_PRODUCT_PATTERNS):
+        if any(re.search(p, narrow_price_ctx) for p in _NON_PRODUCT_PATTERNS_FULLTEXT):
             continue
 
         # 価格の前後の文字数はページサイズに応じて調整
@@ -1217,12 +1236,13 @@ def _extract_price_from_raw_html(html: str, query: str,
 
         # 非商品価格の除外（送料閾値、ポイント、配送料など）
         narrow_ctx = html_lower[max(0, m.start() - 100):min(len(html_lower), m.end() + 100)]
-        _NON_PRODUCT_PATTERNS = [
+        _NON_PRODUCT_PATTERNS_HTML = [
             r'配送料', r'送料', r'以上で.*無料', r'以上で.*負担',
             r'ポイント', r'point', r'還元', r'付与',
             r'off\b', r'割引', r'クーポン', r'coupon',
+            r'お問い合わせ', r'よくある質問', r'ヘルプ', r'FAQ',
         ]
-        is_non_product = any(re.search(p, narrow_ctx) for p in _NON_PRODUCT_PATTERNS)
+        is_non_product = any(re.search(p, narrow_ctx) for p in _NON_PRODUCT_PATTERNS_HTML)
         if is_non_product:
             continue
 
