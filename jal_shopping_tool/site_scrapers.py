@@ -49,6 +49,51 @@ def _normalize_query(query: str) -> str:
     q = re.sub(r'\s+', ' ', q).strip()
     return q
 
+
+# 検索クエリ簡略化用: サイズ/容量/一般製品タイプ語を除去してコアキーワードのみ残す
+_GENERIC_PRODUCT_TERMS = {
+    # 日本語: コスメ・美容の一般用語
+    'セラム', '美容液', '化粧水', 'クリーム', 'ローション', '乳液',
+    'エッセンス', 'トナー', 'ミスト', 'オイル', 'バーム', 'パック',
+    'マスク', 'クレンジング', '洗顔', 'シャンプー', '美白',
+    # 英語
+    'serum', 'cream', 'lotion', 'toner', 'essence', 'moisturizer',
+    'cleanser', 'mask', 'oil', 'mist', 'balm',
+}
+_SIZE_PATTERN = re.compile(
+    r'^\d+\s*(?:ml|g|kg|l|oz|fl\.?\s*oz|mg|mcg|cc|本|個|枚|包|袋|箱)$',
+    re.IGNORECASE)
+
+
+def _simplify_query(query: str) -> str | None:
+    """検索クエリを簡略化（サイズ・容量・一般的な製品タイプを除去）
+
+    長いクエリで検索結果が得られない場合のリトライ用。
+    ブランド名・製品固有名詞のみを残す。
+
+    例: "スキンシューティカルズ CE フェルリック セラム 30ml"
+      → "スキンシューティカルズ CE フェルリック"
+    """
+    words = re.split(r'[\s　]+', query)
+    if len(words) <= 2:
+        return None  # 既に十分短い
+
+    core_words = []
+    for w in words:
+        if _SIZE_PATTERN.match(w):
+            continue
+        if w.lower() in _GENERIC_PRODUCT_TERMS or w in _GENERIC_PRODUCT_TERMS:
+            continue
+        core_words.append(w)
+
+    if not core_words or len(core_words) >= len(words):
+        return None  # 削減できなかった
+
+    simplified = ' '.join(core_words)
+    if len(simplified) < 3:
+        return None
+    return simplified
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -1957,6 +2002,71 @@ def search_amazon(query: str, _config: Config) -> ShopPrice:
         if price:
             return ShopPrice("Amazon.co.jp", price, name, url, search_url)
 
+        # === 簡略クエリでリトライ ===
+        # 長いクエリで関連商品が見つからない場合、サイズ/一般語を除いて再検索
+        simplified = _simplify_query(query)
+        if simplified:
+            logger.info("Amazon: retrying with simplified query '%s'", simplified)
+            retry_url = f"https://www.amazon.co.jp/s?k={quote(simplified)}"
+            try:
+                resp2 = _fetch(retry_url)
+                if resp2.status_code == 200:
+                    soup2 = _soup(resp2)
+                    if not _is_bot_blocked_page(soup2):
+                        retry_results = soup2.select('[data-component-type="s-search-result"]')
+                        logger.info("Amazon retry: found %d search results", len(retry_results))
+                        retry_candidates = []
+                        for result in retry_results:
+                            sponsored = result.select_one('.s-label-popover-default')
+                            if sponsored and 'スポンサー' in sponsored.get_text():
+                                continue
+                            price_whole = result.select_one(".a-price .a-price-whole")
+                            if not price_whole:
+                                continue
+                            p = _parse_price(price_whole.get_text())
+                            if not p:
+                                continue
+                            n = ""
+                            for name_sel in ["h2 a span", "h2 span", "h2 a",
+                                             ".a-text-normal",
+                                             'span[class*="a-size-medium"]',
+                                             'span[class*="a-size-base-plus"]']:
+                                title_el = result.select_one(name_sel)
+                                if title_el:
+                                    n = title_el.get_text(strip=True)
+                                    if n:
+                                        break
+                            if not n:
+                                h2 = result.select_one("h2")
+                                if h2:
+                                    n = h2.get_text(strip=True)
+                            if not n:
+                                img = result.select_one("img.s-image")
+                                if img and img.get("alt"):
+                                    n = img["alt"]
+                            # 簡略クエリの元クエリに対する関連性チェック
+                            if n and not _is_relevant_product(query, n):
+                                continue
+                            link_el = result.select_one("h2 a")
+                            u = ""
+                            if link_el and link_el.get("href"):
+                                href = link_el["href"]
+                                u = f"https://www.amazon.co.jp{href}" if href.startswith("/") else href
+                            if n:
+                                retry_candidates.append((p, n, u))
+
+                        if retry_candidates:
+                            prices = sorted(c[0] for c in retry_candidates)
+                            if len(prices) >= 3:
+                                median = prices[len(prices) // 2]
+                                retry_candidates = [c for c in retry_candidates if c[0] >= median * 0.3]
+                            if retry_candidates:
+                                best = min(retry_candidates, key=lambda c: c[0])
+                                logger.info("Amazon retry OK: ¥%s (%s)", f"{best[0]:,}", best[1][:50])
+                                return ShopPrice("Amazon.co.jp", best[0], best[1], best[2], retry_url)
+            except Exception as retry_err:
+                logger.debug("Amazon retry error: %s", retry_err)
+
         return ShopPrice("Amazon.co.jp", None, "", "", search_url)
 
     except Exception as e:
@@ -2962,6 +3072,60 @@ def search_all_shops(query: str, config: Config) -> list[ShopPrice]:
 
     phase1_found = sum(1 for r in results if r.price is not None)
     logger.info("Phase 1 complete: %d/%d shops found prices", phase1_found, len(results))
+
+    # === Phase 1.5: 簡略クエリでリトライ ===
+    # 長いクエリで結果が少ない場合、サイズ/一般語を除いた短いクエリで再検索
+    simplified_query = _simplify_query(query)
+    if simplified_query and phase1_found < 4:
+        _SKIP_ERRORS_RETRY = {"APIキー", "HTTP 404", "HTTP 410", "取扱ジャンル外"}
+        scraper_map = {name: fn for fn, name in SCRAPERS}
+        retry_targets = []
+        for i, r in enumerate(results):
+            if r.price is not None:
+                continue
+            if r.error and any(s in r.error for s in _SKIP_ERRORS_RETRY):
+                continue
+            if r.shop_name in skipped_shops:
+                continue
+            # Amazon は search_amazon 内で独自にリトライ済み
+            if r.shop_name == "Amazon.co.jp":
+                continue
+            if r.shop_name in scraper_map:
+                retry_targets.append((i, r.shop_name, scraper_map[r.shop_name]))
+
+        if retry_targets:
+            logger.info("Phase 1.5: retrying %d shops with simplified query '%s'",
+                        len(retry_targets), simplified_query)
+            with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as executor:
+                future_to_info: dict = {}
+                for idx, name, fn in retry_targets:
+                    delay = random.uniform(0, 0.5)
+                    future = executor.submit(_delayed_scrape, fn, simplified_query, config, delay)
+                    future_to_info[future] = (idx, name)
+
+                for future in as_completed(future_to_info):
+                    idx, name = future_to_info[future]
+                    try:
+                        result = future.result(timeout=_TIMEOUT + 10)
+                        if result.price is not None:
+                            # 元クエリに対する関連性チェック
+                            if (result.product_name
+                                    and _is_relevant_product(query, result.product_name)):
+                                results[idx] = result
+                                logger.info("Phase1.5 OK: %s = ¥%s (%s)",
+                                            name, f"{result.price:,}",
+                                            result.product_name[:50])
+                            else:
+                                logger.info("Phase1.5 rejected: %s = ¥%s (%s) - not relevant",
+                                            name, f"{result.price:,}",
+                                            result.product_name[:50])
+                    except Exception:
+                        pass
+
+            phase15_found = sum(1 for r in results if r.price is not None)
+            if phase15_found > phase1_found:
+                logger.info("Phase 1.5 recovered %d additional shops",
+                            phase15_found - phase1_found)
 
     # === Phase 2: Playwright ブラウザレンダリング（失敗分のみ） ===
     _retry_with_browser(results, query)
