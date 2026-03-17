@@ -1,0 +1,429 @@
+{% extends "base.html" %}
+{% block title %}「{{ query }}」の検索結果 - JAL LSP ショッピング比較{% endblock %}
+
+{% block content %}
+<div class="results-header">
+    <h1>「{{ query }}」の検索結果</h1>
+    <form action="{{ url_for('search') }}" method="get" class="search-form search-form-inline">
+        <div class="search-box">
+            <input type="text" name="q" value="{{ query }}" required>
+            <button type="submit">再検索</button>
+        </div>
+    </form>
+</div>
+
+{# ショップ数の集計 #}
+{% set scraper_found = [] %}
+{% set scraper_not_found = [] %}
+{% for c in analysis.comparisons %}
+{% if c.price is not none and c.price > 0 %}
+{% if scraper_found.append(c) %}{% endif %}
+{% else %}
+{% if scraper_not_found.append(c) %}{% endif %}
+{% endif %}
+{% endfor %}
+
+<div class="card summary-card">
+    <p class="summary-text">
+        全<strong>{{ total_shop_count }}</strong>ショップ対応
+        （自動検索 <strong>{{ analysis.total_count }}</strong>件
+        ＋ 手動検索 <strong>{{ manual_shops | length }}</strong>件）
+        ・ 自動検索で価格取得 <strong>{{ scraper_found | length }}</strong>件
+        ・ 1 LSP = {{ config.lsp_value_yen }}円として計算（<a href="{{ url_for('settings') }}">変更</a>）
+    </p>
+    <p class="text-small" style="margin-top:4px">
+        {% if has_cloudscraper %}
+        <span class="status ok">cloudscraper: ON</span>
+        {% else %}
+        <span class="status ng">cloudscraper: OFF</span>
+        {% endif %}
+        &nbsp;
+        {% if has_playwright %}
+        <span class="status ok">ブラウザ描画: ON</span>
+        {% else %}
+        <span class="status ng">ブラウザ描画: OFF（<code>pip install playwright</code> → <code>playwright install chromium</code>で有効化）</span>
+        {% endif %}
+    </p>
+</div>
+
+{% if scraper_found | length == 0 %}
+<div class="card">
+    <p>自動検索ではどのショップでも商品が見つかりませんでした。下の手動検索リンクからご確認ください。</p>
+</div>
+{% else %}
+
+{# === 推奨表示 === #}
+{% if analysis.best_effective and analysis.cheapest %}
+<div class="card recommendation">
+    <h2>おすすめ</h2>
+    {% if analysis.best_effective.effective_price < analysis.cheapest.price %}
+    <div class="recommend-good">
+        <p class="recommend-title">LSP込みで「{{ analysis.best_effective.shop_name }}」が最もお得!</p>
+        <p>
+            最安値は <strong>{{ analysis.cheapest.shop_name }}</strong>（{{ analysis.cheapest.price | currency }}）ですが、
+            LSP獲得{% if analysis.best_effective.point_rebate_yen > 0 %}・ポイント還元{% endif %}を考慮すると <strong>{{ analysis.best_effective.shop_name }}</strong> の実質価格
+            <strong>{{ analysis.best_effective.effective_price | currency_float }}</strong> が最安です。
+        </p>
+        {% set savings = analysis.cheapest.price - analysis.best_effective.effective_price %}
+        {% if savings > 0 %}
+        <p class="savings">最安値より実質 {{ savings | currency_float }} お得!</p>
+        {% endif %}
+    </div>
+    {% else %}
+    <div class="recommend-neutral">
+        <p class="recommend-title">最安値: {{ analysis.cheapest.shop_name }}（{{ analysis.cheapest.price | currency }}）</p>
+        <p>
+            {{ analysis.cheapest.shop_name }}が最安値です。
+            {% if analysis.cheapest.lsp_earned > 0 %}
+            JALマイレージパーク経由で {{ analysis.cheapest.lsp_earned | format_lsp }} LSP も獲得できます。
+            {% endif %}
+        </p>
+    </div>
+    {% endif %}
+</div>
+{% endif %}
+
+{# === メイン比較テーブル（価格取得成功分） === #}
+<div class="card">
+    <h2>全ショップ比較（価格順）</h2>
+    <div class="offers-table-wrap">
+        <table class="offers-table comparison-table">
+            <thead>
+                <tr>
+                    <th class="col-rank">#</th>
+                    <th class="col-shop">ショップ</th>
+                    <th class="col-effective col-header-effective">実質価格</th>
+                    <th class="col-price">販売価格</th>
+                    <th class="col-rate">マイルレート</th>
+                    <th class="col-lsp">獲得LSP</th>
+                    <th class="col-lsp-diff">LSP差</th>
+                    <th class="col-action">リンク</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% set rank = namespace(n=0) %}
+                {% for c in analysis.comparisons %}
+                {% if c.price is not none and c.price > 0 %}
+                {% set rank.n = rank.n + 1 %}
+                <tr class="{% if c.is_cheapest %}best-row{% endif %}{% if c == analysis.best_effective and not c.is_cheapest %} effective-best-row{% endif %}">
+                    <td class="col-rank">
+                        {% if rank.n == 1 %}
+                        <span class="rank-badge rank-1">1</span>
+                        {% elif rank.n == 2 %}
+                        <span class="rank-badge rank-2">2</span>
+                        {% elif rank.n == 3 %}
+                        <span class="rank-badge rank-3">3</span>
+                        {% else %}
+                        <span class="rank-badge">{{ rank.n }}</span>
+                        {% endif %}
+                    </td>
+                    <td class="col-shop">
+                        <strong>{{ c.shop_name }}</strong>
+                        {% if c.jal_shop and c.jal_shop.note %}
+                        <br><span class="shop-note">{{ c.jal_shop.note }}</span>
+                        {% endif %}
+                    </td>
+                    <td class="col-effective effective-price-cell">
+                        {{ c.effective_price | currency_float }}
+                        {% if c.lsp_value_yen > 0 or c.point_rebate_yen > 0 %}
+                        <div class="text-muted" style="line-height:1.3">
+                            {% if c.lsp_value_yen > 0 %}LSP -{{ c.lsp_value_yen | currency_float }}{% endif %}
+                            {% if c.point_rebate_yen > 0 %}<br>{{ c.shop_name | replace("Yahoo!ショッピング","PayPay") | replace("楽天市場","楽天Pt") }} -{{ c.point_rebate_yen | currency_float }}{% endif %}
+                        </div>
+                        {% endif %}
+                    </td>
+                    <td class="col-price price-cell">
+                        {{ c.price | currency }}
+                        {% if not c.is_cheapest and c.price_diff > 0 %}
+                        <br><span class="diff-plus">+{{ c.price_diff | currency }}</span>
+                        {% elif c.is_cheapest %}
+                        <br><span class="badge badge-green">最安</span>
+                        {% endif %}
+                    </td>
+                    <td class="col-rate" style="white-space:nowrap">
+                        <span class="text-small">{{ c.mile_rate_desc }}</span>
+                        {% if c.yen_per_mile > 0 %}
+                        <br><span class="text-muted">¥{{ "{:,}".format(c.yen_per_mile * 100) }}/LSP</span>
+                        {% endif %}
+                    </td>
+                    <td class="col-lsp">
+                        <strong>{{ c.lsp_earned | format_lsp }}</strong>
+                    </td>
+                    <td class="col-lsp-diff">
+                        {% if c.lsp_diff > 0 %}
+                        <span class="diff-plus-lsp">+{{ c.lsp_diff | format_lsp }}</span>
+                        {% elif c.lsp_diff < 0 %}
+                        <span class="diff-minus-lsp">{{ c.lsp_diff | format_lsp }}</span>
+                        {% else %}
+                        -
+                        {% endif %}
+                    </td>
+                    <td class="col-action">
+                        <div class="action-links">
+                            {% if c.jal_url %}
+                            <a href="{{ c.jal_url }}" target="_blank" rel="noopener" class="btn btn-small btn-primary" title="JALマイレージパーク経由">JAL経由</a>
+                            {% endif %}
+                            <a href="{{ c.search_url }}" target="_blank" rel="noopener" class="btn btn-small btn-outline" title="ショップで検索結果を確認">確認</a>
+                        </div>
+                    </td>
+                </tr>
+                {% endif %}
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</div>
+{% endif %}
+
+{# === 自動検索で取得できなかったショップ === #}
+{% if scraper_not_found %}
+<div class="card">
+    <h2>自動検索で取得できなかったショップ（{{ scraper_not_found | length }}件）</h2>
+    <p class="text-small">以下のショップでは自動取得できませんでした。手動で価格を確認し、入力するとLSPが計算されます。</p>
+    <div class="offers-table-wrap">
+        <table class="offers-table not-found-table">
+            <thead>
+                <tr>
+                    <th>ショップ名</th>
+                    <th>マイルレート</th>
+                    <th>手動価格入力</th>
+                    <th>獲得マイル / LSP</th>
+                    <th>実質価格</th>
+                    <th>理由</th>
+                    <th>リンク</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% set normal_not_found = [] %}
+                {% set genre_not_found = [] %}
+                {% for c in scraper_not_found %}
+                    {% if c.error == '取扱ジャンル外' %}
+                        {% if genre_not_found.append(c) %}{% endif %}
+                    {% else %}
+                        {% if normal_not_found.append(c) %}{% endif %}
+                    {% endif %}
+                {% endfor %}
+                {% for c in normal_not_found + genre_not_found %}
+                <tr{% if c.error == '取扱ジャンル外' %} class="genre-excluded-row"{% endif %}>
+                    <td><strong>{{ c.shop_name }}</strong></td>
+                    <td class="text-small" style="white-space:nowrap">{{ c.mile_rate_desc }}{% if c.yen_per_mile > 0 %}<br><span class="text-muted">¥{{ "{:,}".format(c.yen_per_mile * 100) }}/LSP</span>{% endif %}</td>
+                    <td>
+                        <input type="number"
+                               class="manual-price-input"
+                               data-yen-per-mile="{{ c.jal_shop.yen_per_mile if c.jal_shop else 0 }}"
+                               data-shop-name="{{ c.shop_name }}"
+                               placeholder="例: 35000"
+                               min="0" step="1"
+                              >
+                    </td>
+                    <td class="text-small manual-calc-result" data-lsp-value="{{ config.lsp_value_yen }}">-</td>
+                    <td class="text-small manual-effective-price">-</td>
+                    <td class="text-small">
+                        {% if c.error %}{{ c.error }}{% else %}商品が見つかりませんでした{% endif %}
+                    </td>
+                    <td>
+                        <div class="action-links">
+                            {% if c.search_url %}
+                            <a href="{{ c.search_url }}" target="_blank" rel="noopener" class="btn btn-small btn-outline">手動で検索</a>
+                            {% endif %}
+                        </div>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</div>
+{% endif %}
+
+{# === 手動検索ショップ（スクレイパー未対応） === #}
+{% if manual_shops %}
+<div class="card">
+    <h2>その他の提携ショップ（{{ manual_shops | length }}件）</h2>
+    <p class="text-small">以下のJALマイレージパーク提携ショップでも手動で検索できます。</p>
+    <div class="offers-table-wrap">
+        <table class="offers-table manual-shop-table">
+            <thead>
+                <tr>
+                    <th>ショップ名</th>
+                    <th>マイルレート</th>
+                    <th>カテゴリ</th>
+                    <th>1万円購入時</th>
+                    <th>リンク</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for ms in manual_shops %}
+                <tr>
+                    <td><strong>{{ ms.name }}</strong></td>
+                    <td class="text-small" style="white-space:nowrap">{{ ms.mile_rate_desc }}<br><span class="text-muted">¥{{ "{:,}".format(ms.yen_per_mile * 100) }}/LSP</span></td>
+                    <td><span class="badge">{{ ms.category }}</span></td>
+                    <td class="text-small">
+                        {{ ms.miles_10k }}マイル / {{ ms.lsp_10k }} LSP
+                    </td>
+                    <td>
+                        <div class="action-links">
+                            {% if ms.search_url %}
+                            <a href="{{ ms.search_url }}" target="_blank" rel="noopener" class="btn btn-small btn-outline">検索する</a>
+                            {% endif %}
+                            <a href="{{ ms.jal_url }}" target="_blank" rel="noopener" class="btn btn-small btn-primary">JAL経由</a>
+                        </div>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</div>
+{% endif %}
+
+{# === 手動入力の比較結果 === #}
+<div class="card" id="manual-comparison" style="display:none">
+    <h2>手動入力の比較結果</h2>
+    <p class="text-small">上で手動入力した価格をもとに、LSPを計算した結果です。</p>
+    <div class="offers-table-wrap">
+        <table class="offers-table comparison-table">
+            <thead>
+                <tr>
+                    <th class="col-shop">ショップ</th>
+                    <th class="col-price">価格</th>
+                    <th class="col-rate">マイルレート</th>
+                    <th class="col-lsp">獲得マイル</th>
+                    <th class="col-lsp">獲得LSP</th>
+                    <th class="col-effective">実質価格</th>
+                </tr>
+            </thead>
+            <tbody id="manual-comparison-body">
+            </tbody>
+        </table>
+    </div>
+</div>
+
+{# === 各ショップの最安商品名 === #}
+{% if scraper_found %}
+<div class="card">
+    <h2>各ショップの最安商品</h2>
+    <div class="product-details">
+        {% for c in scraper_found %}
+        {% if c.product_name %}
+        <div class="product-detail-item">
+            <div class="product-detail-shop">{{ c.shop_name }}</div>
+            <div class="product-detail-name">{{ c.product_name }}</div>
+            <div class="product-detail-price">{{ c.price | currency }}</div>
+            {% if c.product_url %}
+            <a href="{{ c.product_url }}" target="_blank" rel="noopener" class="btn btn-small btn-outline">商品ページ</a>
+            {% endif %}
+        </div>
+        {% endif %}
+        {% endfor %}
+    </div>
+</div>
+{% endif %}
+
+<script>
+(function() {
+    var lspValueYen = {{ config.lsp_value_yen }};
+    var shopPointRates = {
+        'Yahoo!ショッピング': {{ config.yahoo_paypay_rate }},
+        '楽天市場': {{ config.rakuten_point_rate }}
+    };
+
+    function formatCurrency(n) {
+        return '¥' + Math.round(n).toLocaleString('ja-JP');
+    }
+
+    function getPointRate(shopName) {
+        return shopPointRates[shopName] || 0;
+    }
+
+    function updateManualCalc(input) {
+        var price = parseInt(input.value);
+        var yenPerMile = parseInt(input.dataset.yenPerMile);
+        var shopName = input.dataset.shopName;
+        var row = input.closest('tr');
+        var calcCell = row.querySelector('.manual-calc-result');
+        var effectiveCell = row.querySelector('.manual-effective-price');
+
+        if (!price || price <= 0 || !yenPerMile || yenPerMile <= 0) {
+            calcCell.textContent = '-';
+            effectiveCell.textContent = '-';
+            return;
+        }
+
+        var miles = Math.floor(price / yenPerMile);
+        var lsp = miles / 100;
+        var pointRate = getPointRate(shopName);
+        var pointRebate = price * pointRate;
+        var effectivePrice = price - (lsp * lspValueYen) - pointRebate;
+
+        calcCell.innerHTML = '<strong>' + miles + '</strong>マイル / <strong>' + lsp.toFixed(2) + '</strong> LSP';
+        var effectiveHtml = '<strong>' + formatCurrency(effectivePrice) + '</strong>';
+        if (pointRebate > 0) {
+            effectiveHtml += '<br><span class="text-muted">Pt -' + formatCurrency(pointRebate) + '</span>';
+        }
+        effectiveCell.innerHTML = effectiveHtml;
+    }
+
+    function updateComparisonTable() {
+        var inputs = document.querySelectorAll('.manual-price-input');
+        var tbody = document.getElementById('manual-comparison-body');
+        var card = document.getElementById('manual-comparison');
+        if (!tbody || !card) return;
+
+        tbody.innerHTML = '';
+        var entries = [];
+
+        inputs.forEach(function(input) {
+            var price = parseInt(input.value);
+            var yenPerMile = parseInt(input.dataset.yenPerMile);
+            if (!price || price <= 0 || !yenPerMile) return;
+
+            var shopName = input.dataset.shopName;
+            var miles = Math.floor(price / yenPerMile);
+            var lsp = miles / 100;
+            var pointRate = getPointRate(shopName);
+            var pointRebate = price * pointRate;
+            var effectivePrice = price - (lsp * lspValueYen) - pointRebate;
+            var mileRateDesc = input.closest('tr').querySelectorAll('td')[1].textContent.trim();
+
+            entries.push({
+                shopName: shopName,
+                price: price,
+                mileRateDesc: mileRateDesc,
+                miles: miles,
+                lsp: lsp,
+                effectivePrice: effectivePrice,
+                pointRebate: pointRebate
+            });
+        });
+
+        entries.sort(function(a, b) { return a.effectivePrice - b.effectivePrice; });
+
+        entries.forEach(function(e) {
+            var tr = document.createElement('tr');
+            tr.innerHTML =
+                '<td><strong>' + e.shopName + '</strong></td>' +
+                '<td class="price-cell">' + formatCurrency(e.price) + '</td>' +
+                '<td class="text-small">' + e.mileRateDesc + '</td>' +
+                '<td><strong>' + e.miles + '</strong></td>' +
+                '<td><strong>' + e.lsp.toFixed(2) + '</strong></td>' +
+                '<td><strong>' + formatCurrency(e.effectivePrice) + '</strong></td>';
+            tbody.appendChild(tr);
+        });
+
+        card.style.display = entries.length > 0 ? '' : 'none';
+    }
+
+    document.querySelectorAll('.manual-price-input').forEach(function(input) {
+        input.addEventListener('input', function() {
+            updateManualCalc(this);
+            updateComparisonTable();
+        });
+        input.addEventListener('keydown', function(e) {
+            if (e.key === 'Enter') { e.preventDefault(); this.blur(); }
+        });
+    });
+})();
+</script>
+
+{% endblock %}

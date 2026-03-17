@@ -1,0 +1,52 @@
+{% extends "base.html" %}
+{% block title %}JALマイレージパーク掲載ショップ一覧{% endblock %}
+
+{% block content %}
+<h1>JALマイレージパーク LSP対象ショップ一覧</h1>
+<p>獲得マイル100マイルにつき1 LSPとして積算されます。全{{ shops | length }}ショップ対応（自動検索 {{ auto_count }}件 ＋ 手動検索 {{ manual_count }}件）。</p>
+
+<div class="card">
+    <div class="offers-table-wrap">
+        <table class="offers-table">
+            <thead>
+                <tr>
+                    <th>ショップ名</th>
+                    <th>マイルレート</th>
+                    <th>カテゴリ</th>
+                    <th>検索方式</th>
+                    <th>1万円購入時の獲得</th>
+                    <th>JAL経由リンク</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for shop in shops %}
+                <tr>
+                    <td>
+                        <strong>{{ shop.name }}</strong>
+                        {% if shop.note %}
+                        <br><span class="shop-note">{{ shop.note }}</span>
+                        {% endif %}
+                    </td>
+                    <td style="white-space:nowrap">{{ shop.mile_rate_desc }}</td>
+                    <td><span class="badge">{{ shop.category }}</span></td>
+                    <td>
+                        {% if shop.name in scraper_names %}
+                        <span class="badge badge-green">自動</span>
+                        {% else %}
+                        <span class="badge">手動</span>
+                        {% endif %}
+                    </td>
+                    <td style="white-space:nowrap">
+                        {{ shop.calc_miles(10000) }}マイル / {{ shop.calc_lsp(10000) | format_lsp }} LSP
+                        <br><span class="text-muted">¥{{ "{:,}".format(shop.yen_per_mile * 100) }}/LSP</span>
+                    </td>
+                    <td><a href="{{ shop.url }}" target="_blank" rel="noopener" class="btn btn-small btn-outline">経由する</a></td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</div>
+
+<p class="text-small">※ レートは変更される場合があります。最新情報は<a href="https://partner.jal.co.jp/shoplist/" target="_blank" rel="noopener">JAL公式サイト</a>でご確認ください。</p>
+{% endblock %}

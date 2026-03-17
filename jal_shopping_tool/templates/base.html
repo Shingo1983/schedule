@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}JAL LSP ショッピング比較{% endblock %}</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <nav class="navbar">
+        <div class="container">
+            <a href="{{ url_for('index') }}" class="nav-brand">JAL LSP ショッピング比較</a>
+            <div class="nav-links">
+                <a href="{{ url_for('index') }}">検索</a>
+                <a href="{{ url_for('shops') }}">ショップ一覧</a>
+                <a href="{{ url_for('settings') }}">設定</a>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        {% with messages = get_flashed_messages(with_categories=true) %}
+        {% if messages %}
+        {% for category, message in messages %}
+        <div class="flash flash-{{ category }}">{{ message }}</div>
+        {% endfor %}
+        {% endif %}
+        {% endwith %}
+
+        {% block content %}{% endblock %}
+    </main>
+
+    <footer class="footer">
+        <div class="container">
+            <p>JALマイレージパーク経由のLSP獲得を考慮した価格比較ツール</p>
+            <p class="text-small">※ マイルレートは変更される場合があります。最新情報は<a href="https://partner.jal.co.jp/shoplist/" target="_blank" rel="noopener">JAL公式サイト</a>でご確認ください。</p>
+        </div>
+    </footer>
+</body>
+</html>

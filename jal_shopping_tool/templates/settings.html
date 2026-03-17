@@ -1,0 +1,104 @@
+{% extends "base.html" %}
+{% block title %}設定 - JAL LSP ショッピング比較{% endblock %}
+
+{% block content %}
+<h1>設定</h1>
+
+<form method="post" class="settings-form">
+    <div class="card">
+        <h2>楽天市場 API <span class="text-small">（任意 - なくてもスクレイピングで検索可）</span></h2>
+        <p class="text-small">APIキーを設定すると楽天市場の検索精度が向上します。</p>
+        <details class="text-small" style="margin-bottom: 1rem; cursor: pointer;">
+            <summary><strong>取得方法を見る（5分・無料）</strong></summary>
+            <ol style="margin-top: 0.5rem; line-height: 1.8;">
+                <li><a href="https://webservice.rakuten.co.jp/" target="_blank" rel="noopener">Rakuten Developers</a> を開く</li>
+                <li>楽天IDでログイン（なければ新規登録・無料）</li>
+                <li>右上の <strong>「+アプリID発行」</strong> をクリック</li>
+                <li>アプリ名: <strong>価格比較</strong>（何でもOK）</li>
+                <li>アプリURL: <strong>http://localhost</strong>（何でもOK）</li>
+                <li>許可されたWebサイト: <strong>localhost.localdomain</strong> と入力</li>
+                <li>「規約に同意して新規アプリを作成」をクリック</li>
+                <li>表示された <strong>「アプリID/デベロッパーID」</strong> をコピーして下の欄に貼り付け</li>
+            </ol>
+        </details>
+        <div class="form-group">
+            <label for="rakuten_app_id">アプリケーションID</label>
+            <input type="text" id="rakuten_app_id" name="rakuten_app_id"
+                   value="{{ config.rakuten_app_id }}"
+                   placeholder="楽天アプリケーションID">
+            <span class="status {{ 'ok' if config.rakuten_app_id else 'ng' }}">
+                {{ '設定済み' if config.rakuten_app_id else '未設定' }}
+            </span>
+        </div>
+    </div>
+
+    <div class="card">
+        <h2>Yahoo!ショッピング API <span class="text-small">（任意）</span></h2>
+        <p class="text-small">
+            Yahoo!ショッピングの価格も比較したい場合に設定します。
+        </p>
+        <details class="text-small" style="margin-bottom: 1rem; cursor: pointer;">
+            <summary><strong>取得方法を見る（5分・無料）</strong></summary>
+            <ol style="margin-top: 0.5rem; line-height: 1.8;">
+                <li><a href="https://e.developer.yahoo.co.jp/register" target="_blank" rel="noopener">Yahoo!デベロッパー アプリ登録ページ</a> を開く</li>
+                <li>Yahoo! JAPAN IDでログイン</li>
+                <li>「アプリケーションの種類」→ <strong>サーバーサイド</strong> を選択</li>
+                <li>「アプリケーション名」→ <strong>価格比較</strong>（何でもOK）</li>
+                <li>「サイトURL」→ <strong>http://localhost</strong>（何でもOK）</li>
+                <li>メールアドレスを入力</li>
+                <li>ガイドラインに同意して「確認」→「登録」</li>
+                <li>表示された <strong>「Client ID」</strong> をコピーして下の欄に貼り付け</li>
+            </ol>
+            <p>※「シークレット」は使いません。「Client ID」だけでOKです。</p>
+        </details>
+        <div class="form-group">
+            <label for="yahoo_app_id">Client ID（アプリケーションID）</label>
+            <input type="text" id="yahoo_app_id" name="yahoo_app_id"
+                   value="{{ config.yahoo_app_id }}"
+                   placeholder="Yahoo! Client ID">
+            <span class="status {{ 'ok' if config.yahoo_app_id else 'ng' }}">
+                {{ '設定済み' if config.yahoo_app_id else '未設定' }}
+            </span>
+        </div>
+    </div>
+
+    <div class="card">
+        <h2>LSP価値設定</h2>
+        <p class="text-small">
+            1 LSPあたり何円の価値があると考えますか？この値に基づいて「実質価格」を計算します。
+        </p>
+        <div class="form-group">
+            <label for="lsp_value_yen">1 LSPの価値（円）</label>
+            <input type="number" id="lsp_value_yen" name="lsp_value_yen"
+                   value="{{ config.lsp_value_yen }}"
+                   step="0.1" min="0">
+        </div>
+    </div>
+
+    <div class="card">
+        <h2>ショップ別ポイント還元率</h2>
+        <p class="text-small">
+            各ショップのポイント還元率を設定すると、実質価格にポイント還元分が加味されます。
+            ご自身のステータスに合わせて設定してください。
+        </p>
+        <div class="form-group">
+            <label for="yahoo_paypay_rate">Yahoo!ショッピング PayPay還元率（%）</label>
+            <input type="number" id="yahoo_paypay_rate" name="yahoo_paypay_rate"
+                   value="{{ (config.yahoo_paypay_rate * 100) | round(1) }}"
+                   step="0.5" min="0" max="30"
+                   style="width: 100px;">
+            <span class="text-small">%（PayPay支払いの還元率。デフォルト7.5%）</span>
+        </div>
+        <div class="form-group">
+            <label for="rakuten_point_rate">楽天市場 ポイント還元率（%）</label>
+            <input type="number" id="rakuten_point_rate" name="rakuten_point_rate"
+                   value="{{ (config.rakuten_point_rate * 100) | round(1) }}"
+                   step="0.5" min="0" max="30"
+                   style="width: 100px;">
+            <span class="text-small">%（SPU等を含む還元率。デフォルト1%）</span>
+        </div>
+    </div>
+
+    <button type="submit" class="btn btn-primary">設定を保存</button>
+</form>
+{% endblock %}

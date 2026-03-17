@@ -1,0 +1,29 @@
+# Render デプロイ設定ファイル
+# https://render.com/docs/blueprint-spec
+#
+# このファイルがあると、Renderが自動的にプロジェクトの
+# 起動方法を理解してくれる（レシピのようなもの）。
+
+services:
+  - type: web
+    name: jal-shopping-tool
+    runtime: python
+    region: singapore  # 日本から最も近いリージョン
+    plan: free         # 無料プラン
+
+    # ビルド時に実行するコマンド（初回＆コード更新時）
+    # 必要なライブラリをインストールする
+    buildCommand: pip install -r requirements.txt
+
+    # アプリ起動コマンド
+    # gunicorn = 本番用Webサーバー（start.batの代わり）
+    startCommand: gunicorn wsgi:app --bind 0.0.0.0:$PORT --workers 2 --timeout 300
+
+    # 環境変数（アプリの動作設定）
+    envVars:
+      - key: FLASK_DEBUG
+        value: "0"               # 本番なのでデバッグOFF
+      - key: PYTHON_VERSION
+        value: "3.11.11"         # Pythonのバージョン指定
+      - key: SECRET_KEY
+        generateValue: true      # セキュリティ用のランダム文字列を自動生成
