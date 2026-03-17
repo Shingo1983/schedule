@@ -196,6 +196,7 @@ _TIMEOUT = 15
 _TIMEOUT_SLOW = 30
 _SLOW_SHOPS: set[str] = {
     "ビックカメラ.com", "Joshin webショップ", "ケーズデンキオンラインショップ",
+    "セブンネットショッピング", "ノジマオンライン",
 }
 
 # 並列実行のワーカー数（各ショップは別ドメインなので並列OK）
@@ -237,23 +238,23 @@ _SHOP_CATEGORIES: dict[str, set[str]] = {
     "dショッピング": {"all"},
     "セブンネットショッピング": {"all"},
     "JAL Mall": {"all"},
-    "LOHACO": {"daily", "home"},  # 日用品メイン（電子機器なし）
+    "LOHACO": {"daily", "home", "tableware", "food"},
     # ファッション
     "ユニクロオンラインストア": {"clothing"},
     "GU オンラインストア": {"clothing"},
     "ZOZOTOWN": {"clothing", "fashion"},
     "BUYMA": {"fashion", "luxury", "clothing"},
     "ABC-MARTオンラインストア": {"shoes", "fashion"},
-    "ベルメゾンネット": {"clothing", "home"},
+    "ベルメゾンネット": {"clothing", "home", "tableware"},
     # 美容・健康
     "DHCオンラインショップ": {"beauty", "health"},
     "ファンケルオンライン": {"beauty", "health"},
     "マツモトキヨシオンラインストア": {"beauty", "health", "daily"},
     "@cosme SHOPPING": {"beauty", "cosmetics"},
     "iHerb": {"health", "supplements"},
-    # インテリア・家具
-    "ニトリネット": {"furniture", "home"},
-    "無印良品ネットストア": {"home", "clothing", "daily"},
+    # インテリア・家具・テーブルウェア
+    "ニトリネット": {"furniture", "home", "tableware"},
+    "無印良品ネットストア": {"home", "clothing", "daily", "tableware", "food"},
     # その他
     "ショップジャパン": {"home", "fitness"},
 }
@@ -320,6 +321,25 @@ def _detect_product_genres(query: str) -> set[str]:
         ("home", [
             "収納", "キッチン", "フライパン", "鍋", "食器", "タオル",
             "寝具", "枕", "布団", "照明", "時計",
+        ]),
+        ("tableware", [
+            # ワイングラス・食器・キッチン用品ブランド
+            "リーデル", "riedel", "ツヴィーゼル", "zwiesel", "バカラ", "baccarat",
+            "ウェッジウッド", "wedgwood", "マイセン", "meissen",
+            "ル・クルーゼ", "le creuset", "ストウブ", "staub", "ティファール", "t-fal",
+            "柳宗理", "イッタラ", "iittala", "アラビア", "arabia",
+            # ワイン関連キーワード
+            "ワイングラス", "シャンパングラス", "デキャンタ", "ソムリエ",
+            "ボルドー", "ブルゴーニュ", "グラン・クリュ", "グランクリュ",
+            # 食器・テーブルウェア
+            "食器セット", "ティーカップ", "コーヒーカップ", "マグカップ",
+            "プレート", "ボウル", "カトラリー",
+        ]),
+        ("food", [
+            # 食品・飲料
+            "ワイン", "日本酒", "ビール", "ウイスキー", "焼酎",
+            "コーヒー豆", "紅茶", "お茶", "チョコレート", "お菓子",
+            "米", "パスタ", "調味料", "オリーブオイル",
         ]),
         ("daily", [
             "洗剤", "柔軟剤", "ティッシュ", "トイレットペーパー",
@@ -555,7 +575,11 @@ def _is_relevant_product(query: str, product_name: str) -> bool:
             if match_count < 2:
                 return False
         else:
-            required = (len(keywords) + 1) // 2 + 1
+            # 3-4キーワード: majority+1、5+キーワード: 過半数（majority）
+            if len(keywords) >= 5:
+                required = (len(keywords) + 1) // 2  # 5→3, 6→3, 7→4
+            else:
+                required = (len(keywords) + 1) // 2 + 1  # 3→3, 4→3
             required = min(required, len(keywords))
             if match_count < required:
                 return False
@@ -1483,14 +1507,23 @@ def _extract_price_by_fulltext(soup: BeautifulSoup, query: str,
             continue
         p = int(re.sub(r'[^\d]', '', raw) or '0')
         if p == price:
-            # この価格の前後から商品名行を探す
-            start = max(0, m.start() - 300)
+            # === 価格の前方（上方向）を探索 ===
+            start = max(0, m.start() - 500)
             context_lines = full_text[start:m.start()].split('\n')
             for line in reversed(context_lines):
                 line = line.strip()
                 if len(line) >= 10 and _is_relevant_product(query, line):
                     name = line[:120]
                     break
+            # === 前方で見つからなければ後方（下方向）も探索 ===
+            if not name:
+                end = min(len(full_text), m.end() + 500)
+                forward_lines = full_text[m.end():end].split('\n')
+                for line in forward_lines:
+                    line = line.strip()
+                    if len(line) >= 10 and _is_relevant_product(query, line):
+                        name = line[:120]
+                        break
             break
 
     # エコーバック最終防御: 抽出された商品名がクエリと実質同一なら拒否
@@ -1794,6 +1827,8 @@ _SESSION_FIRST_SHOPS: set[str] = {
     "ビックカメラ.com", "コジマネット", "ヤマダウェブコム",
     "au PAY マーケット", "ノジマオンライン", "エディオンネットショップ",
     "ケーズデンキオンラインショップ", "Joshin webショップ",
+    "セブンネットショッピング", "ベルメゾンネット", "LOHACO",
+    "ニトリネット", "JAL Mall",
 }
 
 
@@ -2818,6 +2853,57 @@ _SHOP_SPECIFIC_SELECTORS: dict[str, list[tuple[str, str, str]]] = {
         ('[class*="SearchResult"]', '[class*="price"], [class*="Price"]',
          '[class*="name"] a, [class*="Name"] a, [class*="title"] a'),
     ],
+    # --- 追加ショップ固有セレクタ ---
+    "LOHACO": [
+        (".SearchResults_item, .productListItem", ".SearchResults_price, .productPrice, .price",
+         ".SearchResults_name a, .productName a"),
+        ('[class*="searchResult"]', '[class*="price"]', '[class*="name"] a, [class*="title"] a'),
+        (".product-list__item", ".product-list__price", ".product-list__name a"),
+    ],
+    "@cosme SHOPPING": [
+        (".p-productList__item", ".p-productList__price, .price", ".p-productList__name a"),
+        ('[class*="product-card"]', '[class*="price"]', '[class*="name"] a, [class*="title"] a'),
+        (".product-item", ".product-price, .price", ".product-name a, .product-title a"),
+    ],
+    "BUYMA": [
+        (".product_body", ".product_price .price, .product_price", ".product_name a"),
+        (".product-card", ".product-card__price, .price", ".product-card__name a"),
+        ('[class*="Product"]', '[class*="price"]', '[class*="name"] a, [class*="title"] a'),
+    ],
+    "ベルメゾンネット": [
+        (".searchResultItem, .productItem", ".searchResultPrice, .productPrice, .price",
+         ".searchResultName a, .productName a"),
+        ('[class*="product"]', '[class*="price"]', '[class*="name"] a, [class*="title"] a'),
+    ],
+    "セブンネットショッピング": [
+        (".productItem, .product-item", ".productPrice, .product-price, .price",
+         ".productName a, .product-name a"),
+        ('[class*="product"]', '[class*="price"]', '[class*="name"] a, [class*="title"] a'),
+        (".searchResultItem", ".price, .salePrice", ".itemName a, .name a"),
+    ],
+    "マツモトキヨシオンラインストア": [
+        (".c-productListItem, .productListItem", ".c-productListItem__price, .productPrice, .price",
+         ".c-productListItem__name a, .productName a"),
+        ('[class*="ProductCard"]', '[class*="price"]', '[class*="name"] a, [class*="title"] a'),
+        (".product-tile", ".product-tile__price, .price", ".product-tile__name a"),
+    ],
+    "JAL Mall": [
+        (".goods_list_item, .goodsListItem", ".goods_price, .goodsPrice, .price",
+         ".goods_name a, .goodsName a"),
+        ('[class*="goods"]', '[class*="price"]', '[class*="name"] a, [class*="goods"] a'),
+        (".item-list li, .product", ".price, .item-price", ".item-name a, .product-name a"),
+    ],
+    "ニトリネット": [
+        (".o-product-card, .productCard", ".o-product-card__price, .productPrice, .price",
+         ".o-product-card__name a, .productName a"),
+        ('[class*="ProductCard"]', '[class*="price"]', '[class*="name"] a, [class*="title"] a'),
+        (".item-list__item", ".item-list__price", ".item-list__name a"),
+    ],
+    "ショップジャパン": [
+        (".productItem, .product-item", ".productPrice, .product-price, .price",
+         ".productName a, .product-name a"),
+        ('[class*="product"]', '[class*="price"]', '[class*="name"] a, [class*="title"] a'),
+    ],
 }
 
 # Phase 2で待機するCSSセレクタ（SPA描画完了の判定）
@@ -2833,6 +2919,13 @@ _SHOP_WAIT_SELECTORS: dict[str, str] = {
     "Joshin webショップ": ".productList__item, .lineup_box, [class*='product']",
     "@cosme SHOPPING": ".product-list, [class*='ProductCard'], [class*='product-item'], [class*='product']",
     "Qoo10": ".sc-prd, .item_g, [class*='goods'], [data-gd-no], [class*='SearchResult'], [class*='product']",
+    "LOHACO": ".SearchResults_item, .productListItem, [class*='product'], [class*='searchResult']",
+    "BUYMA": ".product_body, .product-card, [class*='Product'], [class*='product']",
+    "ベルメゾンネット": ".searchResultItem, .productItem, [class*='product']",
+    "セブンネットショッピング": ".productItem, .product-item, [class*='product']",
+    "マツモトキヨシオンラインストア": ".c-productListItem, [class*='ProductCard'], [class*='product']",
+    "JAL Mall": ".goods_list_item, [class*='goods'], [class*='product']",
+    "ニトリネット": ".o-product-card, [class*='ProductCard'], [class*='product']",
 }
 
 
@@ -3105,7 +3198,7 @@ def _retry_with_browser(results: list[ShopPrice], query: str) -> None:
 
     # Phase 2 全体の時間制限（3分）
     phase2_start = time.time()
-    PHASE2_BUDGET = 240  # 秒（家電量販店のタイムアウト対策で延長）
+    PHASE2_BUDGET = 300  # 秒（ジャンル絞り込みにより対象ショップ減 → 余裕を持たせる）
 
     def _launch_browser(pw):
         """ブラウザ起動: Chrome → Chromiumの順にフォールバック"""
@@ -3219,6 +3312,10 @@ def _retry_with_browser(results: list[ShopPrice], query: str) -> None:
                         "au PAY マーケット", "dショッピング",
                         "ビックカメラ.com", "ヤマダウェブコム",
                         "Joshin webショップ", "ケーズデンキオンラインショップ",
+                        "セブンネットショッピング", "ベルメゾンネット",
+                        "ZOZOTOWN", "ノジマオンライン",
+                        "LOHACO", "ニトリネット", "JAL Mall",
+                        "マツモトキヨシオンラインストア",
                     }
                     if r.shop_name in _NEEDS_HOME_VISIT:
                         try:
