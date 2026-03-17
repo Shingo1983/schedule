@@ -195,10 +195,9 @@
                 </tr>
             </thead>
             <tbody>
-                {% set sorted_not_found = scraper_not_found | sort(attribute='error') %}
                 {% set normal_not_found = [] %}
                 {% set genre_not_found = [] %}
-                {% for c in sorted_not_found %}
+                {% for c in scraper_not_found %}
                     {% if c.error == '取扱ジャンル外' %}
                         {% if genre_not_found.append(c) %}{% endif %}
                     {% else %}
