@@ -168,7 +168,7 @@ KNOWN_SHOPS = {
         "mile_rate_desc": "200円につき1マイル",
         "yen_per_mile": 200,
         "category": "総合通販",
-        "search_url_template": "https://wowma.jp/itemlist?keyword={query}",
+        "search_url_template": "https://shopping.au.com/search/{query}/",
     },
     # ====================================================================
     # 追加ショップ（JALマイレージパーク提携）

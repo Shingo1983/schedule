@@ -1495,6 +1495,13 @@ def _extract_price_from_raw_html(html: str, query: str,
     if not candidates:
         return None
 
+    # 候補が1件のみで低価格の場合、検索エコーバック（検索窓の表示）の可能性が高い
+    # 複数候補があれば実際の商品リストと判断
+    if len(candidates) == 1 and candidates[0] < 5000:
+        logger.info("Raw HTML extraction: skipping single low price ¥%s (likely echo-back)",
+                     f"{candidates[0]:,}")
+        return None
+
     price = candidates[0]
     logger.info("Raw HTML extraction found price: ¥%s", f"{price:,}")
     return price, query, ""
@@ -2289,25 +2296,24 @@ def search_joshin(query: str, _config: Config) -> ShopPrice:
 # au PAY マーケット (HTML + JSON-LD + 埋め込みJSON)
 # ============================================================
 def search_aupay(query: str, _config: Config) -> ShopPrice:
-    # au PAY マーケット: wowma.jp の複数URLパターン
-    # 注: au PAY は bot 対策が厳しく cloudscraper では空ページ（524文字等）を
-    # 返すことが多い。Phase 2 (Playwright) での再試行に期待。
+    # au PAY マーケット: shopping.au.com（旧 wowma.jp）
+    # 注: au PAY は bot 対策が厳しく cloudscraper では空ページを返すことが多い。
+    # Phase 2 (Playwright) での再試行に期待。
     search_urls = [
-        f"https://wowma.jp/itemlist?e_scope=O&at=FP&non_gr=ex&keyword={quote(query)}&categ_id=0",
+        f"https://shopping.au.com/search/{quote(query)}/",
+        f"https://shopping.au.com/search/?q={quote(query)}",
         f"https://wowma.jp/itemlist?keyword={quote(query)}",
-        # API風のURLパターン（JSON応答が返る場合がある）
-        f"https://wowma.jp/api/search/items?keyword={quote(query)}&limit=20&offset=0",
     ]
     selectors = [
         (".itemList__item", ".itemList__price, .price", ".itemList__name a, .product-name a"),
         (".product-item", ".product-price, .price", ".product-name a"),
         ('[class*="ItemCard"]', '[class*="price"]', '[class*="name"] a, [class*="title"] a'),
-        (".item", ".price", "a.item-name"),
+        ('[class*="item"]', '[class*="price"]', '[class*="name"] a, [class*="title"] a'),
     ] + _GENERIC_SELECTORS
     last_error = None
     for url in search_urls:
         result = _scrape_generic("au PAY マーケット", url, selectors,
-                                 "https://wowma.jp", query=query)
+                                 "https://shopping.au.com", query=query)
         if result.price is not None:
             return result
         if result.error:
@@ -2703,9 +2709,10 @@ _SHOP_WAIT_SELECTORS: dict[str, str] = {
     "ヤマダウェブコム": ".searchResult__item, .product, [class*='product']",
     "エディオンネットショップ": ".goods-list-item, [class*='goods'], [class*='product']",
     "ノジマオンライン": ".catalogListItem, .catalog-item, [class*='catalog'], [class*='product']",
-    "au PAY マーケット": ".itemList__item, [class*='ItemCard'], [class*='product']",
+    "au PAY マーケット": ".itemList__item, [class*='ItemCard'], [class*='item'], [class*='product']",
     "dショッピング": ".c-productListItem, [class*='ProductCard'], [class*='product']",
     "Joshin webショップ": ".productList__item, .lineup_box, [class*='product']",
+    "@cosme SHOPPING": ".product-list, [class*='ProductCard'], [class*='product-item'], [class*='product']",
     "Qoo10": ".sc-prd, .item_g, [class*='goods'], [data-gd-no], [class*='SearchResult'], [class*='product']",
 }
 
@@ -2935,6 +2942,12 @@ def _retry_with_browser(results: list[ShopPrice], query: str) -> None:
 
     # 再試行対象の選定
     _SKIP_ERRORS = {"APIキー", "HTTP 404", "HTTP 410"}
+    # 自社ブランド専門店：Phase 2でも他ブランド検索は無駄なのでスキップ
+    _HOUSE_BRAND_SHOPS = {
+        "DHCオンラインショップ": ["dhc"],
+        "ファンケルオンライン": ["ファンケル", "fancl"],
+    }
+    query_lower = query.lower()
     retry_normal = []   # Phase1でHTMLは取れたがprice抽出失敗 → 成功見込み高
     retry_timeout = []  # Phase1でタイムアウト/アクセス制限 → ブラウザなら成功の可能性
     for i, r in enumerate(results):
@@ -2943,6 +2956,11 @@ def _retry_with_browser(results: list[ShopPrice], query: str) -> None:
         if r.error and any(skip in r.error for skip in _SKIP_ERRORS):
             continue
         if not r.search_url:
+            continue
+        # 自社ブランド専門店は、クエリにブランド名がない場合スキップ
+        brand_keywords = _HOUSE_BRAND_SHOPS.get(r.shop_name)
+        if brand_keywords and not any(bk in query_lower for bk in brand_keywords):
+            logger.info("Phase 2: skipping %s (house brand only)", r.shop_name)
             continue
         if r.error and ("タイムアウト" in r.error or "アクセス制限" in r.error):
             retry_timeout.append(i)
