@@ -1000,11 +1000,37 @@ def _find_price_in_soup(soup: BeautifulSoup, selectors: list[tuple[str, str, str
                 url = href if href.startswith("http") else (f"{base_url}{href}" if href.startswith("/") and base_url else "")
                 return price, name, url
 
+    # --- エコーバックガード（ステップ5-7共通） ---
+    # 抽出結果の商品名がクエリと実質同一ならエコーバックとして拒否
+    def _is_echoback_name(name: str, q: str) -> bool:
+        if not name or not q:
+            return False
+        _es = re.compile(r'[\s　\-/／「」『』【】()（）・、。,.]+')
+        n_norm = _es.sub('', name.lower())
+        q_norm = _es.sub('', q.lower())
+        if not n_norm or not q_norm:
+            return False
+        # 完全一致
+        if n_norm == q_norm:
+            return True
+        # 商品名がクエリの部分文字列（クエリの一部だけエコー）
+        if n_norm in q_norm:
+            return True
+        # クエリが商品名に含まれ、差分が小さい（装飾文字程度）
+        # 差分が大きい場合は実際の商品名（型番・説明等が付加）と判断
+        if q_norm in n_norm and len(n_norm) - len(q_norm) < 15:
+            return True
+        return False
+
     # 5. テキストベース汎用抽出（DOM構造ベース）
     if query:
         result = _extract_price_by_text(soup, query, base_url)
         if result:
-            return result
+            price_r, name_r, url_r = result
+            if name_r and _is_echoback_name(name_r, query):
+                logger.info("Echo-back rejected (text extraction): '%s'", name_r[:80])
+            else:
+                return result
 
     # 6. フルテキスト近接検索（DOM構造に一切依存しない最終手段）
     # 800KB超のHTMLでもページのプレーンテキストから価格を見つける
@@ -1408,7 +1434,7 @@ def _extract_price_by_fulltext(soup: BeautifulSoup, query: str,
         if _n_norm and _q_norm and (
                 _n_norm == _q_norm
                 or _n_norm in _q_norm
-                or (_q_norm in _n_norm and len(_n_norm) - len(_q_norm) < 15)):
+                or _q_norm in _n_norm):
             logger.info("Fulltext echo-back rejected: name='%s' ≈ query='%s'",
                         name[:80], query[:80])
             name = ""
@@ -1528,7 +1554,9 @@ def _extract_price_from_raw_html(html: str, query: str,
 
     price = candidates[0]
     logger.info("Raw HTML extraction found price: ¥%s", f"{price:,}")
-    return price, query, ""
+    # 商品名は不明（生HTMLからは商品名を確実に取得できない）
+    # クエリをフォールバックにするとエコーバックの原因になるため空文字列を返す
+    return price, "", ""
 
 
 def _extract_price_by_text(soup: BeautifulSoup, query: str,
