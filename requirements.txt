@@ -3,4 +3,4 @@ requests
 beautifulsoup4
 lxml
 cloudscraper
-playwright
+gunicorn
