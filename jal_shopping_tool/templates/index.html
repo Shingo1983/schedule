@@ -13,12 +13,6 @@
         </div>
     </form>
 
-    {% if not has_api_keys %}
-    <div class="flash flash-warning">
-        楽天・Yahoo!のAPIキーが未設定です。APIキーなしでもスクレイピングで多くのショップを検索できますが、
-        楽天・Yahoo!は<a href="{{ url_for('settings') }}">設定画面</a>でAPIキーを登録するとより正確な結果が得られます。
-    </div>
-    {% endif %}
 </div>
 
 <div class="features">
