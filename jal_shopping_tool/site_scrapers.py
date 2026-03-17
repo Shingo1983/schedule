@@ -484,15 +484,20 @@ def _is_relevant_product(query: str, product_name: str) -> bool:
     # 検索結果0件時にページがクエリを見出しに表示し、無関係商品の価格が
     # 近くにあるケースを防止（例: ユニクロ/GUの「〇〇の検索結果」）
     # 商品名がクエリとほぼ同一（余分な文字が少ない）なら実商品ではない
-    _q_normalized = re.sub(r'[\s　\-/／「」『』【】()（）]+', '', query_lower)
-    _n_normalized = re.sub(r'[\s　\-/／「」『』【】()（）]+', '', name_lower)
+    _ECHO_STRIP_RE = re.compile(r'[\s　\-/／「」『』【】()（）・、。,.]+')
+    _q_normalized = _ECHO_STRIP_RE.sub('', query_lower)
+    _n_normalized = _ECHO_STRIP_RE.sub('', name_lower)
     if _q_normalized and _n_normalized:
         # 商品名がクエリとほぼ同じ（前後の装飾文字程度の差）→ エコーバック
         if (_n_normalized == _q_normalized
+                # 商品名がクエリの先頭部分+少しだけ余分
                 or (_n_normalized.startswith(_q_normalized)
                     and len(_n_normalized) - len(_q_normalized) < 10)
+                # クエリが商品名に含まれ、差分が小さい
                 or (_q_normalized in _n_normalized
-                    and len(_n_normalized) - len(_q_normalized) < 15)):
+                    and len(_n_normalized) - len(_q_normalized) < 15)
+                # 商品名がクエリの部分文字列（クエリそのものが短縮されてエコー）
+                or (_n_normalized in _q_normalized)):
             return False
 
     # === キーワードマッチ（先にチェック — 無関係商品を先に弾く） ===
@@ -1378,7 +1383,7 @@ def _extract_price_by_fulltext(soup: BeautifulSoup, query: str,
     price = top_candidates[0]
 
     # 商品名を推定（価格の近くにあるクエリマッチ行）
-    name = query  # フォールバック
+    name = ""  # デフォルトは空（クエリをフォールバックにしない）
     for m in price_pattern.finditer(full_text):
         raw = m.group(1) or m.group(2) or m.group(3)
         if not raw:
@@ -1394,6 +1399,25 @@ def _extract_price_by_fulltext(soup: BeautifulSoup, query: str,
                     name = line[:120]
                     break
             break
+
+    # エコーバック最終防御: 抽出された商品名がクエリと実質同一なら拒否
+    if name:
+        _echo_strip = re.compile(r'[\s　\-/／「」『』【】()（）・、。,.]+')
+        _n_norm = _echo_strip.sub('', name.lower())
+        _q_norm = _echo_strip.sub('', query.lower())
+        if _n_norm and _q_norm and (
+                _n_norm == _q_norm
+                or _n_norm in _q_norm
+                or (_q_norm in _n_norm and len(_n_norm) - len(_q_norm) < 15)):
+            logger.info("Fulltext echo-back rejected: name='%s' ≈ query='%s'",
+                        name[:80], query[:80])
+            name = ""
+
+    # 商品名が取得できなかった場合は結果を返さない（エコーバック防止）
+    if not name:
+        logger.info("Fulltext: price ¥%s found but no valid product name (echo-back guard)",
+                    f"{price:,}")
+        return None
 
     # URLは検索URL（フルテキストからは個別URL取得困難）
     return price, name, ""
