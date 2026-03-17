@@ -220,14 +220,14 @@ class ShopPrice:
 # ---------------------------------------------------------------------------
 # 各ショップの取扱ジャンル定義
 _SHOP_CATEGORIES: dict[str, set[str]] = {
-    # 家電量販店
-    "ビックカメラ.com": {"electronics", "appliances", "camera", "gaming", "daily"},
-    "Joshin webショップ": {"electronics", "appliances", "gaming"},
-    "ケーズデンキオンラインショップ": {"electronics", "appliances"},
-    "コジマネット": {"electronics", "appliances"},
-    "エディオンネットショップ": {"electronics", "appliances"},
-    "ノジマオンライン": {"electronics", "appliances"},
-    "ヤマダウェブコム": {"electronics", "appliances", "daily"},
+    # 家電量販店（家電以外にも食器・酒・日用品など幅広く取扱い）
+    "ビックカメラ.com": {"all"},
+    "Joshin webショップ": {"all"},
+    "ケーズデンキオンラインショップ": {"all"},
+    "コジマネット": {"all"},
+    "エディオンネットショップ": {"all"},
+    "ノジマオンライン": {"all"},
+    "ヤマダウェブコム": {"all"},
     "ソニーストア": {"electronics", "audio", "gaming"},
     # 総合EC（何でも売っている）
     "Amazon.co.jp": {"all"},
