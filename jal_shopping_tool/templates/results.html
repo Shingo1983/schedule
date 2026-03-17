@@ -92,12 +92,11 @@
                 <tr>
                     <th class="col-rank">#</th>
                     <th class="col-shop">ショップ</th>
-                    <th class="col-price">最安値</th>
-                    <th class="col-diff">1位との差</th>
+                    <th class="col-effective col-header-effective">実質価格</th>
+                    <th class="col-price">販売価格</th>
                     <th class="col-rate">マイルレート</th>
                     <th class="col-lsp">獲得LSP</th>
                     <th class="col-lsp-diff">LSP差</th>
-                    <th class="col-effective">実質価格</th>
                     <th class="col-action">リンク</th>
                 </tr>
             </thead>
@@ -124,12 +123,21 @@
                         <br><span class="shop-note">{{ c.jal_shop.note }}</span>
                         {% endif %}
                     </td>
-                    <td class="col-price price-cell">{{ c.price | currency }}</td>
-                    <td class="col-diff">
-                        {% if c.is_cheapest %}
-                        <span class="badge badge-green">最安</span>
-                        {% else %}
-                        <span class="diff-plus">+{{ c.price_diff | currency }}</span>
+                    <td class="col-effective effective-price-cell">
+                        {{ c.effective_price | currency_float }}
+                        {% if c.lsp_value_yen > 0 or c.point_rebate_yen > 0 %}
+                        <div class="text-muted" style="line-height:1.3">
+                            {% if c.lsp_value_yen > 0 %}LSP -{{ c.lsp_value_yen | currency_float }}{% endif %}
+                            {% if c.point_rebate_yen > 0 %}<br>{{ c.shop_name | replace("Yahoo!ショッピング","PayPay") | replace("楽天市場","楽天Pt") }} -{{ c.point_rebate_yen | currency_float }}{% endif %}
+                        </div>
+                        {% endif %}
+                    </td>
+                    <td class="col-price price-cell">
+                        {{ c.price | currency }}
+                        {% if not c.is_cheapest and c.price_diff > 0 %}
+                        <br><span class="diff-plus">+{{ c.price_diff | currency }}</span>
+                        {% elif c.is_cheapest %}
+                        <br><span class="badge badge-green">最安</span>
                         {% endif %}
                     </td>
                     <td class="col-rate" style="white-space:nowrap">
@@ -148,15 +156,6 @@
                         <span class="diff-minus-lsp">{{ c.lsp_diff | format_lsp }}</span>
                         {% else %}
                         -
-                        {% endif %}
-                    </td>
-                    <td class="col-effective">
-                        <strong>{{ c.effective_price | currency_float }}</strong>
-                        {% if c.lsp_value_yen > 0 or c.point_rebate_yen > 0 %}
-                        <div class="text-muted" style="line-height:1.3">
-                            {% if c.lsp_value_yen > 0 %}LSP -{{ c.lsp_value_yen | currency_float }}{% endif %}
-                            {% if c.point_rebate_yen > 0 %}<br>{{ c.shop_name | replace("Yahoo!ショッピング","PayPay") | replace("楽天市場","楽天Pt") }} -{{ c.point_rebate_yen | currency_float }}{% endif %}
-                        </div>
                         {% endif %}
                     </td>
                     <td class="col-action">
@@ -205,7 +204,7 @@
                     {% endif %}
                 {% endfor %}
                 {% for c in normal_not_found + genre_not_found %}
-                <tr>
+                <tr{% if c.error == '取扱ジャンル外' %} class="genre-excluded-row"{% endif %}>
                     <td><strong>{{ c.shop_name }}</strong></td>
                     <td class="text-small" style="white-space:nowrap">{{ c.mile_rate_desc }}{% if c.yen_per_mile > 0 %}<br><span class="text-muted">¥{{ "{:,}".format(c.yen_per_mile * 100) }}/LSP</span>{% endif %}</td>
                     <td>
