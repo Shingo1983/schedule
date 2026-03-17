@@ -75,6 +75,30 @@
         </div>
     </div>
 
+    <div class="card">
+        <h2>ショップ別ポイント還元率</h2>
+        <p class="text-small">
+            各ショップのポイント還元率を設定すると、実質価格にポイント還元分が加味されます。
+            ご自身のステータスに合わせて設定してください。
+        </p>
+        <div class="form-group">
+            <label for="yahoo_paypay_rate">Yahoo!ショッピング PayPay還元率（%）</label>
+            <input type="number" id="yahoo_paypay_rate" name="yahoo_paypay_rate"
+                   value="{{ (config.yahoo_paypay_rate * 100) | round(1) }}"
+                   step="0.5" min="0" max="30"
+                   style="width: 100px;">
+            <span class="text-small">%（PayPay支払いの還元率。デフォルト7.5%）</span>
+        </div>
+        <div class="form-group">
+            <label for="rakuten_point_rate">楽天市場 ポイント還元率（%）</label>
+            <input type="number" id="rakuten_point_rate" name="rakuten_point_rate"
+                   value="{{ (config.rakuten_point_rate * 100) | round(1) }}"
+                   step="0.5" min="0" max="30"
+                   style="width: 100px;">
+            <span class="text-small">%（SPU等を含む還元率。デフォルト1%）</span>
+        </div>
+    </div>
+
     <button type="submit" class="btn btn-primary">設定を保存</button>
 </form>
 {% endblock %}

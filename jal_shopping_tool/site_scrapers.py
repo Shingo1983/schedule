@@ -2296,13 +2296,12 @@ def search_joshin(query: str, _config: Config) -> ShopPrice:
 # au PAY マーケット (HTML + JSON-LD + 埋め込みJSON)
 # ============================================================
 def search_aupay(query: str, _config: Config) -> ShopPrice:
-    # au PAY マーケット: shopping.au.com（旧 wowma.jp）
+    # au PAY マーケット: wowma.jp
     # 注: au PAY は bot 対策が厳しく cloudscraper では空ページを返すことが多い。
     # Phase 2 (Playwright) での再試行に期待。
     search_urls = [
-        f"https://shopping.au.com/search/{quote(query)}/",
-        f"https://shopping.au.com/search/?q={quote(query)}",
         f"https://wowma.jp/itemlist?keyword={quote(query)}",
+        f"https://wowma.jp/search/{quote(query)}/",
     ]
     selectors = [
         (".itemList__item", ".itemList__price, .price", ".itemList__name a, .product-name a"),
@@ -2313,7 +2312,7 @@ def search_aupay(query: str, _config: Config) -> ShopPrice:
     last_error = None
     for url in search_urls:
         result = _scrape_generic("au PAY マーケット", url, selectors,
-                                 "https://shopping.au.com", query=query)
+                                 "https://wowma.jp", query=query)
         if result.price is not None:
             return result
         if result.error:

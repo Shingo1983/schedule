@@ -27,7 +27,9 @@ class ShopComparison:
     miles_earned: int = 0
     lsp_earned: float = 0.0
     lsp_value_yen: float = 0.0
-    effective_price: float = 0.0  # 実質価格 = price - LSP価値
+    point_rebate_rate: float = 0.0  # ショップ別ポイント還元率
+    point_rebate_yen: float = 0.0   # ポイント還元額（円）
+    effective_price: float = 0.0  # 実質価格 = price - LSP価値 - ポイント還元
 
     # 全サイト最安値との比較
     price_diff: int = 0  # 最安値との価格差
@@ -82,6 +84,12 @@ def analyze(
     jal_shops = get_shops()
     jal_shop_map = {s.name: s for s in jal_shops}
 
+    # ショップ別ポイント還元率マップ
+    _SHOP_POINT_RATES = {
+        "Yahoo!ショッピング": config.yahoo_paypay_rate,
+        "楽天市場": config.rakuten_point_rate,
+    }
+
     comparisons: list[ShopComparison] = []
 
     for sp in shop_prices:
@@ -101,7 +109,10 @@ def analyze(
             comp.miles_earned = jal_shop.calc_miles(sp.price)
             comp.lsp_earned = jal_shop.calc_lsp(sp.price)
             comp.lsp_value_yen = comp.lsp_earned * config.lsp_value_yen
-            comp.effective_price = sp.price - comp.lsp_value_yen
+            # ショップ別ポイント還元
+            comp.point_rebate_rate = _SHOP_POINT_RATES.get(sp.shop_name, 0.0)
+            comp.point_rebate_yen = sp.price * comp.point_rebate_rate
+            comp.effective_price = sp.price - comp.lsp_value_yen - comp.point_rebate_yen
 
         comparisons.append(comp)
 

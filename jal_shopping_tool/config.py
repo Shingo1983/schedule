@@ -29,6 +29,9 @@ class Config:
     jal_lsp_pdf_url: str = JAL_LSP_PDF_URL
     # 1 LSPあたりの価値（円）。ユーザーが設定する主観的な価値
     lsp_value_yen: float = 15.0
+    # ショップ別ポイント還元率（%ではなく小数: 7.5% → 0.075）
+    yahoo_paypay_rate: float = 0.075  # Yahoo!ショッピング PayPay還元率
+    rakuten_point_rate: float = 0.01  # 楽天市場 ポイント還元率（SPU等で変動）
 
     def save(self) -> None:
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
@@ -39,6 +42,8 @@ class Config:
                     "yahoo_app_id": self.yahoo_app_id,
                     "jal_lsp_pdf_url": self.jal_lsp_pdf_url,
                     "lsp_value_yen": self.lsp_value_yen,
+                    "yahoo_paypay_rate": self.yahoo_paypay_rate,
+                    "rakuten_point_rate": self.rakuten_point_rate,
                 },
                 f,
                 indent=2,

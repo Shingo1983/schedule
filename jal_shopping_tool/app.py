@@ -102,6 +102,8 @@ def create_app() -> Flask:
             rakuten = request.form.get("rakuten_app_id", "").strip()
             yahoo = request.form.get("yahoo_app_id", "").strip()
             lsp_value = request.form.get("lsp_value_yen", "").strip()
+            yahoo_paypay = request.form.get("yahoo_paypay_rate", "").strip()
+            rakuten_point = request.form.get("rakuten_point_rate", "").strip()
 
             if rakuten:
                 config.rakuten_app_id = rakuten
@@ -113,6 +115,16 @@ def create_app() -> Flask:
                 except ValueError:
                     flash("LSP価値には数値を入力してください。", "error")
                     return render_template("settings.html", config=config)
+            if yahoo_paypay:
+                try:
+                    config.yahoo_paypay_rate = float(yahoo_paypay) / 100.0
+                except ValueError:
+                    pass
+            if rakuten_point:
+                try:
+                    config.rakuten_point_rate = float(rakuten_point) / 100.0
+                except ValueError:
+                    pass
 
             config.save()
             flash("設定を保存しました。", "success")
