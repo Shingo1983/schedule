@@ -192,6 +192,11 @@ _JSON_HEADERS = {
 
 # リクエストタイムアウト（秒）
 _TIMEOUT = 15
+# 重いサイト用の延長タイムアウト（ビックカメラ、Joshin等）
+_TIMEOUT_SLOW = 30
+_SLOW_SHOPS: set[str] = {
+    "ビックカメラ.com", "Joshin webショップ", "ケーズデンキオンラインショップ",
+}
 
 # 並列実行のワーカー数（各ショップは別ドメインなので並列OK）
 _MAX_WORKERS = 10
@@ -436,11 +441,28 @@ def _parse_price(text: str) -> int | None:
 
 
 def _soup(resp: requests.Response) -> BeautifulSoup:
-    """レスポンスからBeautifulSoupオブジェクトを作成"""
+    """レスポンスからBeautifulSoupオブジェクトを作成
+
+    requestsのエンコーディング自動検出はcharset未指定時にISO-8859-1にフォールバックし、
+    日本語サイト（ヤマダウェブコム等）で文字化けの原因になる。
+    apparent_encoding（chardet検出）を優先し、BeautifulSoupにバイト列を渡して
+    meta charset / BOMによる自動検出も有効にする。
+    """
+    # Content-Typeにcharsetが明示されている場合はそのまま使う
+    content_type = resp.headers.get("Content-Type", "")
+    has_explicit_charset = "charset=" in content_type.lower()
+
+    if has_explicit_charset:
+        html = resp.text
+    else:
+        # charset未指定 → requests は ISO-8859-1 にフォールバックするため、
+        # バイト列を直接BeautifulSoupに渡して自動検出させる
+        html = resp.content
+
     try:
-        return BeautifulSoup(resp.text, "lxml")
+        return BeautifulSoup(html, "lxml")
     except Exception:
-        return BeautifulSoup(resp.text, "html.parser")
+        return BeautifulSoup(html, "html.parser")
 
 
 def _is_relevant_product(query: str, product_name: str) -> bool:
@@ -595,6 +617,51 @@ def _is_relevant_product(query: str, product_name: str) -> bool:
     for pattern in _USED_PATTERNS:
         if re.search(pattern, name_lower, re.IGNORECASE):
             return False
+
+    # === 数量・セットサイズ不一致の除外 ===
+    # クエリと商品名の数量指標を比較し、不一致なら除外する
+    # 例: クエリ「リーデル ボルドー グラン クリュ ソムリエ」(単品) に対し
+    #     「2脚セット」「ペア」「6脚セット」等は除外
+    def _extract_quantity(text: str) -> int | None:
+        """テキストから数量指標を抽出する。見つからなければNoneを返す。"""
+        t = text.lower()
+        # 「ペア」「ペアセット」 → 2
+        if re.search(r'ペア(?:セット)?', t):
+            return 2
+        # 英語 "pair" → 2
+        if re.search(r'\bpair\b', t, re.IGNORECASE):
+            return 2
+        # 日本語: 数字+助数詞 (脚, 個, 本, 枚, 客, 点, 組, 足)
+        # 例: "2脚セット", "4個入り", "6脚", "3本セット", "2客"
+        m = re.search(r'(\d+)\s*(?:脚|個|本|枚|客|点|組|足)', t)
+        if m:
+            return int(m.group(1))
+        # 漢数字+助数詞
+        _KANJI_NUM = {'一': 1, '二': 2, '三': 3, '四': 4, '五': 5,
+                      '六': 6, '七': 7, '八': 8, '九': 9, '十': 10}
+        m = re.search(r'([一二三四五六七八九十])\s*(?:脚|個|本|枚|客|点|組|足)', t)
+        if m and m.group(1) in _KANJI_NUM:
+            return _KANJI_NUM[m.group(1)]
+        # 数字+セット/入り (助数詞なし): "2セット", "3入り"
+        m = re.search(r'(\d+)\s*(?:セット|入り?|入数)', t)
+        if m:
+            return int(m.group(1))
+        # English: number + pack/set/pcs/piece(s)
+        m = re.search(r'(\d+)\s*[-]?\s*(?:pack|set|pcs|pieces?)\b', t, re.IGNORECASE)
+        if m:
+            return int(m.group(1))
+        return None
+
+    query_qty = _extract_quantity(query)
+    product_qty = _extract_quantity(product_name)
+
+    # クエリに数量指定がなければ単品(1)と仮定
+    if query_qty is None:
+        query_qty = 1
+
+    # 商品名に数量指標があり、クエリの数量と一致しない場合は除外
+    if product_qty is not None and product_qty != query_qty:
+        return False
 
     return True
 
@@ -1745,6 +1812,7 @@ def _scrape_generic(shop_name: str, search_url: str,
     """
     max_attempts = 2
     use_session_first = shop_name in _SESSION_FIRST_SHOPS
+    req_timeout = _TIMEOUT_SLOW if shop_name in _SLOW_SHOPS else _TIMEOUT
 
     for attempt in range(max_attempts):
         try:
@@ -1772,7 +1840,7 @@ def _scrape_generic(shop_name: str, search_url: str,
                 except Exception as e:
                     logger.debug("Session-first homepage failed for %s: %s", shop_name, e)
 
-            resp = session.get(search_url, timeout=_TIMEOUT)
+            resp = session.get(search_url, timeout=req_timeout)
             if resp.status_code == 403:
                 if attempt < max_attempts - 1:
                     continue  # リトライ
@@ -3037,7 +3105,7 @@ def _retry_with_browser(results: list[ShopPrice], query: str) -> None:
 
     # Phase 2 全体の時間制限（3分）
     phase2_start = time.time()
-    PHASE2_BUDGET = 180  # 秒（高速化のため短縮）
+    PHASE2_BUDGET = 240  # 秒（家電量販店のタイムアウト対策で延長）
 
     def _launch_browser(pw):
         """ブラウザ起動: Chrome → Chromiumの順にフォールバック"""
@@ -3145,10 +3213,12 @@ def _retry_with_browser(results: list[ShopPrice], query: str) -> None:
                     base_url = f"{urlparse(r.search_url).scheme}://{urlparse(r.search_url).netloc}"
 
                     # ホームページ訪問が必要なショップのみ（bot検出が厳しいサイト）
-                    # 大半のショップは直接検索URLで問題ないためスキップして高速化
+                    # 家電量販店もcookieがないとbot扱いされるため追加
                     _NEEDS_HOME_VISIT = {
                         "ファンケルオンライン", "@cosme SHOPPING",
                         "au PAY マーケット", "dショッピング",
+                        "ビックカメラ.com", "ヤマダウェブコム",
+                        "Joshin webショップ", "ケーズデンキオンラインショップ",
                     }
                     if r.shop_name in _NEEDS_HOME_VISIT:
                         try:
@@ -3161,8 +3231,9 @@ def _retry_with_browser(results: list[ShopPrice], query: str) -> None:
                         except Exception:
                             pass
 
-                    # 検索ページへ遷移
-                    page.goto(r.search_url, timeout=20000,
+                    # 検索ページへ遷移（重いサイトはタイムアウト延長）
+                    _page_timeout = 35000 if r.shop_name in _SLOW_SHOPS else 20000
+                    page.goto(r.search_url, timeout=_page_timeout,
                               wait_until="domcontentloaded",
                               referer=base_url + "/")
                     # ネットワークアイドルを待つ（SPAのJS描画完了を待機）
