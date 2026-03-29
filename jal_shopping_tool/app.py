@@ -8,6 +8,9 @@ from .analyzer import analyze
 from .config import Config
 from .jal_shops import get_shops, SHOP_CACHE_FILE
 from .price_search import search_all_sites
+from .resale_arbitrage import (
+    run_arbitrage_scan, run_single_arbitrage, ARBITRAGE_CANDIDATES,
+)
 from .site_scrapers import get_manual_search_shops, SCRAPER_SHOP_NAMES, _HAS_CLOUDSCRAPER, _HAS_PLAYWRIGHT
 
 
@@ -92,6 +95,32 @@ def create_app() -> Flask:
             scraper_names=SCRAPER_SHOP_NAMES,
             auto_count=auto_count,
             manual_count=manual_count,
+        )
+
+    @app.route("/arbitrage")
+    def arbitrage():
+        config = Config.load()
+        query = request.args.get("q", "").strip()
+        category = request.args.get("category", "general").strip()
+        scan = request.args.get("scan", "").strip()
+        limit = int(request.args.get("limit", "0"))
+
+        result = None
+        report = None
+
+        if query:
+            result = run_single_arbitrage(query, config, category=category)
+        elif scan:
+            report = run_arbitrage_scan(config, max_items=limit)
+
+        return render_template(
+            "arbitrage.html",
+            query=query,
+            category=category,
+            result=result,
+            report=report,
+            candidates=ARBITRAGE_CANDIDATES,
+            candidate_count=len(ARBITRAGE_CANDIDATES),
         )
 
     @app.route("/settings", methods=["GET", "POST"])

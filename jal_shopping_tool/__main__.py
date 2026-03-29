@@ -2,9 +2,11 @@
 
 Usage:
   python -m jal_shopping_tool search "商品名"   # CLI検索
-  python -m jal_shopping_tool web               # Webアプリ起動
+  python -m jal_shopping_tool web               # Webア���リ起動
   python -m jal_shopping_tool setup             # 初期設定
   python -m jal_shopping_tool shops             # ショップ一覧
+  python -m jal_shopping_tool arbitrage         # 転売アービトラージ検索
+  python -m jal_shopping_tool arbitrage "商品名" # 単一商品アービトラージ分析
 """
 
 import sys

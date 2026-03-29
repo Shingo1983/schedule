@@ -538,6 +538,74 @@ details ol { color: var(--text-secondary); }
 }
 .manual-price-input:focus { border-color: var(--cyan); }
 
+/* === Arbitrage Page === */
+.search-row {
+    display: flex;
+    gap: 0.5rem;
+    justify-content: center;
+    flex-wrap: wrap;
+}
+.search-row .search-input {
+    flex: 1;
+    min-width: 200px;
+    max-width: 400px;
+}
+.search-select {
+    padding: 10px 12px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--bg-input);
+    color: var(--text-primary);
+    font-size: 0.9rem;
+}
+.btn-small {
+    padding: 4px 12px;
+    font-size: 0.8rem;
+    background: var(--cyan);
+    color: #fff;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    text-decoration: none;
+}
+.btn-small:hover { background: var(--cyan-dim); }
+.fee-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.9rem;
+}
+.fee-table td {
+    padding: 4px 8px;
+    border-bottom: 1px solid var(--border);
+}
+.fee-table .text-right { text-align: right; }
+.fee-table .fee-total td {
+    border-top: 2px solid var(--text-primary);
+    padding-top: 6px;
+}
+.profit-positive { color: var(--green); font-weight: 600; }
+.profit-negative { color: var(--red); font-weight: 600; }
+.badge-size {
+    background: #e0e7ff;
+    color: #3730a3;
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: 0.75rem;
+}
+.recommendation-good {
+    background: #dcfce7;
+    border: 1px solid #bbf7d0;
+}
+.recommendation-neutral {
+    background: #fef9c3;
+    border: 1px solid #fde68a;
+}
+.recommendation-bad {
+    background: #fee2e2;
+    border: 1px solid #fecaca;
+}
+.text-muted { color: var(--text-muted); }
+
 /* === Responsive === */
 @media (max-width: 768px) {
     .hero h1 { font-size: 1.4rem; }
