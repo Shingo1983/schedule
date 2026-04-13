@@ -19,7 +19,14 @@ RUN pip install --no-cache-dir -r requirements.txt \
 COPY . .
 
 ENV PYTHONUNBUFFERED=1
-ENV PORT=8080
-EXPOSE 8080
-
-CMD gunicorn wsgi:app --bind 0.0.0.0:$PORT --workers 2 --timeout 300
+# Railway Hobby(512MB-1GB) では Chromium と並行してワーカー複数は OOM 危険なので 1 に
+# gthread で同時リクエスト処理は確保しつつメモリは節約
+# --bind 0.0.0.0:$PORT は sh 経由で $PORT を展開するため shell 形式を使用
+CMD exec gunicorn wsgi:app \
+    --bind 0.0.0.0:${PORT:-8080} \
+    --workers 1 \
+    --threads 4 \
+    --worker-class gthread \
+    --timeout 300 \
+    --access-logfile - \
+    --error-logfile -
