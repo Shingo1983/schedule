@@ -41,7 +41,19 @@
         {% if has_playwright %}
         <span class="status ok">ブラウザ描画: ON</span>
         {% else %}
-        <span class="status ng">ブラウザ描画: OFF（<code>pip install playwright</code> → <code>playwright install chromium</code>で有効化）</span>
+        <span class="status ng">ブラウザ描画: OFF（多くのSPAサイトで価格取得不可。本番では Dockerfile + playwright install chromium で有効化）</span>
+        {% endif %}
+        &nbsp;
+        {% if config.rakuten_app_id %}
+        <span class="status ok">楽天API: ON</span>
+        {% else %}
+        <span class="status ng">楽天API: OFF（環境変数 RAKUTEN_APP_ID を設定すると楽天市場検索が大幅改善）</span>
+        {% endif %}
+        &nbsp;
+        {% if config.yahoo_app_id %}
+        <span class="status ok">Yahoo!API: ON</span>
+        {% else %}
+        <span class="status ng">Yahoo!API: OFF（環境変数 YAHOO_APP_ID を設定するとYahoo!ショッピング検索が大幅改善）</span>
         {% endif %}
     </p>
 </div>

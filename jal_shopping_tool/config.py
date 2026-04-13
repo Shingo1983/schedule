@@ -52,8 +52,28 @@ class Config:
 
     @classmethod
     def load(cls) -> "Config":
+        # ファイルから読み込む（存在すれば）
         if CONFIG_FILE.exists():
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
-        return cls()
+            cfg = cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
+        else:
+            cfg = cls()
+
+        # 環境変数を優先（本番デプロイ環境用 - Railway/Render等の設定で上書き）
+        # API キーはセキュリティ上、ソースコードに含めず環境変数で渡す。
+        # ユーザーは Railway の Variables で一度設定すれば UI 不要で全クエリに反映される。
+        env_rakuten = os.environ.get("RAKUTEN_APP_ID", "").strip()
+        if env_rakuten:
+            cfg.rakuten_app_id = env_rakuten
+        env_yahoo = os.environ.get("YAHOO_APP_ID", "").strip()
+        if env_yahoo:
+            cfg.yahoo_app_id = env_yahoo
+        env_lsp = os.environ.get("LSP_VALUE_YEN", "").strip()
+        if env_lsp:
+            try:
+                cfg.lsp_value_yen = float(env_lsp)
+            except ValueError:
+                pass
+
+        return cfg

@@ -568,18 +568,31 @@ def _is_relevant_product(query: str, product_name: str) -> bool:
             elif any(v.lower() in name_lower or v.lower() in name_lower_nospace
                      for v in variants):
                 match_count += 1
+        # === 型番マッチの強力ボーナス ===
+        # 型番（英数字+数字、例: SBM24W011, MTJV3, AC-X5）が一致した場合、
+        # それは商品を一意に特定する強い証拠なので、他のキーワードが揃わなくても通す。
+        # ブランド名・色名等の周辺キーワードがマッチしないだけで除外されるのを防止。
+        _MODEL_NUMBER_RE = re.compile(r'^[A-Za-z]{1,5}[\-]?\d{2,}[A-Za-z\d\-]*$')
+        model_keywords = [kw for kw in keywords if _MODEL_NUMBER_RE.match(kw)]
+        for mk in model_keywords:
+            # 型番が商品名に含まれる場合は強マッチ → 単独でも通す
+            if mk.lower() in name_lower or mk.lower() in name_lower_nospace:
+                return True
+
         if len(keywords) == 1:
             if match_count < 1:
                 return False
         elif len(keywords) == 2:
+            # 2キーワード: 両方マッチ必須（厳しすぎる時は1件で許容も検討可）
+            if match_count < 2:
+                return False
+        elif len(keywords) <= 4:
+            # 3-4キーワード: 2件マッチで通す（旧: majority+1 = 厳しすぎた）
             if match_count < 2:
                 return False
         else:
-            # 3-4キーワード: majority+1、5+キーワード: 過半数（majority）
-            if len(keywords) >= 5:
-                required = (len(keywords) + 1) // 2  # 5→3, 6→3, 7→4
-            else:
-                required = (len(keywords) + 1) // 2 + 1  # 3→3, 4→3
+            # 5+キーワード: 過半数
+            required = (len(keywords) + 1) // 2  # 5→3, 6→3, 7→4
             required = min(required, len(keywords))
             if match_count < required:
                 return False
@@ -1907,9 +1920,21 @@ def _scrape_generic(shop_name: str, search_url: str,
 
             # 価格が見つからなかった理由をログ出力
             text_len = len(soup.get_text())
-            logger.info("Phase1 no price for %s (HTML %d chars, status %d)",
-                        shop_name, text_len, resp.status_code)
-            return ShopPrice(shop_name, None, "", "", search_url)
+            html_len = len(resp.text)
+            logger.info("Phase1 no price for %s (HTML %d chars, text %d chars, status %d)",
+                        shop_name, html_len, text_len, resp.status_code)
+
+            # SPA検出: HTMLは大きいがテキストが少ない → JS未描画
+            #          → Phase2 (Playwright) で再試行されるよう「JS描画待ち」エラーを返す
+            if html_len > 20000 and text_len < 8000:
+                return ShopPrice(shop_name, None, "", "", search_url,
+                                 error="JS描画が必要（Phase2へ）")
+            # 「該当なし」ページが返ってきた可能性
+            if _is_no_results_page(soup):
+                return ShopPrice(shop_name, None, "", "", search_url,
+                                 error="商品が見つかりませんでした")
+            return ShopPrice(shop_name, None, "", "", search_url,
+                             error="価格を抽出できませんでした")
 
         except requests.exceptions.SSLError:
             return _make_error_result(shop_name, search_url, "SSL接続エラー（手動で検索してください）")
@@ -3153,7 +3178,9 @@ def _retry_with_browser(results: list[ShopPrice], query: str) -> None:
         return
 
     # 再試行対象の選定
-    _SKIP_ERRORS = {"APIキー", "HTTP 404", "HTTP 410"}
+    # 「商品が見つかりませんでした」もリトライ対象に含む(クエリ簡略化やJS描画で
+    # 解決する可能性があるため)。HTTP 404/410 は確定的にスキップ。
+    _SKIP_ERRORS = {"APIキー", "HTTP 404", "HTTP 410", "取扱ジャンル外"}
     # 自社ブランド専門店：Phase 2でも他ブランド検索は無駄なのでスキップ
     _HOUSE_BRAND_SHOPS = {
         "DHCオンラインショップ": ["dhc"],
