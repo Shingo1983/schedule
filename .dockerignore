@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.git/
+.gitignore
+.env
+*.csv
+*.xlsx
+*.bat
+README.md
+SETUP_GUIDE.md
+render.yaml
+.venv/
+venv/
