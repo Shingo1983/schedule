@@ -28,6 +28,11 @@ def create_app() -> Flask:
         has_api_keys = bool(config.rakuten_app_id or config.yahoo_app_id)
         return render_template("index.html", has_api_keys=has_api_keys)
 
+    @app.route("/healthz")
+    def healthz():
+        """Railway等のヘルスチェック用軽量エンドポイント"""
+        return "ok", 200
+
     @app.route("/search")
     def search():
         config = Config.load()
