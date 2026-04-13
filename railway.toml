@@ -2,8 +2,7 @@
 builder = "dockerfile"
 
 [deploy]
-startCommand = "gunicorn wsgi:app --bind 0.0.0.0:$PORT --workers 1 --threads 4 --worker-class gthread --timeout 300 --access-logfile - --error-logfile -"
-healthcheckPath = "/healthz"
-healthcheckTimeout = 300
+# startCommand を省略（Dockerfile の CMD = start.sh を使用）
+# healthcheck は一時的に無効化: まずは起動ログ確認と公開 URL 手動チェックのため
 restartPolicyType = "on_failure"
 restartPolicyMaxRetries = 3

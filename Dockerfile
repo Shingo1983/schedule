@@ -17,9 +17,11 @@ RUN pip install --no-cache-dir -r requirements.txt \
  && python -m playwright install chromium
 
 COPY . .
+RUN chmod +x /app/start.sh
 
 ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
 # Railway Hobby(512MB-1GB) では Chromium と並行してワーカー複数は OOM 危険なので 1 に
 # gthread で同時リクエスト処理は確保しつつメモリは節約
-# --bind 0.0.0.0:$PORT は sh 経由で $PORT を展開するため shell 形式を使用
-CMD ["sh", "-c", "gunicorn wsgi:app --bind 0.0.0.0:${PORT:-8080} --workers 1 --threads 4 --worker-class gthread --timeout 300 --access-logfile - --error-logfile -"]
+# start.sh で診断ログを出してから gunicorn を起動する
+CMD ["/app/start.sh"]
