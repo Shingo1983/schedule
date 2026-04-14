@@ -807,13 +807,21 @@ def _is_bot_blocked_page(soup: BeautifulSoup) -> bool:
 # 各ショップの価格を取得する。kakaku.com は比較的アクセス制限が緩く、
 # 各商品ページで主要家電量販店の価格を一覧表示している。
 _KAKAKU_SHOP_ALIASES: dict[str, list[str]] = {
-    "ビックカメラ.com": ["ビックカメラ"],
+    "ビックカメラ.com": ["ビックカメラ", "BicCamera"],
     "Joshin webショップ": ["Joshin web", "Joshin", "上新電機", "ジョーシン"],
     "ヤマダウェブコム": ["ヤマダウェブコム", "ヤマダ電機", "ヤマダ"],
     "コジマネット": ["コジマネット", "コジマ"],
     "ケーズデンキオンラインショップ": ["ケーズデンキ", "ケーズ"],
     "エディオンネットショップ": ["エディオン"],
     "ノジマオンライン": ["ノジマオンライン", "ノジマ"],
+    # 家電量販以外にも kakaku.com は意外と広くカバー（家電系ならまず載る）
+    "ソニーストア": ["ソニーストア"],
+    "Amazon.co.jp": ["Amazon", "アマゾン"],
+    "楽天市場": ["楽天ビック", "楽天市場"],
+    "Yahoo!ショッピング": ["Yahoo!ショッピング", "PayPayモール", "LOHACO"],
+    "LOHACO": ["LOHACO", "ロハコ"],
+    "au PAY マーケット": ["au PAY", "auPAY", "Wowma"],
+    "セブンネットショッピング": ["セブンネット"],
 }
 
 
@@ -914,6 +922,139 @@ def _kakaku_fallback(shop_name: str, query: str, original_search_url: str) -> Sh
         )
     except Exception as e:
         logger.debug("kakaku fallback error for %s: %s", shop_name, e)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# ショップ名 → 公式ドメイン（Bing site: 検索で使う）
+# 検索URLから自動推定できないケース or 別ドメインで商品ページを持つケースを補完
+# ---------------------------------------------------------------------------
+_SHOP_DOMAINS: dict[str, list[str]] = {
+    "楽天市場": ["item.rakuten.co.jp"],
+    "Yahoo!ショッピング": ["store.shopping.yahoo.co.jp", "shopping.yahoo.co.jp"],
+    "Amazon.co.jp": ["amazon.co.jp"],
+    "ビックカメラ.com": ["biccamera.com"],
+    "コジマネット": ["kojima.net"],
+    "ヤマダウェブコム": ["yamada-denkiweb.com"],
+    "Joshin webショップ": ["joshinweb.jp"],
+    "au PAY マーケット": ["wowma.jp", "paymarket.auone.jp"],
+    "セブンネットショッピング": ["7net.omni7.jp"],
+    "Qoo10": ["qoo10.jp"],
+    "エディオンネットショップ": ["edion.com"],
+    "ユニクロオンラインストア": ["uniqlo.com"],
+    "無印良品ネットストア": ["muji.com"],
+    "JAL Mall": ["mall.jal.co.jp"],
+    "ベルメゾンネット": ["bellemaison.jp"],
+    "LOHACO": ["lohaco.yahoo.co.jp", "lohaco.jp"],
+    "ニトリネット": ["nitori-net.jp"],
+    "ZOZOTOWN": ["zozo.jp"],
+    "DHCオンラインショップ": ["dhc.co.jp"],
+    "ファンケルオンライン": ["fancl.co.jp"],
+    "ソニーストア": ["sony.jp"],
+    "ケーズデンキオンラインショップ": ["ksdenki.com"],
+    "ノジマオンライン": ["online.nojima.co.jp", "nojima.co.jp"],
+    "マツモトキヨシオンラインストア": ["matsukiyo.co.jp"],
+    "dショッピング": ["dshopping.docomo.ne.jp"],
+    "BUYMA": ["buyma.com"],
+    "ABC-MARTオンラインストア": ["abc-mart.net"],
+    "GU オンラインストア": ["gu-global.com"],
+    "ショップジャパン": ["shopjapan.co.jp"],
+    "iHerb": ["iherb.com"],
+    "@cosme SHOPPING": ["cosme.net"],
+}
+
+
+def _shop_primary_domain(shop_name: str, search_url: str = "") -> str | None:
+    """ショップ名から主要ドメインを返す。
+    _SHOP_DOMAINS が優先、なければ search_url のドメインを使う。
+    """
+    domains = _SHOP_DOMAINS.get(shop_name)
+    if domains:
+        return domains[0]
+    if search_url:
+        netloc = urlparse(search_url).netloc
+        return netloc or None
+    return None
+
+
+def _bing_search_fallback(
+    shop_name: str, query: str, original_search_url: str
+) -> ShopPrice | None:
+    """Bing の `site:<domain>` 検索を使った汎用価格フォールバック。
+
+    Phase 1/2/2.5 すべて失敗したショップ向けの最終手段。
+    Bing は Google に比べて bot 検知が緩く、snippet に価格テキスト
+    （「¥12,345」「12,345円」「税込」）が含まれやすい。
+    成功率は 100% ではないが、スクレイパーが壊れた/存在しないショップでも
+    商品ページの存在を確認＋価格をゲットできる。
+    """
+    domain = _shop_primary_domain(shop_name, original_search_url)
+    if not domain:
+        return None
+
+    # Bing 検索クエリ: `site:domain query 税込` で価格入り snippet を狙う
+    bq = f"site:{domain} {query} 税込"
+    bing_url = f"https://www.bing.com/search?q={quote(bq)}&mkt=ja-JP&setlang=ja&cc=JP"
+
+    try:
+        resp = _fetch(bing_url, headers={"Referer": "https://www.bing.com/"})
+        if resp.status_code != 200:
+            logger.debug("Bing fallback HTTP %d for %s", resp.status_code, shop_name)
+            return None
+        soup = _soup(resp)
+
+        candidates: list[tuple[int, str, str]] = []  # (price, name, url)
+        for item in soup.select("li.b_algo, .b_algo"):
+            title_el = item.select_one("h2 a") or item.select_one("a")
+            if not title_el:
+                continue
+            title = title_el.get_text(strip=True)
+            href = title_el.get("href", "") or ""
+            if not href or domain not in href:
+                continue
+            snippet_el = (item.select_one(".b_caption p")
+                          or item.select_one(".b_snippet")
+                          or item.select_one("p"))
+            snippet = snippet_el.get_text(" ", strip=True) if snippet_el else ""
+            combined = f"{title} {snippet}"
+
+            # 関連性チェック: タイトル（商品名相当）で判定
+            if not _is_relevant_product(query, title):
+                continue
+
+            # 価格抽出: snippet → title → combined の順で試す
+            price = (_parse_price(snippet)
+                     or _parse_price(title)
+                     or _parse_price(combined))
+            if price:
+                candidates.append((price, title, href))
+
+        if not candidates:
+            logger.debug("Bing fallback: no candidates for %s (domain=%s)",
+                         shop_name, domain)
+            return None
+
+        # 外れ値除去（中央値の30%未満除外 — アクセサリ対策）
+        if len(candidates) >= 3:
+            ps = sorted(p for p, _, _ in candidates)
+            median = ps[len(ps) // 2]
+            candidates = [c for c in candidates if c[0] >= median * 0.3]
+
+        if not candidates:
+            return None
+
+        best = min(candidates, key=lambda c: c[0])
+        logger.info("Bing fallback OK: %s = ¥%s (%s)",
+                    shop_name, f"{best[0]:,}", best[1][:50])
+        return ShopPrice(
+            shop_name=shop_name,
+            price=best[0],
+            product_name=best[1] or "(Bing検索経由)",
+            product_url=best[2],
+            search_url=original_search_url,
+        )
+    except Exception as e:
+        logger.debug("Bing fallback error for %s: %s", shop_name, e)
         return None
 
 
@@ -3923,6 +4064,45 @@ def search_all_shops(query: str, config: Config) -> list[ShopPrice]:
         if phase25_found > phase2_found:
             logger.info("Phase 2.5 (kakaku) recovered %d additional shops",
                         phase25_found - phase2_found)
+    else:
+        phase25_found = phase2_found
+
+    # === Phase 2.6: Bing site: 検索による汎用フォールバック ===
+    # kakaku でも拾えなかったショップ（LOHACO, ZOZOTOWN, DHC, ソニーストア 等の
+    # 非・家電系）に対して、Bing 検索の snippet から価格を抽出する最終手段。
+    # どのショップでもドメインさえ分かれば試せる水平思考アプローチ。
+    _SKIP_BING_ERRORS = {"APIキー", "取扱ジャンル外"}
+    bing_targets = [
+        (i, r) for i, r in enumerate(results)
+        if r.price is None
+        and not (r.error and any(s in r.error for s in _SKIP_BING_ERRORS))
+        and _shop_primary_domain(r.shop_name, r.search_url)
+    ]
+    if bing_targets:
+        logger.info("Phase 2.6: Bing fallback for %d shops", len(bing_targets))
+        # Bing への連続アクセスは並列を抑える（レートリミット対策）
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            future_to_idx = {
+                executor.submit(
+                    _bing_search_fallback, r.shop_name, query, r.search_url
+                ): idx
+                for idx, r in bing_targets
+            }
+            for future in as_completed(future_to_idx):
+                idx = future_to_idx[future]
+                try:
+                    fb = future.result(timeout=_TIMEOUT + 5)
+                except Exception as e:
+                    logger.debug("Phase 2.6 exception for %s: %s",
+                                 results[idx].shop_name, e)
+                    continue
+                if fb and fb.price is not None:
+                    results[idx] = fb
+
+        phase26_found = sum(1 for r in results if r.price is not None)
+        if phase26_found > phase25_found:
+            logger.info("Phase 2.6 (Bing) recovered %d additional shops",
+                        phase26_found - phase25_found)
 
     # === Phase 3: クロスショップ価格バリデーション ===
     # 複数ショップの価格を比較し、明らかな外れ値（アクセサリ/無関係商品）を除外
