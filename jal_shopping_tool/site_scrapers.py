@@ -626,9 +626,9 @@ def _is_relevant_product(query: str, product_name: str) -> bool:
     # 「用ケース」「専用カバー」等は除外するが「充電ケース付き」は除外しない
     _ACCESSORY_PATTERNS = [
         # 「〜用」パターン（アクセサリの最も確実な指標）
-        r'用\s*(?:ケース|カバー|フィルム|スタンド|ホルダー|ポーチ|バンド|充電器)',
-        r'専用\s*(?:ケース|カバー|フィルム|イヤーピース|イヤーチップ)',
-        r'対応\s*(?:ケース|カバー|フィルム|充電器)',
+        r'用\s*(?:ケース|カバー|フィルム|スタンド|ホルダー|ポーチ|バンド|充電器|充電パッド|充電スタンド|ランヤード|ストラップ)',
+        r'専用\s*(?:ケース|カバー|フィルム|イヤーピース|イヤーチップ|スタンド|ホルダー|充電器|充電パッド)',
+        r'対応\s*(?:ケース|カバー|フィルム|充電器|スタンド|ホルダー|ポーチ|バンド|充電パッド|充電スタンド|ランヤード|ストラップ)',
         # 素材+ケース（ケース製品を示す）
         r'(?:シリコン|TPU|レザー|ハード|ソフト|クリア|透明)\s*ケース',
         # スタンドアロンのアクセサリワード（「付き」で終わらないもの）
@@ -666,6 +666,17 @@ def _is_relevant_product(query: str, product_name: str) -> bool:
     for pattern in _ACCESSORY_PATTERNS:
         if re.search(pattern, name_lower, re.IGNORECASE):
             return False
+
+    # === 多機種対応アクセサリの除外 ===
+    # 商品名が複数のモデル名をスラッシュ/読点で列挙している場合はアクセサリ。
+    # 例: "Belkin ワイヤレス充電器 AirPods / AirPods Pro / iPhone 15 / 14 / 13 / 12 対応"
+    # 列挙記号(スラッシュ系)が3個以上かつ「対応」「互換」などの語が含まれる場合に限定
+    # （正当な商品名でもスラッシュが混じることはあるので「対応」語と併用判定）
+    separator_count = (name_lower.count('/') + name_lower.count('／')
+                       + name_lower.count('、') + name_lower.count(','))
+    if separator_count >= 3 and ('対応' in name_lower or '互換' in name_lower
+                                  or 'compatible' in name_lower):
+        return False
 
     # === 中古・整備済み品の除外 ===
     _USED_PATTERNS = [
@@ -3867,17 +3878,38 @@ def _validate_prices_cross_shop(results: list[ShopPrice]) -> None:
     if len(prices_with_idx) < 3:
         return  # 3件未満では統計的判断不可
 
-    prices_only = sorted(p for p, _ in prices_with_idx)
-    median = prices_only[len(prices_only) // 2]
-
-    # === Pass 1: 下限外れ値を除去 ===
-    # 中央値の20%未満は明らかな外れ値（非商品ページの誤検出等）
-    lower_threshold = median * 0.20
-    removed_indices = set()
-    for price, idx in prices_with_idx:
-        if price < lower_threshold:
+    # === Pass 1: 反復的トリミング ===
+    # 単純な中央値ベースの下限フィルタでは、半数以上がアクセサリ（低価格帯）の
+    # ケースで中央値自体が汚染され、本物の商品が「高すぎ」と誤判定される。
+    # 「下位を刈る→中央値再計算」を繰り返し、安定するまで収束させる。
+    # 例: [1989, 2918, 5304, 10790, 17776, 27680, 35776] (AirPods Pro検索)
+    #   iter1: median=10790, threshold=3237 → [5304,10790,17776,27680,35776]
+    #   iter2: median=17776, threshold=5332 → [10790,17776,27680,35776]
+    #   iter3: median=22728, threshold=6818 → no change → 収束
+    # (1989, 2918, 5304 が全てアクセサリとして除去される)
+    TRIM_RATIO = 0.30  # 中央値の30%未満は外れ値
+    MAX_ITERS = 4
+    removed_indices: set = set()
+    remaining = list(prices_with_idx)
+    final_median = None
+    for _ in range(MAX_ITERS):
+        if len(remaining) < 3:
+            break
+        ps = sorted(p for p, _ in remaining)
+        final_median = ps[len(ps) // 2]
+        threshold = final_median * TRIM_RATIO
+        new_remaining = []
+        newly_removed = []
+        for price, idx in remaining:
+            if price < threshold:
+                newly_removed.append((price, idx))
+            else:
+                new_remaining.append((price, idx))
+        if not newly_removed:
+            break
+        for price, idx in newly_removed:
             r = results[idx]
-            reason = f"価格が低すぎ（中央値¥{median:,}の20%未満）"
+            reason = f"価格が低すぎ（反復median¥{final_median:,}の{int(TRIM_RATIO*100)}%未満）"
             logger.info("Cross-shop validation: %s ¥%s removed (%s)",
                         r.shop_name, f"{price:,}", reason)
             results[idx] = ShopPrice(
@@ -3885,10 +3917,10 @@ def _validate_prices_cross_shop(results: list[ShopPrice]) -> None:
                 error="価格異常（他店と大きく乖離）"
             )
             removed_indices.add(idx)
+        remaining = new_remaining
 
-    # === Pass 2: 中央値を再計算して上限チェック ===
-    remaining = [(p, i) for p, i in prices_with_idx if i not in removed_indices]
-    if len(remaining) < 5:
+    # === Pass 2: 上限チェック（反復後の中央値で） ===
+    if len(remaining) < 5 or final_median is None:
         return  # 5件未満では上限チェックしない（少数だと誤判定リスク大）
 
     remaining_prices = sorted(p for p, _ in remaining)
