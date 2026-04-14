@@ -74,6 +74,37 @@ def create_app() -> Flask:
             result["phase1_elapsed_s"] = round(_t.time() - t0, 2)
             result["phase1"] = {"exception": str(e), "trace": _tb.format_exc()[-800:]}
 
+        # Phase 1 と同じ HTTP 取得を独立に行い、HTMLのサイズ・先頭テキスト・
+        # 主要コンテナの出現数を返す（cloudscraper が bot 検知ページを返していないか等を検証）
+        diag: dict = {}
+        try:
+            from .site_scrapers import _fetch as _sfetch, _soup as _ssoup
+            search_url_for_diag = (result.get("phase1") or {}).get("search_url") or ""
+            if search_url_for_diag:
+                rd = _sfetch(search_url_for_diag)
+                diag["status_code"] = rd.status_code
+                diag["html_length"] = len(rd.text)
+                diag["content_type"] = rd.headers.get("Content-Type", "")[:100]
+                sp2 = _ssoup(rd)
+                title_el = sp2.find("title")
+                diag["title"] = (title_el.get_text(strip=True)[:120]
+                                 if title_el else "")
+                # 代表的な Amazon コンテナセレクタのマッチ数を記録
+                for sel in [
+                    '[data-component-type="s-search-result"]',
+                    'div[data-asin]:not([data-asin=""])',
+                    '.s-result-item[data-asin]',
+                    '[role="listitem"][data-asin]',
+                    '.a-price .a-offscreen',
+                    '.a-price-whole',
+                ]:
+                    diag[f"count::{sel}"] = len(sp2.select(sel))
+                # HTML 先頭 400 文字（bot チャレンジページ判定用）
+                diag["html_head"] = rd.text[:400]
+        except Exception as e:
+            diag["error"] = str(e)
+        result["phase1_diag"] = diag
+
         # Playwright Phase 2 を単発で叩く
         pw_info: dict = {}
         try:

@@ -2349,8 +2349,22 @@ def _extract_amazon_candidates(soup, query_for_filter: str):
     """Amazon 検索結果HTMLから (price, name, url) 候補リストを抽出する。
     関連性フィルタは呼び出し側で切り替えられるように query_for_filter を受け取る。
     """
-    results_found = soup.select('[data-component-type="s-search-result"]')
-    logger.info("Amazon: found %d search result blocks", len(results_found))
+    # コンテナセレクタを複数試行（Amazon HTML は頻繁に変わる）
+    container_selectors = [
+        '[data-component-type="s-search-result"]',
+        'div[data-asin]:not([data-asin=""])',
+        '.s-result-item[data-asin]',
+        '[role="listitem"][data-asin]',
+    ]
+    results_found = []
+    matched_selector = None
+    for sel in container_selectors:
+        results_found = soup.select(sel)
+        if results_found:
+            matched_selector = sel
+            break
+    logger.info("Amazon: found %d search result blocks (selector=%s)",
+                 len(results_found), matched_selector)
 
     all_candidates = []
     nameless_fallback = None  # (price, url)
