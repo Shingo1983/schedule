@@ -81,7 +81,12 @@ def create_app() -> Flask:
             from .site_scrapers import _fetch as _sfetch, _soup as _ssoup
             search_url_for_diag = (result.get("phase1") or {}).get("search_url") or ""
             if search_url_for_diag:
-                rd = _sfetch(search_url_for_diag)
+                # Amazon 診断は cookie 付きで fetch する（JPY 強制 cookie なしだと USD が出る）
+                if "amazon" in search_url_for_diag.lower():
+                    from .site_scrapers import _fetch_amazon as _afetch
+                    rd = _afetch(search_url_for_diag)
+                else:
+                    rd = _sfetch(search_url_for_diag)
                 diag["status_code"] = rd.status_code
                 diag["html_length"] = len(rd.text)
                 diag["content_type"] = rd.headers.get("Content-Type", "")[:100]
