@@ -977,85 +977,184 @@ def _shop_primary_domain(shop_name: str, search_url: str = "") -> str | None:
     return None
 
 
+def _extract_from_search_snippets(soup, query: str, domain: str,
+                                    item_sel: str, link_sel: str,
+                                    snippet_sels: list[str],
+                                    relevance_required: bool = True
+                                    ) -> list[tuple[int, str, str]]:
+    """検索エンジン結果の snippet から (price, name, url) 候補リストを抽出する共通関数。
+    Bing/DuckDuckGo/Yahoo Japan 検索いずれも構造が同じなので共用。
+    """
+    candidates: list[tuple[int, str, str]] = []
+    for item in soup.select(item_sel):
+        title_el = item.select_one(link_sel)
+        if not title_el:
+            continue
+        title = title_el.get_text(strip=True)
+        href = title_el.get("href", "") or ""
+        # DuckDuckGo はリダイレクト URL を使うので uddg パラメータから実URL抽出
+        if "duckduckgo.com/l/" in href or "/l/?uddg=" in href:
+            m = re.search(r"uddg=([^&]+)", href)
+            if m:
+                from urllib.parse import unquote
+                href = unquote(m.group(1))
+        if not href or domain not in href:
+            continue
+
+        snippet_text = ""
+        for ss in snippet_sels:
+            snippet_el = item.select_one(ss)
+            if snippet_el:
+                snippet_text = snippet_el.get_text(" ", strip=True)
+                if snippet_text:
+                    break
+        combined = f"{title} {snippet_text}"
+
+        if relevance_required and not _is_relevant_product(query, title):
+            # タイトルで落ちた場合 title+snippet でも試す（snippet にキーワードが
+            # あるケース: カテゴリページや型番ページ）
+            if not _is_relevant_product(query, combined):
+                continue
+
+        price = (_parse_price(snippet_text)
+                 or _parse_price(title)
+                 or _parse_price(combined))
+        if price:
+            candidates.append((price, title, href))
+    return candidates
+
+
+def _bing_query(q: str, domain: str) -> list[tuple[int, str, str]]:
+    """Bing で `site:domain q 税込` を検索して snippet から候補抽出。"""
+    bq = f"site:{domain} {q} 税込"
+    bing_url = f"https://www.bing.com/search?q={quote(bq)}&mkt=ja-JP&setlang=ja&cc=JP"
+    try:
+        resp = _fetch(bing_url, headers={"Referer": "https://www.bing.com/"})
+        if resp.status_code != 200:
+            return []
+        soup = _soup(resp)
+        return _extract_from_search_snippets(
+            soup, q, domain,
+            item_sel="li.b_algo, .b_algo",
+            link_sel="h2 a",
+            snippet_sels=[".b_caption p", ".b_snippet", "p"],
+        )
+    except Exception:
+        return []
+
+
+def _duckduckgo_query(q: str, domain: str) -> list[tuple[int, str, str]]:
+    """DuckDuckGo HTML 版で `site:domain q 税込` を検索。
+    Bing と別エンジンを使うことでインデックス差を補う。
+    """
+    dq = f"site:{domain} {q} 税込"
+    ddg_url = f"https://html.duckduckgo.com/html/?q={quote(dq)}&kl=jp-jp"
+    try:
+        resp = _fetch(ddg_url, headers={"Referer": "https://duckduckgo.com/"})
+        if resp.status_code != 200:
+            return []
+        soup = _soup(resp)
+        return _extract_from_search_snippets(
+            soup, q, domain,
+            item_sel=".result, .web-result, div.results_links",
+            link_sel="a.result__a, a.result-link, h2 a",
+            snippet_sels=[".result__snippet", ".snippet", "a.result__snippet"],
+        )
+    except Exception:
+        return []
+
+
+def _yahoojp_query(q: str, domain: str) -> list[tuple[int, str, str]]:
+    """Yahoo! JAPAN 検索（Google 系エンジンベース）で site: 検索。"""
+    yq = f"site:{domain} {q} 税込"
+    yj_url = f"https://search.yahoo.co.jp/search?p={quote(yq)}&ei=UTF-8"
+    try:
+        resp = _fetch(yj_url, headers={"Referer": "https://search.yahoo.co.jp/"})
+        if resp.status_code != 200:
+            return []
+        soup = _soup(resp)
+        return _extract_from_search_snippets(
+            soup, q, domain,
+            item_sel=".sw-CardBase, .Algo, div.w, li.Sw-Card",
+            link_sel="a.sw-Card__titleInner, h3 a, a.Title",
+            snippet_sels=[".sw-Card__summary", ".Desc", ".compText", "p"],
+        )
+    except Exception:
+        return []
+
+
 def _bing_search_fallback(
     shop_name: str, query: str, original_search_url: str
 ) -> ShopPrice | None:
-    """Bing の `site:<domain>` 検索を使った汎用価格フォールバック。
+    """Web 検索エンジンの `site:<domain>` 検索を組み合わせた汎用価格フォールバック。
 
     Phase 1/2/2.5 すべて失敗したショップ向けの最終手段。
-    Bing は Google に比べて bot 検知が緩く、snippet に価格テキスト
-    （「¥12,345」「12,345円」「税込」）が含まれやすい。
-    成功率は 100% ではないが、スクレイパーが壊れた/存在しないショップでも
-    商品ページの存在を確認＋価格をゲットできる。
+    ショップ HTML に依存せず、複数の検索エンジン（Bing / DuckDuckGo / Yahoo JP）の
+    snippet から価格を抽出する水平思考アプローチ。
+
+    戦略:
+    1. Bing で `site:domain query 税込` 検索
+    2. 候補が取れなければ簡略クエリで Bing を再検索
+    3. それでも取れなければ DuckDuckGo で検索
+    4. 最後の手段として Yahoo! JAPAN 検索
     """
     domain = _shop_primary_domain(shop_name, original_search_url)
     if not domain:
         return None
 
-    # Bing 検索クエリ: `site:domain query 税込` で価格入り snippet を狙う
-    bq = f"site:{domain} {query} 税込"
-    bing_url = f"https://www.bing.com/search?q={quote(bq)}&mkt=ja-JP&setlang=ja&cc=JP"
+    queries_to_try = [query]
+    simp = _simplify_query(query)
+    if simp and simp not in queries_to_try:
+        queries_to_try.append(simp)
 
-    try:
-        resp = _fetch(bing_url, headers={"Referer": "https://www.bing.com/"})
-        if resp.status_code != 200:
-            logger.debug("Bing fallback HTTP %d for %s", resp.status_code, shop_name)
-            return None
-        soup = _soup(resp)
+    all_candidates: list[tuple[int, str, str]] = []
+    source_used = None
 
-        candidates: list[tuple[int, str, str]] = []  # (price, name, url)
-        for item in soup.select("li.b_algo, .b_algo"):
-            title_el = item.select_one("h2 a") or item.select_one("a")
-            if not title_el:
-                continue
-            title = title_el.get_text(strip=True)
-            href = title_el.get("href", "") or ""
-            if not href or domain not in href:
-                continue
-            snippet_el = (item.select_one(".b_caption p")
-                          or item.select_one(".b_snippet")
-                          or item.select_one("p"))
-            snippet = snippet_el.get_text(" ", strip=True) if snippet_el else ""
-            combined = f"{title} {snippet}"
+    # 各検索エンジンを順に試行。候補が得られた時点で中断。
+    engines = [
+        ("Bing", _bing_query),
+        ("DDG", _duckduckgo_query),
+        ("YahooJP", _yahoojp_query),
+    ]
+    for engine_name, engine_fn in engines:
+        for q in queries_to_try:
+            try:
+                cands = engine_fn(q, domain)
+            except Exception as e:
+                logger.debug("Search engine %s error for %s: %s",
+                             engine_name, shop_name, e)
+                cands = []
+            if cands:
+                all_candidates = cands
+                source_used = f"{engine_name}[{q[:30]}]"
+                break
+        if all_candidates:
+            break
 
-            # 関連性チェック: タイトル（商品名相当）で判定
-            if not _is_relevant_product(query, title):
-                continue
-
-            # 価格抽出: snippet → title → combined の順で試す
-            price = (_parse_price(snippet)
-                     or _parse_price(title)
-                     or _parse_price(combined))
-            if price:
-                candidates.append((price, title, href))
-
-        if not candidates:
-            logger.debug("Bing fallback: no candidates for %s (domain=%s)",
-                         shop_name, domain)
-            return None
-
-        # 外れ値除去（中央値の30%未満除外 — アクセサリ対策）
-        if len(candidates) >= 3:
-            ps = sorted(p for p, _, _ in candidates)
-            median = ps[len(ps) // 2]
-            candidates = [c for c in candidates if c[0] >= median * 0.3]
-
-        if not candidates:
-            return None
-
-        best = min(candidates, key=lambda c: c[0])
-        logger.info("Bing fallback OK: %s = ¥%s (%s)",
-                    shop_name, f"{best[0]:,}", best[1][:50])
-        return ShopPrice(
-            shop_name=shop_name,
-            price=best[0],
-            product_name=best[1] or "(Bing検索経由)",
-            product_url=best[2],
-            search_url=original_search_url,
-        )
-    except Exception as e:
-        logger.debug("Bing fallback error for %s: %s", shop_name, e)
+    if not all_candidates:
+        logger.debug("Web search fallback: no candidates for %s (domain=%s)",
+                     shop_name, domain)
         return None
+
+    # 外れ値除去（中央値の30%未満除外 — アクセサリ対策）
+    if len(all_candidates) >= 3:
+        ps = sorted(p for p, _, _ in all_candidates)
+        median = ps[len(ps) // 2]
+        all_candidates = [c for c in all_candidates if c[0] >= median * 0.3]
+
+    if not all_candidates:
+        return None
+
+    best = min(all_candidates, key=lambda c: c[0])
+    logger.info("Web search fallback OK: %s = ¥%s (%s) [src=%s]",
+                shop_name, f"{best[0]:,}", best[1][:50], source_used)
+    return ShopPrice(
+        shop_name=shop_name,
+        price=best[0],
+        product_name=best[1] or f"({source_used}経由)",
+        product_url=best[2],
+        search_url=original_search_url,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2660,15 +2759,30 @@ def search_amazon(query: str, _config: Config) -> ShopPrice:
 
         # 最安値を返す（候補がある場合）
         if all_candidates:
-            # 定価アンカーが取得できていれば、定価の80%未満は除外（ユーザー方針）
-            if max_list_price:
-                lower = int(max_list_price * 0.80)
+            # 定価アンカーが取得できていれば、定価の70%未満は除外（ユーザー方針）
+            # 70% 閾値: 80% だとセール品・型落ち等の正当な値引きまで弾いてしまうため緩和。
+            # 「それ以上安いのは怖い」が目的なので、30% 引き超（つまり -30%〜）までは許容。
+            # ただし定価が極端に低い（¥2000 未満）ケースは誤検出（スペック値を定価と誤認等）が
+            # 多いためフィルタを適用しない。
+            if max_list_price and max_list_price >= 2000:
+                lower = int(max_list_price * 0.70)
                 pre_n = len(all_candidates)
-                all_candidates = [c for c in all_candidates if c[0] >= lower]
-                if pre_n != len(all_candidates):
-                    logger.info("Amazon: list_price anchor ¥%s → lower=¥%s, %d→%d candidates",
-                                f"{max_list_price:,}", f"{lower:,}",
-                                pre_n, len(all_candidates))
+                filtered = [c for c in all_candidates if c[0] >= lower]
+                # フィルタで全滅するケースは閾値が強すぎた可能性が高いのでスキップ
+                if filtered:
+                    all_candidates = filtered
+                    if pre_n != len(all_candidates):
+                        logger.info("Amazon: list_price anchor ¥%s → lower=¥%s (70%%), %d→%d candidates",
+                                    f"{max_list_price:,}", f"{lower:,}",
+                                    pre_n, len(all_candidates))
+                else:
+                    logger.info("Amazon: list_price ¥%s anchor would remove all %d candidates — skipping filter",
+                                f"{max_list_price:,}", pre_n)
+                    # 全滅する場合は定価が誤検出と判断し、中央値ベースに切り替え
+                    prices = sorted(c[0] for c in all_candidates)
+                    if len(prices) >= 3:
+                        median = prices[len(prices) // 2]
+                        all_candidates = [c for c in all_candidates if c[0] >= median * 0.3]
             else:
                 # 定価不明時のみ中央値ベースの外れ値除去
                 prices = sorted(c[0] for c in all_candidates)
@@ -2720,9 +2834,11 @@ def search_amazon(query: str, _config: Config) -> ShopPrice:
                             label, len(retry_candidates),
                             f"¥{retry_max_list:,}" if retry_max_list else "なし")
                 if retry_candidates:
-                    if retry_max_list:
-                        lower = int(retry_max_list * 0.80)
-                        retry_candidates = [c for c in retry_candidates if c[0] >= lower]
+                    if retry_max_list and retry_max_list >= 2000:
+                        lower = int(retry_max_list * 0.70)
+                        filtered = [c for c in retry_candidates if c[0] >= lower]
+                        if filtered:
+                            retry_candidates = filtered
                     else:
                         prices = sorted(c[0] for c in retry_candidates)
                         if len(prices) >= 3:
@@ -4134,28 +4250,34 @@ def _validate_prices_cross_shop(results: list[ShopPrice]) -> None:
     # 複数ショップから list_price が取れた場合、その最大値をアンカーとする
     # （一番信頼できる定価情報を採用）。
     list_prices = [r.list_price for r in results
-                   if r.price is not None and r.list_price]
+                   if r.price is not None and r.list_price and r.list_price >= 2000]
     if list_prices:
         anchor = max(list_prices)
-        lower_bound = int(anchor * 0.80)
-        logger.info("Cross-shop: list_price anchor=¥%s, lower_bound=¥%s (from %d shops)",
-                    f"{anchor:,}", f"{lower_bound:,}", len(list_prices))
-        new_prices_with_idx = []
-        for price, idx in prices_with_idx:
-            if price < lower_bound:
-                r = results[idx]
-                reason = f"定価¥{anchor:,}の80%未満（¥{lower_bound:,}）"
-                logger.info("Cross-shop validation: %s ¥%s removed (%s)",
-                            r.shop_name, f"{price:,}", reason)
-                results[idx] = ShopPrice(
-                    r.shop_name, None, "", "", r.search_url,
-                    error="価格が定価の80%未満（アクセサリ等の可能性）"
-                )
-            else:
-                new_prices_with_idx.append((price, idx))
-        prices_with_idx = new_prices_with_idx
-        if len(prices_with_idx) < 3:
-            return  # アンカー除外後、統計判断する母数が不足
+        lower_bound = int(anchor * 0.70)  # 30%引きまでは許容（80%→70%に緩和）
+        # 安全弁: フィルタで半分以上が消える場合は定価が信頼できないと判断しスキップ
+        would_remove = sum(1 for p, _ in prices_with_idx if p < lower_bound)
+        if would_remove > len(prices_with_idx) // 2:
+            logger.info("Cross-shop: list_price anchor ¥%s would remove %d/%d shops — skipping (likely unreliable anchor)",
+                        f"{anchor:,}", would_remove, len(prices_with_idx))
+        else:
+            logger.info("Cross-shop: list_price anchor=¥%s, lower_bound=¥%s (70%%, from %d shops)",
+                        f"{anchor:,}", f"{lower_bound:,}", len(list_prices))
+            new_prices_with_idx = []
+            for price, idx in prices_with_idx:
+                if price < lower_bound:
+                    r = results[idx]
+                    reason = f"定価¥{anchor:,}の70%未満（¥{lower_bound:,}）"
+                    logger.info("Cross-shop validation: %s ¥%s removed (%s)",
+                                r.shop_name, f"{price:,}", reason)
+                    results[idx] = ShopPrice(
+                        r.shop_name, None, "", "", r.search_url,
+                        error="価格が定価の70%未満（アクセサリ等の可能性）"
+                    )
+                else:
+                    new_prices_with_idx.append((price, idx))
+            prices_with_idx = new_prices_with_idx
+            if len(prices_with_idx) < 3:
+                return  # アンカー除外後、統計判断する母数が不足
 
     # === Pass 1: 反復的トリミング ===
     # 単純な中央値ベースの下限フィルタでは、半数以上がアクセサリ（低価格帯）の
