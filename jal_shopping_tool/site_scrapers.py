@@ -977,6 +977,103 @@ def _shop_primary_domain(shop_name: str, search_url: str = "") -> str | None:
     return None
 
 
+def _fetch_product_page_price(url: str, query: str) -> tuple[int | None, str]:
+    """検索エンジン経由で見つけた商品ページを直接 GET して価格を抽出する。
+    Returns: (price, product_name) — 取れなかった場合は (None, "")
+
+    戦略（汎用的で壊れにくい順）:
+      1. JSON-LD (Product/Offer) — SEO 用に大半の EC サイトが埋め込む
+      2. Meta tag (og:price, product:price, itemprop=price)
+      3. よくある CSS クラス（.price, [itemprop="price"] 等）
+      4. <title> / <h1> 周辺の価格テキストを抽出
+    """
+    try:
+        resp = _fetch(url)
+        if resp.status_code != 200:
+            return None, ""
+        soup = _soup(resp)
+        if _is_bot_blocked_page(soup):
+            return None, ""
+
+        # 商品名: title または h1
+        title_el = soup.find("title")
+        h1_el = soup.find("h1")
+        product_name = ""
+        if h1_el:
+            product_name = h1_el.get_text(strip=True)[:120]
+        if not product_name and title_el:
+            product_name = title_el.get_text(strip=True)[:120]
+
+        # 1. JSON-LD
+        jsonld_items = _extract_jsonld_prices(soup)
+        if jsonld_items:
+            # 関連性の高いものを優先
+            relevant = [it for it in jsonld_items
+                        if _is_relevant_product(query, it.get("name", ""))]
+            pool = relevant or jsonld_items
+            # 最小価格を採用（合理的に正の値）
+            best = min(pool, key=lambda x: x.get("price", 10**9))
+            if best.get("price"):
+                return int(best["price"]), best.get("name") or product_name
+
+        # 2. Meta tag
+        for sel in [
+            'meta[property="product:price:amount"]',
+            'meta[property="og:price:amount"]',
+            'meta[itemprop="price"]',
+            'meta[name="twitter:data1"]',
+        ]:
+            el = soup.select_one(sel)
+            if el and el.get("content"):
+                p = _parse_price(el["content"])
+                if p and 100 <= p <= 99_999_999:
+                    return p, product_name
+
+        # 3. 一般的な価格セレクタ
+        price_selectors = [
+            '[itemprop="price"]',
+            '.price-value', '.priceValue', '.PriceValue',
+            '.product-price', '.productPrice', '.item-price',
+            '.p-price__value', '.price__value',
+            '.current-price', '.sellingPrice', '.selling-price',
+            '.price-current', '.priceCurrent',
+            '.price', '.Price',
+            '[class*="Price"][class*="current"]',
+            '[class*="price"][class*="tax"]',
+            '.tax-in', '.zeikomi',
+        ]
+        for sel in price_selectors:
+            for el in soup.select(sel)[:8]:
+                # content 属性（itemprop=price）を優先
+                content = el.get("content", "") or ""
+                text = content or el.get_text(" ", strip=True)
+                if not text:
+                    continue
+                # 価格らしさチェック: ¥/円/税/price が含まれるか数値 only
+                p = _parse_price(text)
+                if p and 100 <= p <= 99_999_999:
+                    return p, product_name
+
+        # 4. 本文全体から「税込」「￥」パターンを拾う最終手段
+        body_text = soup.get_text(" ", strip=True)[:5000]
+        # 「税込￥1,234」「1,234円（税込）」パターン
+        for pat in [
+            r'税込\s*[¥￥]?\s*([\d,]+)\s*円?',
+            r'[¥￥]\s*([\d,]+)\s*\(税込\)',
+            r'販売価格\s*[¥￥]?\s*([\d,]+)',
+        ]:
+            m = re.search(pat, body_text)
+            if m:
+                p = _parse_price(m.group(0))
+                if p and 100 <= p <= 99_999_999:
+                    return p, product_name
+
+        return None, product_name
+    except Exception as e:
+        logger.debug("product page fetch error for %s: %s", url[:80], e)
+        return None, ""
+
+
 def _extract_from_search_snippets(soup, query: str, domain: str,
                                     item_sel: str, link_sel: str,
                                     snippet_sels: list[str],
@@ -986,6 +1083,8 @@ def _extract_from_search_snippets(soup, query: str, domain: str,
     Bing/DuckDuckGo/Yahoo Japan 検索いずれも構造が同じなので共用。
     """
     candidates: list[tuple[int, str, str]] = []
+    # snippet に価格が取れなかったが商品ページっぽい URL は後で直接フェッチ
+    urls_without_price: list[tuple[str, str]] = []  # (title, url)
     for item in soup.select(item_sel):
         title_el = item.select_one(link_sel)
         if not title_el:
@@ -1011,8 +1110,7 @@ def _extract_from_search_snippets(soup, query: str, domain: str,
         combined = f"{title} {snippet_text}"
 
         if relevance_required and not _is_relevant_product(query, title):
-            # タイトルで落ちた場合 title+snippet でも試す（snippet にキーワードが
-            # あるケース: カテゴリページや型番ページ）
+            # タイトルで落ちた場合 title+snippet でも試す
             if not _is_relevant_product(query, combined):
                 continue
 
@@ -1021,6 +1119,21 @@ def _extract_from_search_snippets(soup, query: str, domain: str,
                  or _parse_price(combined))
         if price:
             candidates.append((price, title, href))
+        else:
+            # 商品ページっぽい URL（/item/, /product(s)/, /goods/, /detail/, /dp/, /g/, /p/ 等）
+            # は候補としてキープ。snippet に価格がなくても直接フェッチで取れる。
+            if re.search(r"/(item|products?|goods|detail|dp|g|p)/", href, re.I):
+                urls_without_price.append((title, href))
+
+    # snippet 経由で価格候補が取れなかった場合、商品ページを直接 GET して抽出
+    # （最大3件まで: レイテンシとサーバ負荷の balance）
+    if not candidates and urls_without_price:
+        for title, url in urls_without_price[:3]:
+            p, page_name = _fetch_product_page_price(url, query)
+            if p:
+                name = page_name or title
+                candidates.append((p, name, url))
+
     return candidates
 
 
@@ -4183,11 +4296,12 @@ def search_all_shops(query: str, config: Config) -> list[ShopPrice]:
     else:
         phase25_found = phase2_found
 
-    # === Phase 2.6: Bing site: 検索による汎用フォールバック ===
-    # kakaku でも拾えなかったショップ（LOHACO, ZOZOTOWN, DHC, ソニーストア 等の
-    # 非・家電系）に対して、Bing 検索の snippet から価格を抽出する最終手段。
-    # どのショップでもドメインさえ分かれば試せる水平思考アプローチ。
-    _SKIP_BING_ERRORS = {"APIキー", "取扱ジャンル外"}
+    # === Phase 2.6: 検索エンジン site: 検索による汎用フォールバック ===
+    # kakaku でも拾えなかったショップ向け。Bing/DDG/Yahoo JP を順に試行する
+    # 水平思考アプローチ。商品ページ URL が取れれば直接フェッチして価格抽出。
+    # 「取扱ジャンル外」で事前に弾かれた shop も、ユーザーは「全件取れる」と
+    # 確信しているのでここでは genre フィルタを通さない（総合モールは全商品扱う）。
+    _SKIP_BING_ERRORS = {"APIキー"}
     bing_targets = [
         (i, r) for i, r in enumerate(results)
         if r.price is None
