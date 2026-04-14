@@ -780,6 +780,125 @@ def _is_bot_blocked_page(soup: BeautifulSoup) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# kakaku.com 経由フォールバック（Akamai IPブロック対策）
+# ---------------------------------------------------------------------------
+# ビックカメラ.com、ヤマダウェブコム、Joshin 等の家電量販店サイトは
+# Akamai により Railway 等のデータセンターIPからのアクセスを完全遮断する。
+# これらは直接スクレイプ不可能なため、価格比較サイト kakaku.com を経由して
+# 各ショップの価格を取得する。kakaku.com は比較的アクセス制限が緩く、
+# 各商品ページで主要家電量販店の価格を一覧表示している。
+_KAKAKU_SHOP_ALIASES: dict[str, list[str]] = {
+    "ビックカメラ.com": ["ビックカメラ"],
+    "Joshin webショップ": ["Joshin web", "Joshin", "上新電機", "ジョーシン"],
+    "ヤマダウェブコム": ["ヤマダウェブコム", "ヤマダ電機", "ヤマダ"],
+    "コジマネット": ["コジマネット", "コジマ"],
+    "ケーズデンキオンラインショップ": ["ケーズデンキ", "ケーズ"],
+    "エディオンネットショップ": ["エディオン"],
+    "ノジマオンライン": ["ノジマオンライン", "ノジマ"],
+}
+
+
+def _kakaku_fallback(shop_name: str, query: str, original_search_url: str) -> ShopPrice | None:
+    """kakaku.com の価格比較表から指定ショップの価格を抽出する（フォールバック）。
+
+    Akamai IPブロックで本体サイトを直接スクレイプできない家電量販店向け。
+    kakaku.com の検索→商品ページ→価格比較表と辿って、指定ショップの価格行を拾う。
+    見つからなければ None。
+    """
+    aliases = _KAKAKU_SHOP_ALIASES.get(shop_name)
+    if not aliases:
+        return None
+
+    try:
+        # Step 1: kakaku.com で検索
+        ks_search_url = f"https://kakaku.com/search_results/{quote(query)}/"
+        resp = _fetch(ks_search_url, headers={"Referer": "https://kakaku.com/"})
+        if resp.status_code != 200:
+            logger.debug("kakaku search HTTP %d for %s", resp.status_code, shop_name)
+            return None
+        soup = _soup(resp)
+        if _is_bot_blocked_page(soup):
+            return None
+
+        # Step 2: 検索結果から最初の関連商品の商品ページを特定
+        product_url = None
+        product_name = ""
+        # kakaku.com の商品URL: https://kakaku.com/item/{id}/ or /item/K0001234567/
+        for a in soup.select('a[href*="/item/"]'):
+            href = a.get('href', '') or ''
+            m = re.search(r'/item/([KJ]?\d+)/', href)
+            if not m:
+                continue
+            candidate = a.get_text(strip=True)
+            if len(candidate) < 5:
+                continue
+            if not _is_relevant_product(query, candidate):
+                continue
+            product_id = m.group(1)
+            product_url = f"https://kakaku.com/item/{product_id}/"
+            product_name = candidate
+            break
+
+        if not product_url:
+            logger.debug("kakaku: no relevant product found for '%s' (%s)", query, shop_name)
+            return None
+
+        # Step 3: 価格比較ページを取得
+        compare_url = product_url + "itemlist.aspx"
+        resp2 = _fetch(compare_url, headers={"Referer": product_url})
+        if resp2.status_code != 200:
+            resp2 = _fetch(product_url, headers={"Referer": ks_search_url})
+            if resp2.status_code != 200:
+                return None
+        soup2 = _soup(resp2)
+        if _is_bot_blocked_page(soup2):
+            return None
+
+        # Step 4: 各tr行からショップ名と価格を抽出
+        best_price = None
+        for row in soup2.select('tr'):
+            row_text = row.get_text(" ", strip=True)
+            if not row_text:
+                continue
+            # ショップ名エイリアスに一致する行のみ
+            if not any(alias in row_text for alias in aliases):
+                continue
+            # 価格セル（複数セレクタ試行）
+            price = None
+            for sel in ['.p-PriceTable_price', '.pricetext', '.td-priceSet',
+                        '[class*="price"] .num', '[class*="Price"] .num',
+                        '[class*="price"]']:
+                price_el = row.select_one(sel)
+                if price_el:
+                    price = _parse_price(price_el.get_text())
+                    if price:
+                        break
+            if not price:
+                # 行全体のテキストから最初の価格数値を抽出
+                price = _parse_price(row_text)
+            if price:
+                if best_price is None or price < best_price:
+                    best_price = price
+
+        if best_price is None:
+            logger.debug("kakaku: %s not listed on %s", shop_name, product_url)
+            return None
+
+        logger.info("kakaku fallback OK: %s = ¥%s (%s)",
+                    shop_name, f"{best_price:,}", product_name[:50])
+        return ShopPrice(
+            shop_name=shop_name,
+            price=best_price,
+            product_name=product_name or "(価格.com経由)",
+            product_url=product_url,
+            search_url=original_search_url,
+        )
+    except Exception as e:
+        logger.debug("kakaku fallback error for %s: %s", shop_name, e)
+        return None
+
+
+# ---------------------------------------------------------------------------
 # 共通抽出関数
 # ---------------------------------------------------------------------------
 
@@ -2149,6 +2268,125 @@ def search_yahoo(query: str, config: Config) -> ShopPrice:
 # ============================================================
 # Amazon.co.jp (スクレイピング)
 # ============================================================
+def _extract_amazon_price(result) -> int | None:
+    """Amazon 検索結果カードから価格を抽出する（2025/2026 HTML対応）。
+
+    旧コードの `.a-price .a-price-whole` だけでは最近の Amazon HTML では
+    マッチしないケースが多発しているため、複数セレクタを順に試す。
+    優先順位:
+      1. `.a-price .a-offscreen`  → 完全な価格文字列「￥1,234」
+      2. `.a-price-whole` 単独
+      3. `span[aria-label*="￥"]` / `aria-label*="円"`
+      4. `[data-cy="price-recipe"] .a-offscreen`
+    最初に見つけた有効な価格（取り消し線=.a-text-price は除外）を返す。
+    """
+    # 取り消し線（旧価格）は除外
+    selectors = [
+        '.a-price:not(.a-text-price) .a-offscreen',
+        '[data-cy="price-recipe"] .a-price:not(.a-text-price) .a-offscreen',
+        '[data-cy="price-recipe"] .a-offscreen',
+        '.a-price .a-offscreen',
+        '.a-price:not(.a-text-price) .a-price-whole',
+        '.a-price-whole',
+        'span[data-a-color="price"] .a-offscreen',
+    ]
+    for sel in selectors:
+        el = result.select_one(sel)
+        if not el:
+            continue
+        txt = el.get_text(strip=True)
+        if not txt:
+            txt = el.get('aria-label', '') or ''
+        p = _parse_price(txt)
+        if p:
+            return p
+
+    # 最後の手段: aria-label に価格が入っているケース
+    for el in result.select('span[aria-label]'):
+        label = el.get('aria-label', '') or ''
+        if '￥' in label or '¥' in label or '円' in label:
+            p = _parse_price(label)
+            if p:
+                return p
+    return None
+
+
+def _extract_amazon_name(result) -> str:
+    """Amazon 検索結果カードから商品名を抽出する。"""
+    # 方法1: 各種CSSセレクタ（2025/2026 対応）
+    for name_sel in ["h2 a span", "h2 span", "h2 a",
+                     '[data-cy="title-recipe"] h2 span',
+                     '[data-cy="title-recipe"] a span',
+                     '[data-cy="title-recipe"] a',
+                     ".a-text-normal", ".a-link-normal .a-text-normal",
+                     'span[class*="a-size-medium"]',
+                     'span[class*="a-size-base-plus"]']:
+        title_el = result.select_one(name_sel)
+        if title_el:
+            name = title_el.get_text(strip=True)
+            if name:
+                return name
+    # 方法2: h2全体のテキスト
+    h2 = result.select_one("h2")
+    if h2:
+        name = h2.get_text(strip=True)
+        if name:
+            return name
+    # 方法3: aria-label
+    for el in result.select("[aria-label]"):
+        label = el.get("aria-label", "") or ""
+        # 価格のaria-labelは除外
+        if len(label) > 10 and '￥' not in label and '¥' not in label and '円' not in label:
+            return label
+    # 方法4: 画像alt
+    img = result.select_one("img.s-image, img[data-image-latency]")
+    if img and img.get("alt"):
+        return img["alt"]
+    return ""
+
+
+def _extract_amazon_candidates(soup, query_for_filter: str):
+    """Amazon 検索結果HTMLから (price, name, url) 候補リストを抽出する。
+    関連性フィルタは呼び出し側で切り替えられるように query_for_filter を受け取る。
+    """
+    results_found = soup.select('[data-component-type="s-search-result"]')
+    logger.info("Amazon: found %d search result blocks", len(results_found))
+
+    all_candidates = []
+    nameless_fallback = None  # (price, url)
+
+    for result in results_found:
+        sponsored = result.select_one('.s-label-popover-default')
+        if sponsored and 'スポンサー' in sponsored.get_text():
+            continue
+
+        price = _extract_amazon_price(result)
+        if not price:
+            continue
+
+        name = _extract_amazon_name(result)
+
+        # 関連性チェック
+        if name and not _is_relevant_product(query_for_filter, name):
+            if len(all_candidates) == 0 and nameless_fallback is None:
+                logger.info("Amazon: rejected '%s' (¥%s) by relevance filter",
+                            name[:80], f"{price:,}")
+            continue
+
+        link_el = result.select_one("h2 a") or result.select_one('a.a-link-normal.s-link-style')
+        url = ""
+        if link_el and link_el.get("href"):
+            href = link_el["href"]
+            url = f"https://www.amazon.co.jp{href}" if href.startswith("/") else href
+
+        if name:
+            all_candidates.append((price, name, url))
+        elif nameless_fallback is None:
+            nameless_fallback = (price, url)
+
+    return all_candidates, nameless_fallback
+
+
 def search_amazon(query: str, _config: Config) -> ShopPrice:
     # 関連性順でソート（価格順だとアクセサリが先に来る）
     search_url = f"https://www.amazon.co.jp/s?k={quote(query)}"
@@ -2165,78 +2403,15 @@ def search_amazon(query: str, _config: Config) -> ShopPrice:
             logger.info("Amazon: bot blocked page detected")
             return _make_error_result("Amazon.co.jp", search_url, "アクセス制限（手動で検索してください）")
 
-        results_found = soup.select('[data-component-type="s-search-result"]')
-        logger.info("Amazon: found %d search results, HTML %d chars",
-                     len(results_found), len(resp.text))
+        all_candidates, nameless_fallback = _extract_amazon_candidates(soup, query)
+        logger.info("Amazon: HTML %d chars, %d candidates extracted",
+                     len(resp.text), len(all_candidates))
 
-        # 全候補を収集して最安値を返す
-        all_candidates = []
         first_valid_price_result = None
-
-        for result in results_found:
-            sponsored = result.select_one('.s-label-popover-default')
-            if sponsored and 'スポンサー' in sponsored.get_text():
-                continue
-
-            price_whole = result.select_one(".a-price .a-price-whole")
-            if not price_whole:
-                continue
-            price = _parse_price(price_whole.get_text())
-            if not price:
-                continue
-
-            # 商品名: 複数の方法で抽出（Amazon HTML頻繁変更に対応）
-            name = ""
-
-            # 方法1: 各種CSSセレクタ
-            for name_sel in ["h2 a span", "h2 span", "h2 a",
-                             '[data-cy="title-recipe"] a span',
-                             ".a-text-normal", ".a-link-normal .a-text-normal",
-                             'span[class*="a-size-medium"]',
-                             'span[class*="a-size-base-plus"]']:
-                title_el = result.select_one(name_sel)
-                if title_el:
-                    name = title_el.get_text(strip=True)
-                    if name:
-                        break
-
-            # 方法2: h2全体のテキスト
-            if not name:
-                h2 = result.select_one("h2")
-                if h2:
-                    name = h2.get_text(strip=True)
-
-            # 方法3: aria-label属性（アクセシビリティ用に商品名が入っている）
-            if not name:
-                for el in result.select("[aria-label]"):
-                    label = el.get("aria-label", "")
-                    if len(label) > 10:  # 短すぎるのは無視
-                        name = label
-                        break
-
-            # 方法4: 画像のalt属性
-            if not name:
-                img = result.select_one("img.s-image, img[data-image-latency]")
-                if img and img.get("alt"):
-                    name = img["alt"]
-
-            # 関連性チェック（中古・整備済み品も除外される）
-            if name and not _is_relevant_product(query, name):
-                if len(all_candidates) == 0 and first_valid_price_result is None:
-                    logger.info("Amazon: rejected '%s' (¥%s) by relevance filter",
-                                name[:80], f"{price:,}")
-                continue
-
-            link_el = result.select_one("h2 a")
-            url = ""
-            if link_el and link_el.get("href"):
-                href = link_el["href"]
-                url = f"https://www.amazon.co.jp{href}" if href.startswith("/") else href
-
-            if name:
-                all_candidates.append((price, name, url))
-            elif first_valid_price_result is None:
-                first_valid_price_result = ShopPrice("Amazon.co.jp", price, "(商品名取得不可)", url, search_url)
+        if nameless_fallback:
+            first_valid_price_result = ShopPrice(
+                "Amazon.co.jp", nameless_fallback[0], "(商品名取得不可)",
+                nameless_fallback[1], search_url)
 
         # 最安値を返す（候補がある場合）
         if all_candidates:
@@ -2259,140 +2434,41 @@ def search_amazon(query: str, _config: Config) -> ShopPrice:
         if price:
             return ShopPrice("Amazon.co.jp", price, name, url, search_url)
 
-        # === 簡略クエリでリトライ ===
-        # 長いクエリで関連商品が見つからない場合、サイズ/一般語を除いて再検索
+        # === 簡略クエリ / 英語クエリでリトライ ===
+        # 1) サイズ/一般語を除いたクエリ
+        # 2) カタカナ→英語変換クエリ（Amazon は英語名でインデックスしていることが多い）
+        retry_queries: list[tuple[str, str]] = []
         simplified = _simplify_query(query)
         if simplified:
-            logger.info("Amazon: retrying with simplified query '%s'", simplified)
-            retry_url = f"https://www.amazon.co.jp/s?k={quote(simplified)}"
-            try:
-                resp2 = _fetch(retry_url)
-                if resp2.status_code == 200:
-                    soup2 = _soup(resp2)
-                    if not _is_bot_blocked_page(soup2):
-                        retry_results = soup2.select('[data-component-type="s-search-result"]')
-                        logger.info("Amazon retry: found %d search results", len(retry_results))
-                        retry_candidates = []
-                        for result in retry_results:
-                            sponsored = result.select_one('.s-label-popover-default')
-                            if sponsored and 'スポンサー' in sponsored.get_text():
-                                continue
-                            price_whole = result.select_one(".a-price .a-price-whole")
-                            if not price_whole:
-                                continue
-                            p = _parse_price(price_whole.get_text())
-                            if not p:
-                                continue
-                            n = ""
-                            for name_sel in ["h2 a span", "h2 span", "h2 a",
-                                             ".a-text-normal",
-                                             'span[class*="a-size-medium"]',
-                                             'span[class*="a-size-base-plus"]']:
-                                title_el = result.select_one(name_sel)
-                                if title_el:
-                                    n = title_el.get_text(strip=True)
-                                    if n:
-                                        break
-                            if not n:
-                                h2 = result.select_one("h2")
-                                if h2:
-                                    n = h2.get_text(strip=True)
-                            if not n:
-                                img = result.select_one("img.s-image")
-                                if img and img.get("alt"):
-                                    n = img["alt"]
-                            # 簡略クエリに対する関連性チェック（元クエリでは厳しすぎる）
-                            if n and not _is_relevant_product(simplified, n):
-                                logger.info("Amazon retry rejected: '%s' (¥%s)",
-                                            n[:80], f"{p:,}")
-                                continue
-                            link_el = result.select_one("h2 a")
-                            u = ""
-                            if link_el and link_el.get("href"):
-                                href = link_el["href"]
-                                u = f"https://www.amazon.co.jp{href}" if href.startswith("/") else href
-                            if n:
-                                retry_candidates.append((p, n, u))
-
-                        if retry_candidates:
-                            prices = sorted(c[0] for c in retry_candidates)
-                            if len(prices) >= 3:
-                                median = prices[len(prices) // 2]
-                                retry_candidates = [c for c in retry_candidates if c[0] >= median * 0.3]
-                            if retry_candidates:
-                                best = min(retry_candidates, key=lambda c: c[0])
-                                logger.info("Amazon retry OK: ¥%s (%s)", f"{best[0]:,}", best[1][:50])
-                                return ShopPrice("Amazon.co.jp", best[0], best[1], best[2], retry_url)
-            except Exception as retry_err:
-                logger.debug("Amazon retry error: %s", retry_err)
-
-        # === 英語クエリでリトライ ===
-        # カタカナブランド名を英語に変換して再検索（Amazon は英語名でインデックスしていることが多い）
-        # 例: "スキンシューティカルズ CE フェルリック" → "skinceuticals CE ferulic"
+            retry_queries.append(("simplified", simplified))
         english_query = _build_english_query(query)
         if english_query:
-            logger.info("Amazon: retrying with English query '%s'", english_query)
-            eng_url = f"https://www.amazon.co.jp/s?k={quote(english_query)}"
-            try:
-                resp_eng = _fetch(eng_url)
-                if resp_eng.status_code == 200:
-                    soup_eng = _soup(resp_eng)
-                    if not _is_bot_blocked_page(soup_eng):
-                        eng_results = soup_eng.select('[data-component-type="s-search-result"]')
-                        logger.info("Amazon English retry: found %d search results", len(eng_results))
-                        eng_candidates = []
-                        for result in eng_results:
-                            sponsored = result.select_one('.s-label-popover-default')
-                            if sponsored and 'スポンサー' in sponsored.get_text():
-                                continue
-                            price_whole = result.select_one(".a-price .a-price-whole")
-                            if not price_whole:
-                                continue
-                            p = _parse_price(price_whole.get_text())
-                            if not p:
-                                continue
-                            n = ""
-                            for name_sel in ["h2 a span", "h2 span", "h2 a",
-                                             ".a-text-normal",
-                                             'span[class*="a-size-medium"]',
-                                             'span[class*="a-size-base-plus"]']:
-                                title_el = result.select_one(name_sel)
-                                if title_el:
-                                    n = title_el.get_text(strip=True)
-                                    if n:
-                                        break
-                            if not n:
-                                h2 = result.select_one("h2")
-                                if h2:
-                                    n = h2.get_text(strip=True)
-                            if not n:
-                                img = result.select_one("img.s-image")
-                                if img and img.get("alt"):
-                                    n = img["alt"]
-                            # 英語クエリに対する関連性チェック
-                            if n and not _is_relevant_product(english_query, n):
-                                logger.info("Amazon English retry rejected: '%s' (¥%s)",
-                                            n[:80], f"{p:,}")
-                                continue
-                            link_el = result.select_one("h2 a")
-                            u = ""
-                            if link_el and link_el.get("href"):
-                                href = link_el["href"]
-                                u = f"https://www.amazon.co.jp{href}" if href.startswith("/") else href
-                            if n:
-                                eng_candidates.append((p, n, u))
+            retry_queries.append(("english", english_query))
 
-                        if eng_candidates:
-                            prices = sorted(c[0] for c in eng_candidates)
-                            if len(prices) >= 3:
-                                median = prices[len(prices) // 2]
-                                eng_candidates = [c for c in eng_candidates if c[0] >= median * 0.3]
-                            if eng_candidates:
-                                best = min(eng_candidates, key=lambda c: c[0])
-                                logger.info("Amazon English retry OK: ¥%s (%s)", f"{best[0]:,}", best[1][:50])
-                                return ShopPrice("Amazon.co.jp", best[0], best[1], best[2], eng_url)
-            except Exception as eng_err:
-                logger.debug("Amazon English retry error: %s", eng_err)
+        for label, rq in retry_queries:
+            logger.info("Amazon: retrying with %s query '%s'", label, rq)
+            retry_url = f"https://www.amazon.co.jp/s?k={quote(rq)}"
+            try:
+                resp2 = _fetch(retry_url)
+                if resp2.status_code != 200:
+                    continue
+                soup2 = _soup(resp2)
+                if _is_bot_blocked_page(soup2):
+                    continue
+                retry_candidates, _ = _extract_amazon_candidates(soup2, rq)
+                logger.info("Amazon %s retry: %d candidates", label, len(retry_candidates))
+                if retry_candidates:
+                    prices = sorted(c[0] for c in retry_candidates)
+                    if len(prices) >= 3:
+                        median = prices[len(prices) // 2]
+                        retry_candidates = [c for c in retry_candidates if c[0] >= median * 0.3]
+                    if retry_candidates:
+                        best = min(retry_candidates, key=lambda c: c[0])
+                        logger.info("Amazon %s retry OK: ¥%s (%s)", label,
+                                    f"{best[0]:,}", best[1][:50])
+                        return ShopPrice("Amazon.co.jp", best[0], best[1], best[2], retry_url)
+            except Exception as retry_err:
+                logger.debug("Amazon %s retry error: %s", label, retry_err)
 
         return ShopPrice("Amazon.co.jp", None, "", "", search_url)
 
@@ -3686,6 +3762,39 @@ def search_all_shops(query: str, config: Config) -> list[ShopPrice]:
     phase2_found = sum(1 for r in results if r.price is not None)
     if phase2_found > phase1_found:
         logger.info("Phase 2 recovered %d additional shops", phase2_found - phase1_found)
+
+    # === Phase 2.5: kakaku.com 経由フォールバック ===
+    # Akamai IPブロックで Phase 1/2 ともに失敗する家電量販店向け。
+    # kakaku.com の価格比較表から各ショップの価格を抽出する。
+    kakaku_targets = [
+        (i, r) for i, r in enumerate(results)
+        if r.price is None and r.shop_name in _KAKAKU_SHOP_ALIASES
+    ]
+    if kakaku_targets:
+        logger.info("Phase 2.5: kakaku.com fallback for %d shops", len(kakaku_targets))
+        # kakaku.com への並列アクセスは控えめに（相手サーバ負荷＆bot検出回避）
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            future_to_idx = {
+                executor.submit(
+                    _kakaku_fallback, r.shop_name, query, r.search_url
+                ): idx
+                for idx, r in kakaku_targets
+            }
+            for future in as_completed(future_to_idx):
+                idx = future_to_idx[future]
+                try:
+                    fb = future.result(timeout=_TIMEOUT_SLOW + 10)
+                except Exception as e:
+                    logger.debug("Phase 2.5 exception for %s: %s",
+                                 results[idx].shop_name, e)
+                    continue
+                if fb and fb.price is not None:
+                    results[idx] = fb
+
+        phase25_found = sum(1 for r in results if r.price is not None)
+        if phase25_found > phase2_found:
+            logger.info("Phase 2.5 (kakaku) recovered %d additional shops",
+                        phase25_found - phase2_found)
 
     # === Phase 3: クロスショップ価格バリデーション ===
     # 複数ショップの価格を比較し、明らかな外れ値（アクセサリ/無関係商品）を除外
