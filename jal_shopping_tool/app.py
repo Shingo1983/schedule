@@ -101,8 +101,34 @@ def create_app() -> Flask:
                     diag[f"count::{sel}"] = len(sp2.select(sel))
                 # HTML 先頭 400 文字（bot チャレンジページ判定用）
                 diag["html_head"] = rd.text[:400]
+                # Amazon 専用: コンテナ単位の抽出結果をサンプリング（最初の 5 件）
+                if "amazon" in search_url_for_diag.lower():
+                    from .site_scrapers import (
+                        _extract_amazon_price as _aep,
+                        _extract_amazon_name as _aen,
+                    )
+                    samples = []
+                    for c in sp2.select('[data-component-type="s-search-result"]')[:5]:
+                        offscreen = c.select_one('.a-price .a-offscreen')
+                        price_whole = c.select_one('.a-price-whole')
+                        h2 = c.select_one('h2')
+                        a = c.select_one('h2 a') or c.select_one('a.a-link-normal')
+                        samples.append({
+                            "extracted_price": _aep(c),
+                            "extracted_name": _aen(c)[:80],
+                            "offscreen_text": (offscreen.get_text(strip=True)[:40]
+                                               if offscreen else None),
+                            "price_whole_text": (price_whole.get_text(strip=True)[:40]
+                                                 if price_whole else None),
+                            "h2_text": h2.get_text(strip=True)[:80] if h2 else None,
+                            "has_a_price": bool(c.select_one('.a-price')),
+                            "data_asin": c.get("data-asin", ""),
+                            "container_html_head": str(c)[:300],
+                        })
+                    diag["amazon_samples"] = samples
         except Exception as e:
             diag["error"] = str(e)
+            diag["trace"] = _tb.format_exc()[-500:]
         result["phase1_diag"] = diag
 
         # Playwright Phase 2 を単発で叩く
