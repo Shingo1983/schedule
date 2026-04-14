@@ -3,6 +3,7 @@ builder = "dockerfile"
 
 [deploy]
 # startCommand を省略（Dockerfile の CMD = start.sh を使用）
-# healthcheck は一時的に無効化: まずは起動ログ確認と公開 URL 手動チェックのため
+healthcheckPath = "/healthz"
+healthcheckTimeout = 300
 restartPolicyType = "on_failure"
 restartPolicyMaxRetries = 3

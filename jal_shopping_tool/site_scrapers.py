@@ -182,6 +182,21 @@ _HEADERS = {
     "DNT": "1",
 }
 
+# モバイル用ヘッダー（リトライ時に使用）
+# 多くのECサイトは bot 判定を回避しやすい簡素な HTML をモバイルに返す
+_MOBILE_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) "
+        "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+        "Version/17.5 Mobile/15E148 Safari/604.1"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+}
+
 # JSON API用ヘッダー
 _JSON_HEADERS = {
     "User-Agent": _HEADERS["User-Agent"],
@@ -199,8 +214,9 @@ _SLOW_SHOPS: set[str] = {
     "セブンネットショッピング", "ノジマオンライン",
 }
 
-# 並列実行のワーカー数（各ショップは別ドメインなので並列OK）
-_MAX_WORKERS = 10
+# 並列実行のワーカー数（各ショップは別ドメインだが bot 検出器が共有 CDN(Akamai/Cloudflare)
+# 上で動いているサイトが多いので、同時接続過多は逆効果。5 並列で十分）
+_MAX_WORKERS = 5
 
 
 @dataclass
@@ -1858,7 +1874,7 @@ def _scrape_generic(shop_name: str, search_url: str,
     - bot検出時はリトライ（セッション共有 or 直接）
     - 厳しいbot対策ショップではホームページ訪問でcookie取得後に検索
     """
-    max_attempts = 2
+    max_attempts = 3  # Attempt 1: Desktop Chrome / 2: Desktop retry / 3: Mobile Safari
     use_session_first = shop_name in _SESSION_FIRST_SHOPS
     req_timeout = _TIMEOUT_SLOW if shop_name in _SLOW_SHOPS else _TIMEOUT
 
@@ -1869,6 +1885,9 @@ def _scrape_generic(shop_name: str, search_url: str,
                 time.sleep(3 + random.uniform(0, 2))
 
             session = _new_session()
+            # 最終試行はモバイル UA: 多くのサイトが bot 判定の緩い簡素 HTML を返す
+            if attempt == max_attempts - 1:
+                session.headers.update(_MOBILE_HEADERS)
             if headers:
                 session.headers.update(headers)
             # Refererを自動設定
@@ -2602,11 +2621,72 @@ def _make_generic_scraper(
 # ============================================================
 # 追加ショップ（汎用スクレイパーで自動生成）
 # ============================================================
-search_uniqlo = _make_generic_scraper(
-    "ユニクロオンラインストア",
-    "https://www.uniqlo.com/jp/ja/search?q={query}",
-    "https://www.uniqlo.com",
-)
+def _search_fast_retailing_api(shop_name: str, host: str,
+                                query: str, search_url: str) -> ShopPrice:
+    """ユニクロ/GU 共通の Fast Retailing Commerce API で検索
+
+    公式フロントエンドと同じ JSON エンドポイントを直接叩く:
+    GET https://{host}/jp/api/commerce/v5/ja/products?q=<query>&offset=0&limit=24&httpFailure=true
+
+    SPA の HTML では価格が取れない（JS 描画後に入るため）が、
+    この API は Next.js がビルド時/実行時に叩いているもので、UA とリファラがあれば返る。
+    """
+    api_url = (
+        f"https://{host}/jp/api/commerce/v5/ja/products"
+        f"?q={quote(query)}&offset=0&limit=24&httpFailure=true"
+    )
+    headers = {
+        **_JSON_HEADERS,
+        "Referer": search_url,
+        "Origin": f"https://{host}",
+    }
+    try:
+        resp = requests.get(api_url, headers=headers, timeout=_TIMEOUT)
+        if resp.status_code != 200:
+            raise ValueError(f"API HTTP {resp.status_code}")
+        data = resp.json()
+        items = (data.get("result", {}) or {}).get("items", []) or []
+        candidates: list[tuple[int, str, str]] = []
+        for item in items:
+            name = item.get("name") or ""
+            if not _is_relevant_product(query, name):
+                continue
+            prices = item.get("prices") or {}
+            base = prices.get("base") or {}
+            price_val = base.get("value")
+            if price_val is None:
+                # セール価格が base にない場合 promo をフォールバック
+                promo = prices.get("promo") or {}
+                price_val = promo.get("value")
+            try:
+                price = int(price_val) if price_val is not None else 0
+            except (TypeError, ValueError):
+                price = 0
+            if price < 100:
+                continue
+            product_id = item.get("productId") or item.get("l2Id") or ""
+            url = (
+                f"https://{host}/jp/ja/products/{product_id}/00"
+                if product_id else search_url
+            )
+            candidates.append((price, name, url))
+        if not candidates:
+            return ShopPrice(shop_name, None, "", "", search_url,
+                              error="商品が見つかりませんでした")
+        candidates.sort(key=lambda x: x[0])
+        price, name, url = candidates[0]
+        return ShopPrice(shop_name, price, name, url, search_url)
+    except Exception as e:
+        logger.info("%s API failed (%s), fallback to HTML", shop_name, e)
+        return _scrape_generic(shop_name, search_url, _GENERIC_SELECTORS,
+                                f"https://{host}", query=query)
+
+
+def search_uniqlo(query: str, _config: Config) -> ShopPrice:
+    search_url = f"https://www.uniqlo.com/jp/ja/search?q={quote(query)}"
+    return _search_fast_retailing_api(
+        "ユニクロオンラインストア", "www.uniqlo.com", query, search_url
+    )
 
 search_muji = _make_generic_scraper(
     "無印良品ネットストア",
@@ -2739,11 +2819,11 @@ search_abcmart = _make_generic_scraper(
     "https://www.abc-mart.net",
 )
 
-search_gu = _make_generic_scraper(
-    "GU オンラインストア",
-    "https://www.gu-global.com/jp/ja/search?q={query}",
-    "https://www.gu-global.com",
-)
+def search_gu(query: str, _config: Config) -> ShopPrice:
+    search_url = f"https://www.gu-global.com/jp/ja/search?q={quote(query)}"
+    return _search_fast_retailing_api(
+        "GU オンラインストア", "www.gu-global.com", query, search_url
+    )
 
 search_shopjapan = _make_generic_scraper(
     "ショップジャパン",

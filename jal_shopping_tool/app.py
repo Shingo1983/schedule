@@ -33,6 +33,34 @@ def create_app() -> Flask:
         """Railway等のヘルスチェック用軽量エンドポイント"""
         return "ok", 200
 
+    @app.route("/_debug")
+    def debug_info():
+        """環境診断: ライブラリ可用性・Chromium存在・APIキー設定状況を返す。
+        本番で「ほとんどのショップで価格が取れない」原因を切り分けるために使う。
+        """
+        import sys, shutil, glob as _glob
+        config = Config.load()
+        # Chromium バイナリの所在を探索
+        chromium_paths = []
+        for pat in (
+            "/root/.cache/ms-playwright/chromium-*/chrome-linux/chrome",
+            "/root/.cache/ms-playwright/chromium-*/chrome-linux/headless_shell",
+            "/ms-playwright/chromium-*/chrome-linux/chrome",
+        ):
+            chromium_paths.extend(_glob.glob(pat))
+        info = {
+            "python": sys.version.split()[0],
+            "has_cloudscraper": _HAS_CLOUDSCRAPER,
+            "has_playwright": _HAS_PLAYWRIGHT,
+            "chromium_found": bool(chromium_paths),
+            "chromium_paths": chromium_paths[:3],
+            "system_chrome": shutil.which("google-chrome") or shutil.which("chromium"),
+            "rakuten_api_key": bool(config.rakuten_app_id),
+            "yahoo_api_key": bool(config.yahoo_app_id),
+            "scraper_shops": len(SCRAPER_SHOP_NAMES),
+        }
+        return info, 200
+
     @app.route("/search")
     def search():
         config = Config.load()
