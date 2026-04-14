@@ -38,7 +38,7 @@ def create_app() -> Flask:
         """環境診断: ライブラリ可用性・Chromium存在・APIキー設定状況を返す。
         本番で「ほとんどのショップで価格が取れない」原因を切り分けるために使う。
         """
-        import sys, shutil, glob as _glob
+        import sys, shutil, glob as _glob, os as _os, subprocess as _sp
         config = Config.load()
         # Chromium バイナリの所在を探索
         chromium_paths = []
@@ -46,16 +46,48 @@ def create_app() -> Flask:
             "/ms-playwright/chromium-*/chrome-linux/chrome",
             "/ms-playwright/chromium-*/chrome-linux/headless_shell",
             "/ms-playwright/chromium_headless_shell-*/chrome-linux/headless_shell",
+            "/ms-playwright/chromium_headless_shell-*/chrome-linux/chrome",
             "/root/.cache/ms-playwright/chromium-*/chrome-linux/chrome",
             "/root/.cache/ms-playwright/chromium-*/chrome-linux/headless_shell",
         ):
             chromium_paths.extend(_glob.glob(pat))
+        # /ms-playwright 直下をスキャン（どのバージョンの Chromium が入ったか確認用）
+        ls_ms = []
+        if _os.path.isdir("/ms-playwright"):
+            try:
+                ls_ms = sorted(_os.listdir("/ms-playwright"))[:20]
+            except OSError:
+                pass
+        # Playwright が認識しているブラウザパス
+        pw_exec = None
+        try:
+            from playwright.sync_api import sync_playwright
+            with sync_playwright() as p:
+                pw_exec = p.chromium.executable_path
+        except Exception as e:
+            pw_exec = f"error: {e}"
+        # find でフルスキャン（最大 30 件）
+        found_binaries = []
+        try:
+            r = _sp.run(
+                ["find", "/ms-playwright", "-maxdepth", "5",
+                 "-name", "chrome", "-o", "-name", "headless_shell"],
+                capture_output=True, text=True, timeout=5,
+            )
+            found_binaries = [l for l in r.stdout.strip().split("\n") if l][:30]
+        except Exception:
+            pass
         info = {
             "python": sys.version.split()[0],
             "has_cloudscraper": _HAS_CLOUDSCRAPER,
             "has_playwright": _HAS_PLAYWRIGHT,
-            "chromium_found": bool(chromium_paths),
-            "chromium_paths": chromium_paths[:3],
+            "chromium_found": bool(chromium_paths) or bool(found_binaries),
+            "chromium_paths": chromium_paths[:5],
+            "found_binaries": found_binaries,
+            "ms_playwright_dir": ls_ms,
+            "playwright_executable_path": pw_exec,
+            "PLAYWRIGHT_BROWSERS_PATH": _os.environ.get("PLAYWRIGHT_BROWSERS_PATH"),
+            "HOME": _os.environ.get("HOME"),
             "system_chrome": shutil.which("google-chrome") or shutil.which("chromium"),
             "rakuten_api_key": bool(config.rakuten_app_id),
             "yahoo_api_key": bool(config.yahoo_app_id),
