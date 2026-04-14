@@ -1144,15 +1144,22 @@ def _bing_query(q: str, domain: str) -> list[tuple[int, str, str]]:
     try:
         resp = _fetch(bing_url, headers={"Referer": "https://www.bing.com/"})
         if resp.status_code != 200:
+            logger.info("Bing HTTP %d for %s (domain=%s)",
+                        resp.status_code, q[:40], domain)
             return []
         soup = _soup(resp)
-        return _extract_from_search_snippets(
+        n_items = len(soup.select("li.b_algo, .b_algo"))
+        cands = _extract_from_search_snippets(
             soup, q, domain,
             item_sel="li.b_algo, .b_algo",
             link_sel="h2 a",
             snippet_sels=[".b_caption p", ".b_snippet", "p"],
         )
-    except Exception:
+        logger.info("Bing %s: %d items → %d candidates (domain=%s)",
+                     q[:40], n_items, len(cands), domain)
+        return cands
+    except Exception as e:
+        logger.info("Bing exception for %s: %s", q[:40], e)
         return []
 
 
@@ -4309,8 +4316,12 @@ def search_all_shops(query: str, config: Config) -> list[ShopPrice]:
         and _shop_primary_domain(r.shop_name, r.search_url)
     ]
     if bing_targets:
-        logger.info("Phase 2.6: Bing fallback for %d shops", len(bing_targets))
-        # Bing への連続アクセスは並列を抑える（レートリミット対策）
+        shop_list = [r.shop_name for _, r in bing_targets]
+        logger.info("Phase 2.6: web-search fallback for %d shops: %s",
+                     len(bing_targets), ", ".join(shop_list[:15]))
+        recovered_shops = []
+        failed_shops = []
+        # 検索エンジンへの連続アクセスは並列を抑える（レートリミット対策）
         with ThreadPoolExecutor(max_workers=3) as executor:
             future_to_idx = {
                 executor.submit(
@@ -4320,19 +4331,23 @@ def search_all_shops(query: str, config: Config) -> list[ShopPrice]:
             }
             for future in as_completed(future_to_idx):
                 idx = future_to_idx[future]
+                shop_name = results[idx].shop_name
                 try:
-                    fb = future.result(timeout=_TIMEOUT + 5)
+                    fb = future.result(timeout=_TIMEOUT + 15)
                 except Exception as e:
-                    logger.debug("Phase 2.6 exception for %s: %s",
-                                 results[idx].shop_name, e)
+                    logger.info("Phase 2.6 EXCEPTION: %s → %s", shop_name, e)
+                    failed_shops.append(shop_name)
                     continue
                 if fb and fb.price is not None:
                     results[idx] = fb
+                    recovered_shops.append(f"{shop_name}=¥{fb.price:,}")
+                else:
+                    failed_shops.append(shop_name)
 
         phase26_found = sum(1 for r in results if r.price is not None)
-        if phase26_found > phase25_found:
-            logger.info("Phase 2.6 (Bing) recovered %d additional shops",
-                        phase26_found - phase25_found)
+        logger.info("Phase 2.6 result: recovered=%d [%s] | failed=%d [%s]",
+                    len(recovered_shops), ", ".join(recovered_shops[:10]),
+                    len(failed_shops), ", ".join(failed_shops[:15]))
 
     # === Phase 3: クロスショップ価格バリデーション ===
     # 複数ショップの価格を比較し、明らかな外れ値（アクセサリ/無関係商品）を除外

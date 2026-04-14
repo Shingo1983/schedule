@@ -174,6 +174,78 @@ def create_app() -> Flask:
         """Railway等のヘルスチェック用軽量エンドポイント"""
         return "ok", 200
 
+    @app.route("/_debug_fallback")
+    def debug_fallback():
+        """Phase 2.6 (検索エンジン site: fallback) の診断。
+        Railway のIPから Bing/DDG/Yahoo JP が到達可能か・HTMLが取れているか・
+        商品ページ fetch が機能するかを段階的に検証する。
+
+        使い方: /_debug_fallback?shop=Amazon.co.jp&q=airpods pro
+        """
+        import time as _t, traceback as _tb
+        from .site_scrapers import (
+            _SHOP_DOMAINS, _shop_primary_domain,
+            _bing_query, _duckduckgo_query, _yahoojp_query,
+            _fetch_product_page_price, _simplify_query, _fetch, _soup,
+        )
+
+        shop = request.args.get("shop", "Amazon.co.jp").strip()
+        query = request.args.get("q", "airpods pro").strip()
+        domain = _shop_primary_domain(shop, "")
+
+        out: dict = {"shop": shop, "query": query, "domain": domain}
+        if not domain:
+            out["error"] = f"no domain mapped for shop '{shop}'"
+            out["known_shops"] = sorted(_SHOP_DOMAINS.keys())[:40]
+            return out, 200
+
+        queries = [query]
+        simp = _simplify_query(query)
+        if simp and simp != query:
+            queries.append(simp)
+        out["queries_tried"] = queries
+
+        # 各検索エンジンを生で叩いて HTML 長さ・候補件数を報告
+        engines = [("Bing", _bing_query),
+                   ("DuckDuckGo", _duckduckgo_query),
+                   ("YahooJP", _yahoojp_query)]
+        engine_results = {}
+        for name, fn in engines:
+            er = {}
+            for q in queries:
+                t0 = _t.time()
+                try:
+                    cands = fn(q, domain)
+                    er[q] = {
+                        "elapsed_s": round(_t.time() - t0, 2),
+                        "num_candidates": len(cands),
+                        "sample": [
+                            {"price": c[0], "name": c[1][:80], "url": c[2][:120]}
+                            for c in cands[:3]
+                        ],
+                    }
+                except Exception as e:
+                    er[q] = {"exception": str(e), "trace": _tb.format_exc()[-400:]}
+            engine_results[name] = er
+        out["engines"] = engine_results
+
+        # 生のBing HTML取得テスト（IPブロックされているか検証）
+        try:
+            from urllib.parse import quote as _q
+            bing_url = f"https://www.bing.com/search?q={_q(f'site:{domain} {query}')}&mkt=ja-JP"
+            resp = _fetch(bing_url, headers={"Referer": "https://www.bing.com/"})
+            out["raw_bing"] = {
+                "url": bing_url,
+                "status": resp.status_code,
+                "html_length": len(resp.text),
+                "content_type": resp.headers.get("Content-Type", "")[:100],
+                "head_200": resp.text[:200],
+            }
+        except Exception as e:
+            out["raw_bing"] = {"exception": str(e)}
+
+        return out, 200
+
     @app.route("/_debug")
     def debug_info():
         """環境診断: ライブラリ可用性・Chromium存在・APIキー設定状況を返す。
