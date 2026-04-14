@@ -229,6 +229,9 @@ class ShopPrice:
     product_url: str
     search_url: str  # ユーザーが手動で確認できるURL
     error: str | None = None  # エラーメッセージ
+    # 定価（メーカー希望小売価格）: 取得できた場合のみ。クロスショップ検証で
+    # アンカーとして使う（価格が定価の80%を下回る商品は「怖いので除外」）。
+    list_price: int | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -2284,6 +2287,35 @@ def search_yahoo(query: str, config: Config) -> ShopPrice:
 # ============================================================
 # Amazon.co.jp (スクレイピング)
 # ============================================================
+def _extract_amazon_list_price(result) -> int | None:
+    """Amazon 検索結果カードから「定価（メーカー希望小売価格）」を抽出する。
+
+    Amazon は割引時、商品カードに取り消し線（.a-text-price）で元価格を表示する。
+    例: 「参考価格: ￥39,800 (取り消し線)  → ￥32,800 (現在価格)」
+    これを拾えれば、その商品の定価が分かる。
+    """
+    selectors = [
+        '.a-price.a-text-price[data-a-strike="true"] .a-offscreen',
+        '.a-price.a-text-price .a-offscreen',
+        'span[data-a-strike="true"] .a-offscreen',
+        '.a-text-price .a-offscreen',
+    ]
+    for sel in selectors:
+        el = result.select_one(sel)
+        if not el:
+            continue
+        txt = el.get_text(strip=True) or (el.get('aria-label', '') or '')
+        if not txt:
+            continue
+        # USD 表示ガード（_fetch_amazon cookie で JPY 強制されるが念のため）
+        if ('USD' in txt or '$' in txt) and not ('￥' in txt or '¥' in txt or '円' in txt):
+            continue
+        p = _parse_price(txt)
+        if p:
+            return p
+    return None
+
+
 def _extract_amazon_price(result) -> int | None:
     """Amazon 検索結果カードから価格を抽出する（2025/2026 HTML対応）。
 
@@ -2366,8 +2398,12 @@ def _extract_amazon_name(result) -> str:
 
 
 def _extract_amazon_candidates(soup, query_for_filter: str):
-    """Amazon 検索結果HTMLから (price, name, url) 候補リストを抽出する。
-    関連性フィルタは呼び出し側で切り替えられるように query_for_filter を受け取る。
+    """Amazon 検索結果HTMLから候補リストを抽出する。
+    Returns:
+        (candidates, nameless_fallback, max_list_price)
+            candidates: list of (price, name, url, list_price_or_None)
+            nameless_fallback: (price, url) or None
+            max_list_price: 関連性を通った候補のうち最大の定価（推定定価）
     """
     # コンテナセレクタを複数試行（Amazon HTML は頻繁に変わる）
     container_selectors = [
@@ -2388,6 +2424,7 @@ def _extract_amazon_candidates(soup, query_for_filter: str):
 
     all_candidates = []
     nameless_fallback = None  # (price, url)
+    max_list_price = None
 
     for result in results_found:
         sponsored = result.select_one('.s-label-popover-default')
@@ -2413,12 +2450,20 @@ def _extract_amazon_candidates(soup, query_for_filter: str):
             href = link_el["href"]
             url = f"https://www.amazon.co.jp{href}" if href.startswith("/") else href
 
+        # 定価（取り消し線）が存在すれば抽出
+        list_price = _extract_amazon_list_price(result)
+        # list_price は通常 price 以上。逆転していたら異常値として無視。
+        if list_price and list_price < price:
+            list_price = None
+        if list_price and (max_list_price is None or list_price > max_list_price):
+            max_list_price = list_price
+
         if name:
-            all_candidates.append((price, name, url))
+            all_candidates.append((price, name, url, list_price))
         elif nameless_fallback is None:
             nameless_fallback = (price, url)
 
-    return all_candidates, nameless_fallback
+    return all_candidates, nameless_fallback, max_list_price
 
 
 def _fetch_amazon(url: str) -> requests.Response:
@@ -2461,9 +2506,10 @@ def search_amazon(query: str, _config: Config) -> ShopPrice:
             logger.info("Amazon: bot blocked page detected")
             return _make_error_result("Amazon.co.jp", search_url, "アクセス制限（手動で検索してください）")
 
-        all_candidates, nameless_fallback = _extract_amazon_candidates(soup, query)
-        logger.info("Amazon: HTML %d chars, %d candidates extracted",
-                     len(resp.text), len(all_candidates))
+        all_candidates, nameless_fallback, max_list_price = _extract_amazon_candidates(soup, query)
+        logger.info("Amazon: HTML %d chars, %d candidates extracted (list_price_anchor=%s)",
+                     len(resp.text), len(all_candidates),
+                     f"¥{max_list_price:,}" if max_list_price else "なし")
 
         first_valid_price_result = None
         if nameless_fallback:
@@ -2473,14 +2519,29 @@ def search_amazon(query: str, _config: Config) -> ShopPrice:
 
         # 最安値を返す（候補がある場合）
         if all_candidates:
-            # 外れ値除去（中央値の30%未満を除外 — アクセサリ等）
-            prices = sorted(c[0] for c in all_candidates)
-            if len(prices) >= 3:
-                median = prices[len(prices) // 2]
-                all_candidates = [c for c in all_candidates if c[0] >= median * 0.3]
+            # 定価アンカーが取得できていれば、定価の80%未満は除外（ユーザー方針）
+            if max_list_price:
+                lower = int(max_list_price * 0.80)
+                pre_n = len(all_candidates)
+                all_candidates = [c for c in all_candidates if c[0] >= lower]
+                if pre_n != len(all_candidates):
+                    logger.info("Amazon: list_price anchor ¥%s → lower=¥%s, %d→%d candidates",
+                                f"{max_list_price:,}", f"{lower:,}",
+                                pre_n, len(all_candidates))
+            else:
+                # 定価不明時のみ中央値ベースの外れ値除去
+                prices = sorted(c[0] for c in all_candidates)
+                if len(prices) >= 3:
+                    median = prices[len(prices) // 2]
+                    all_candidates = [c for c in all_candidates if c[0] >= median * 0.3]
             if all_candidates:
                 best = min(all_candidates, key=lambda c: c[0])
-                return ShopPrice("Amazon.co.jp", best[0], best[1], best[2], search_url)
+                # best: (price, name, url, list_price)
+                best_list_price = best[3] if len(best) > 3 else None
+                # 個別 list_price がなければクエリ全体の max_list_price をアンカーとして添付
+                anchor_lp = best_list_price or max_list_price
+                return ShopPrice("Amazon.co.jp", best[0], best[1], best[2], search_url,
+                                 list_price=anchor_lp)
 
         # 名前付き商品が見つからなかった場合、名前なしでも価格があれば返す
         if first_valid_price_result:
@@ -2513,18 +2574,27 @@ def search_amazon(query: str, _config: Config) -> ShopPrice:
                 soup2 = _soup(resp2)
                 if _is_bot_blocked_page(soup2):
                     continue
-                retry_candidates, _ = _extract_amazon_candidates(soup2, rq)
-                logger.info("Amazon %s retry: %d candidates", label, len(retry_candidates))
+                retry_candidates, _, retry_max_list = _extract_amazon_candidates(soup2, rq)
+                logger.info("Amazon %s retry: %d candidates (list_price_anchor=%s)",
+                            label, len(retry_candidates),
+                            f"¥{retry_max_list:,}" if retry_max_list else "なし")
                 if retry_candidates:
-                    prices = sorted(c[0] for c in retry_candidates)
-                    if len(prices) >= 3:
-                        median = prices[len(prices) // 2]
-                        retry_candidates = [c for c in retry_candidates if c[0] >= median * 0.3]
+                    if retry_max_list:
+                        lower = int(retry_max_list * 0.80)
+                        retry_candidates = [c for c in retry_candidates if c[0] >= lower]
+                    else:
+                        prices = sorted(c[0] for c in retry_candidates)
+                        if len(prices) >= 3:
+                            median = prices[len(prices) // 2]
+                            retry_candidates = [c for c in retry_candidates if c[0] >= median * 0.3]
                     if retry_candidates:
                         best = min(retry_candidates, key=lambda c: c[0])
+                        best_list_price = best[3] if len(best) > 3 else None
+                        anchor_lp = best_list_price or retry_max_list
                         logger.info("Amazon %s retry OK: ¥%s (%s)", label,
                                     f"{best[0]:,}", best[1][:50])
-                        return ShopPrice("Amazon.co.jp", best[0], best[1], best[2], retry_url)
+                        return ShopPrice("Amazon.co.jp", best[0], best[1], best[2],
+                                         retry_url, list_price=anchor_lp)
             except Exception as retry_err:
                 logger.debug("Amazon %s retry error: %s", label, retry_err)
 
@@ -3877,6 +3947,35 @@ def _validate_prices_cross_shop(results: list[ShopPrice]) -> None:
     prices_with_idx = [(r.price, i) for i, r in enumerate(results) if r.price is not None]
     if len(prices_with_idx) < 3:
         return  # 3件未満では統計的判断不可
+
+    # === Pass 0: 定価アンカー（ユーザー方針）===
+    # 定価（メーカー希望小売価格）が取得できていれば、その80%未満の価格は
+    # 「そんな安値で本物が売られているのは怖い」ので除外する。
+    # 複数ショップから list_price が取れた場合、その最大値をアンカーとする
+    # （一番信頼できる定価情報を採用）。
+    list_prices = [r.list_price for r in results
+                   if r.price is not None and r.list_price]
+    if list_prices:
+        anchor = max(list_prices)
+        lower_bound = int(anchor * 0.80)
+        logger.info("Cross-shop: list_price anchor=¥%s, lower_bound=¥%s (from %d shops)",
+                    f"{anchor:,}", f"{lower_bound:,}", len(list_prices))
+        new_prices_with_idx = []
+        for price, idx in prices_with_idx:
+            if price < lower_bound:
+                r = results[idx]
+                reason = f"定価¥{anchor:,}の80%未満（¥{lower_bound:,}）"
+                logger.info("Cross-shop validation: %s ¥%s removed (%s)",
+                            r.shop_name, f"{price:,}", reason)
+                results[idx] = ShopPrice(
+                    r.shop_name, None, "", "", r.search_url,
+                    error="価格が定価の80%未満（アクセサリ等の可能性）"
+                )
+            else:
+                new_prices_with_idx.append((price, idx))
+        prices_with_idx = new_prices_with_idx
+        if len(prices_with_idx) < 3:
+            return  # アンカー除外後、統計判断する母数が不足
 
     # === Pass 1: 反復的トリミング ===
     # 単純な中央値ベースの下限フィルタでは、半数以上がアクセサリ（低価格帯）の
