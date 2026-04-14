@@ -28,6 +28,85 @@ def create_app() -> Flask:
         has_api_keys = bool(config.rakuten_app_id or config.yahoo_app_id)
         return render_template("index.html", has_api_keys=has_api_keys)
 
+    @app.route("/_debug_scrape")
+    def debug_scrape():
+        """1ショップだけ実際にスクレイプして詳細をJSONで返す診断エンドポイント。
+        使い方: /_debug_scrape?shop=Amazon.co.jp&q=airpods
+        """
+        import time as _t, traceback as _tb
+        from .site_scrapers import SCRAPERS
+
+        shop_arg = request.args.get("shop", "").strip()
+        query = request.args.get("q", "airpods pro").strip()
+        config = Config.load()
+
+        # ショップ検索: 完全一致 or 部分一致
+        matched = None
+        for fn, name in SCRAPERS:
+            if name == shop_arg or shop_arg.lower() in name.lower():
+                matched = (fn, name)
+                break
+
+        result = {
+            "query": query,
+            "requested_shop": shop_arg,
+            "available_shops": sorted(n for _, n in SCRAPERS)[:50],
+        }
+
+        if not matched:
+            result["error"] = "shop not matched; use ?shop=<exact_name>&q=<query>"
+            return result, 400
+
+        fn, name = matched
+        result["resolved_shop"] = name
+        t0 = _t.time()
+        try:
+            sp = fn(query, config)
+            result["phase1_elapsed_s"] = round(_t.time() - t0, 2)
+            result["phase1"] = {
+                "price": sp.price,
+                "product_name": sp.product_name[:120] if sp.product_name else "",
+                "product_url": sp.product_url[:200] if sp.product_url else "",
+                "search_url": sp.search_url[:200] if sp.search_url else "",
+                "error": sp.error,
+            }
+        except Exception as e:
+            result["phase1_elapsed_s"] = round(_t.time() - t0, 2)
+            result["phase1"] = {"exception": str(e), "trace": _tb.format_exc()[-800:]}
+
+        # Playwright Phase 2 を単発で叩く
+        pw_info: dict = {}
+        try:
+            from playwright.sync_api import sync_playwright
+            t1 = _t.time()
+            with sync_playwright() as pw:
+                try:
+                    browser = pw.chromium.launch(headless=True, args=[
+                        "--no-sandbox", "--disable-dev-shm-usage",
+                    ])
+                    pw_info["launch_elapsed_s"] = round(_t.time() - t1, 2)
+                    context = browser.new_context(locale="ja-JP")
+                    page = context.new_page()
+                    t2 = _t.time()
+                    search_url = (result.get("phase1") or {}).get("search_url") or ""
+                    if search_url:
+                        page.goto(search_url, timeout=30000, wait_until="domcontentloaded")
+                        pw_info["goto_elapsed_s"] = round(_t.time() - t2, 2)
+                        pw_info["page_status"] = "loaded"
+                        pw_info["page_title"] = (page.title() or "")[:120]
+                        pw_info["html_length"] = len(page.content())
+                    else:
+                        pw_info["skipped"] = "no search_url"
+                    browser.close()
+                except Exception as e:
+                    pw_info["browser_error"] = str(e)
+                    pw_info["trace"] = _tb.format_exc()[-600:]
+        except Exception as e:
+            pw_info["playwright_error"] = str(e)
+
+        result["playwright"] = pw_info
+        return result, 200
+
     @app.route("/healthz")
     def healthz():
         """Railway等のヘルスチェック用軽量エンドポイント"""
