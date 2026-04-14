@@ -5,3 +5,5 @@ lxml
 cloudscraper
 gunicorn
 playwright
+brotli
+zstandard

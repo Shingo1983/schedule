@@ -159,6 +159,33 @@ try:
 except ImportError:
     logger.info("playwright not installed - browser rendering disabled")
 
+# Brotli / zstd デコーダの可用性を検査。ない場合 Accept-Encoding に br/zstd を含めると
+# サーバが brotli 圧縮で返してきて requests/cloudscraper が decode できず、本文が
+# 文字化けバイト列になる（Bing 等で顕著）。可用な圧縮方式のみ advertise する。
+try:
+    import brotli  # type: ignore
+    _HAS_BROTLI = True
+except ImportError:
+    try:
+        import brotlicffi as brotli  # type: ignore  # noqa: F401
+        _HAS_BROTLI = True
+    except ImportError:
+        _HAS_BROTLI = False
+try:
+    import zstandard  # type: ignore  # noqa: F401
+    _HAS_ZSTD = True
+except ImportError:
+    _HAS_ZSTD = False
+
+_ACCEPT_ENCODING_PARTS = ["gzip", "deflate"]
+if _HAS_BROTLI:
+    _ACCEPT_ENCODING_PARTS.append("br")
+if _HAS_ZSTD:
+    _ACCEPT_ENCODING_PARTS.append("zstd")
+_ACCEPT_ENCODING = ", ".join(_ACCEPT_ENCODING_PARTS)
+logger.info("Accept-Encoding capability: %s (brotli=%s, zstd=%s)",
+            _ACCEPT_ENCODING, _HAS_BROTLI, _HAS_ZSTD)
+
 # 共通ヘッダー（最新Chromeを完全模倣 - bot検出回避）
 _HEADERS = {
     "User-Agent": (
@@ -168,7 +195,7 @@ _HEADERS = {
     ),
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
     "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
-    "Accept-Encoding": "gzip, deflate, br, zstd",
+    "Accept-Encoding": _ACCEPT_ENCODING,
     "Cache-Control": "max-age=0",
     "Sec-Ch-Ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
     "Sec-Ch-Ua-Mobile": "?0",
@@ -192,7 +219,7 @@ _MOBILE_HEADERS = {
     ),
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
-    "Accept-Encoding": "gzip, deflate, br",
+    "Accept-Encoding": _ACCEPT_ENCODING,
     "Connection": "keep-alive",
     "Upgrade-Insecure-Requests": "1",
 }
@@ -1172,34 +1199,48 @@ def _duckduckgo_query(q: str, domain: str) -> list[tuple[int, str, str]]:
     try:
         resp = _fetch(ddg_url, headers={"Referer": "https://duckduckgo.com/"})
         if resp.status_code != 200:
+            logger.info("DDG HTTP %d for %s", resp.status_code, q[:40])
             return []
         soup = _soup(resp)
-        return _extract_from_search_snippets(
+        n_items = len(soup.select(".result, .web-result, div.results_links"))
+        cands = _extract_from_search_snippets(
             soup, q, domain,
             item_sel=".result, .web-result, div.results_links",
             link_sel="a.result__a, a.result-link, h2 a",
             snippet_sels=[".result__snippet", ".snippet", "a.result__snippet"],
         )
-    except Exception:
+        logger.info("DDG %s: %d items → %d candidates (domain=%s)",
+                     q[:40], n_items, len(cands), domain)
+        return cands
+    except Exception as e:
+        logger.info("DDG exception for %s: %s", q[:40], e)
         return []
 
 
 def _yahoojp_query(q: str, domain: str) -> list[tuple[int, str, str]]:
-    """Yahoo! JAPAN 検索（Google 系エンジンベース）で site: 検索。"""
+    """Yahoo! JAPAN 検索（Google 系エンジンベース）で site: 検索。
+    現在 Railway で最も安定に HTML を返すエンジン。"""
     yq = f"site:{domain} {q} 税込"
     yj_url = f"https://search.yahoo.co.jp/search?p={quote(yq)}&ei=UTF-8"
     try:
         resp = _fetch(yj_url, headers={"Referer": "https://search.yahoo.co.jp/"})
         if resp.status_code != 200:
+            logger.info("YahooJP HTTP %d for %s", resp.status_code, q[:40])
             return []
         soup = _soup(resp)
-        return _extract_from_search_snippets(
+        item_sel = ".sw-CardBase, .Algo, div.w, li.Sw-Card"
+        n_items = len(soup.select(item_sel))
+        cands = _extract_from_search_snippets(
             soup, q, domain,
-            item_sel=".sw-CardBase, .Algo, div.w, li.Sw-Card",
+            item_sel=item_sel,
             link_sel="a.sw-Card__titleInner, h3 a, a.Title",
             snippet_sels=[".sw-Card__summary", ".Desc", ".compText", "p"],
         )
-    except Exception:
+        logger.info("YahooJP %s: %d items → %d candidates (domain=%s)",
+                     q[:40], n_items, len(cands), domain)
+        return cands
+    except Exception as e:
+        logger.info("YahooJP exception for %s: %s", q[:40], e)
         return []
 
 
@@ -1231,10 +1272,12 @@ def _bing_search_fallback(
     source_used = None
 
     # 各検索エンジンを順に試行。候補が得られた時点で中断。
+    # Yahoo JP 優先: Railway の datacenter IP からでも安定に HTML を返すため。
+    # Bing は brotli 圧縮を返すので brotli パッケージが必要。
     engines = [
+        ("YahooJP", _yahoojp_query),
         ("Bing", _bing_query),
         ("DDG", _duckduckgo_query),
-        ("YahooJP", _yahoojp_query),
     ]
     for engine_name, engine_fn in engines:
         for q in queries_to_try:
