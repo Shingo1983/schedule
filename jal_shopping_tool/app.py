@@ -42,13 +42,14 @@ def create_app() -> Flask:
         config = Config.load()
         # Chromium バイナリの所在を探索
         chromium_paths = []
+        # 新旧両パターン: Playwright 1.49+ は chrome-linux64、それ以前は chrome-linux
         for pat in (
+            "/ms-playwright/chromium-*/chrome-linux64/chrome",
             "/ms-playwright/chromium-*/chrome-linux/chrome",
-            "/ms-playwright/chromium-*/chrome-linux/headless_shell",
+            "/ms-playwright/chromium_headless_shell-*/chrome-linux64/headless_shell",
             "/ms-playwright/chromium_headless_shell-*/chrome-linux/headless_shell",
-            "/ms-playwright/chromium_headless_shell-*/chrome-linux/chrome",
+            "/root/.cache/ms-playwright/chromium-*/chrome-linux64/chrome",
             "/root/.cache/ms-playwright/chromium-*/chrome-linux/chrome",
-            "/root/.cache/ms-playwright/chromium-*/chrome-linux/headless_shell",
         ):
             chromium_paths.extend(_glob.glob(pat))
         # /ms-playwright 直下をスキャン（どのバージョンの Chromium が入ったか確認用）
