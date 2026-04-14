@@ -43,9 +43,11 @@ def create_app() -> Flask:
         # Chromium バイナリの所在を探索
         chromium_paths = []
         for pat in (
+            "/ms-playwright/chromium-*/chrome-linux/chrome",
+            "/ms-playwright/chromium-*/chrome-linux/headless_shell",
+            "/ms-playwright/chromium_headless_shell-*/chrome-linux/headless_shell",
             "/root/.cache/ms-playwright/chromium-*/chrome-linux/chrome",
             "/root/.cache/ms-playwright/chromium-*/chrome-linux/headless_shell",
-            "/ms-playwright/chromium-*/chrome-linux/chrome",
         ):
             chromium_paths.extend(_glob.glob(pat))
         info = {

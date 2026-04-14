@@ -12,9 +12,22 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
+# Playwright のブラウザ配置先を固定（既定の $HOME/.cache ではなく /ms-playwright）
+# 実行時ユーザが root 以外になっても同じ場所を参照できるよう明示
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+
 COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt \
- && python -m playwright install chromium
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Chromium のダウンロードが失敗しても pip install は成功してしまうので、
+# 別 RUN に分けて、インストール直後に実体バイナリの存在を検証する。
+# 見つからなければビルドを即失敗させ、サイレント失敗のまま本番へ流れるのを防ぐ。
+RUN python -m playwright install --with-deps chromium \
+ && ls -la "$PLAYWRIGHT_BROWSERS_PATH" 2>&1 \
+ && find "$PLAYWRIGHT_BROWSERS_PATH" -maxdepth 4 \( -name 'chrome' -o -name 'headless_shell' \) -print 2>&1 \
+ && if [ -z "$(find "$PLAYWRIGHT_BROWSERS_PATH" -maxdepth 4 \( -name 'chrome' -o -name 'headless_shell' \) 2>/dev/null)" ]; then \
+        echo "!!! Playwright Chromium binary not found after install !!!" && exit 1; \
+    fi
 
 COPY . .
 RUN chmod +x /app/start.sh
