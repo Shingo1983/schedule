@@ -2297,6 +2297,10 @@ def _extract_amazon_price(result) -> int | None:
         txt = el.get_text(strip=True)
         if not txt:
             txt = el.get('aria-label', '') or ''
+        # USD 表記（Railway が米国IPでアクセスした時の既定通貨）は除外:
+        # ¥/円/￥ を含まないドル価格を JPY と誤認すると 150倍の誤差になる
+        if ('USD' in txt or '$' in txt) and not ('￥' in txt or '¥' in txt or '円' in txt):
+            continue
         p = _parse_price(txt)
         if p:
             return p
@@ -2401,12 +2405,36 @@ def _extract_amazon_candidates(soup, query_for_filter: str):
     return all_candidates, nameless_fallback
 
 
+def _fetch_amazon(url: str) -> requests.Response:
+    """Amazon.co.jp 専用の HTTP GET。
+
+    Railway 等のデータセンター IP からアクセスすると Amazon は
+    「International customer」扱いで USD 表示に切り替わる。
+    これを回避するため以下の cookie を事前にセットして JPY / 日本配送に強制する:
+      - i18n-prefs=JPY    (通貨表示を JPY)
+      - lc-acbjp=ja_JP    (言語設定を日本語)
+      - sp-cdn="L5Z9:JP"  (配送国を日本)
+    """
+    session = _new_session()
+    # Referer を自動設定
+    parsed = urlparse(url)
+    session.headers["Referer"] = f"{parsed.scheme}://{parsed.netloc}/"
+    for name, value in (
+        ("i18n-prefs", "JPY"),
+        ("lc-acbjp", "ja_JP"),
+        ("sp-cdn", "L5Z9:JP"),
+    ):
+        # cloudscraper の Session でも set できる
+        session.cookies.set(name, value, domain=".amazon.co.jp")
+    return session.get(url, timeout=_TIMEOUT)
+
+
 def search_amazon(query: str, _config: Config) -> ShopPrice:
     # 関連性順でソート（価格順だとアクセサリが先に来る）
     search_url = f"https://www.amazon.co.jp/s?k={quote(query)}"
 
     try:
-        resp = _fetch(search_url)
+        resp = _fetch_amazon(search_url)
         if resp.status_code != 200:
             return _make_error_result("Amazon.co.jp", search_url, f"HTTP {resp.status_code}")
 
@@ -2463,7 +2491,7 @@ def search_amazon(query: str, _config: Config) -> ShopPrice:
             logger.info("Amazon: retrying with %s query '%s'", label, rq)
             retry_url = f"https://www.amazon.co.jp/s?k={quote(rq)}"
             try:
-                resp2 = _fetch(retry_url)
+                resp2 = _fetch_amazon(retry_url)
                 if resp2.status_code != 200:
                     continue
                 soup2 = _soup(resp2)
