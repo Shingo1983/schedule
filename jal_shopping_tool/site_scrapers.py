@@ -2952,10 +2952,15 @@ def _extract_amazon_name(result) -> str:
 def _extract_amazon_candidates(soup, query_for_filter: str):
     """Amazon 検索結果HTMLから候補リストを抽出する。
     Returns:
-        (candidates, nameless_fallback, max_list_price)
+        (candidates, nameless_fallback, max_list_price, full_pool)
             candidates: list of (price, name, url, list_price_or_None)
+                         — 関連性を通ったもの
             nameless_fallback: (price, url) or None
             max_list_price: 関連性を通った候補のうち最大の定価（推定定価）
+            full_pool: list of (price, name, url)
+                         — 関連性フィルタ【前】の全商品。クロスショップ再選定用。
+                         Yahoo/楽天 と同じ方針で、ショップ側でフィルタを
+                         絞りすぎても他店アンカーで救えるようにする。
     """
     # コンテナセレクタを複数試行（Amazon HTML は頻繁に変わる）
     container_selectors = [
@@ -2975,6 +2980,7 @@ def _extract_amazon_candidates(soup, query_for_filter: str):
                  len(results_found), matched_selector)
 
     all_candidates = []
+    full_pool: list[tuple[int, str, str]] = []
     nameless_fallback = None  # (price, url)
     max_list_price = None
 
@@ -2989,18 +2995,22 @@ def _extract_amazon_candidates(soup, query_for_filter: str):
 
         name = _extract_amazon_name(result)
 
+        link_el = result.select_one("h2 a") or result.select_one('a.a-link-normal.s-link-style')
+        url = ""
+        if link_el and link_el.get("href"):
+            href = link_el["href"]
+            url = f"https://www.amazon.co.jp{href}" if href.startswith("/") else href
+
+        # === 関連性フィルタ【前】のフルプール（クロスショップ再選定用） ===
+        if price >= 100:
+            full_pool.append((price, name or "", url))
+
         # 関連性チェック
         if name and not _is_relevant_product(query_for_filter, name):
             if len(all_candidates) == 0 and nameless_fallback is None:
                 logger.info("Amazon: rejected '%s' (¥%s) by relevance filter",
                             name[:80], f"{price:,}")
             continue
-
-        link_el = result.select_one("h2 a") or result.select_one('a.a-link-normal.s-link-style')
-        url = ""
-        if link_el and link_el.get("href"):
-            href = link_el["href"]
-            url = f"https://www.amazon.co.jp{href}" if href.startswith("/") else href
 
         # 定価（取り消し線）が存在すれば抽出
         list_price = _extract_amazon_list_price(result)
@@ -3015,7 +3025,7 @@ def _extract_amazon_candidates(soup, query_for_filter: str):
         elif nameless_fallback is None:
             nameless_fallback = (price, url)
 
-    return all_candidates, nameless_fallback, max_list_price
+    return all_candidates, nameless_fallback, max_list_price, full_pool
 
 
 def _fetch_amazon(url: str) -> requests.Response:
@@ -3058,13 +3068,13 @@ def search_amazon(query: str, _config: Config) -> ShopPrice:
             logger.info("Amazon: bot blocked page detected")
             return _make_error_result("Amazon.co.jp", search_url, "アクセス制限（手動で検索してください）")
 
-        all_candidates, nameless_fallback, max_list_price = _extract_amazon_candidates(soup, query)
-        # クロスショップ再選定用に元の候補プールを保存（フィルタ前 / list_price 削除）
-        amazon_pool: list[tuple[int, str, str]] = [
-            (c[0], c[1], c[2]) for c in all_candidates if c[0] and c[0] >= 100
-        ]
-        logger.info("Amazon: HTML %d chars, %d candidates extracted (list_price_anchor=%s)",
-                     len(resp.text), len(all_candidates),
+        all_candidates, nameless_fallback, max_list_price, full_pool = _extract_amazon_candidates(soup, query)
+        # クロスショップ再選定用プール: 関連性フィルタ【前】の全商品
+        # (Yahoo/楽天と同方針。ショップ側フィルタが絞りすぎても、
+        #  他店アンカーで本体価格帯を救える)
+        amazon_pool: list[tuple[int, str, str]] = full_pool
+        logger.info("Amazon: HTML %d chars, %d filtered candidates / %d total pool (list_price_anchor=%s)",
+                     len(resp.text), len(all_candidates), len(full_pool),
                      f"¥{max_list_price:,}" if max_list_price else "なし")
 
         first_valid_price_result = None
@@ -3157,9 +3167,9 @@ def search_amazon(query: str, _config: Config) -> ShopPrice:
                 soup2 = _soup(resp2)
                 if _is_bot_blocked_page(soup2):
                     continue
-                retry_candidates, _, retry_max_list = _extract_amazon_candidates(soup2, rq)
-                logger.info("Amazon %s retry: %d candidates (list_price_anchor=%s)",
-                            label, len(retry_candidates),
+                retry_candidates, _, retry_max_list, retry_full_pool = _extract_amazon_candidates(soup2, rq)
+                logger.info("Amazon %s retry: %d candidates / %d pool (list_price_anchor=%s)",
+                            label, len(retry_candidates), len(retry_full_pool),
                             f"¥{retry_max_list:,}" if retry_max_list else "なし")
                 if retry_candidates:
                     if retry_max_list and retry_max_list >= 2000:
@@ -3178,10 +3188,9 @@ def search_amazon(query: str, _config: Config) -> ShopPrice:
                         anchor_lp = best_list_price or retry_max_list
                         logger.info("Amazon %s retry OK: ¥%s (%s)", label,
                                     f"{best[0]:,}", best[1][:50])
-                        retry_pool = [(c[0], c[1], c[2]) for c in retry_candidates if c[0]]
                         return ShopPrice("Amazon.co.jp", best[0], best[1], best[2],
                                          retry_url, list_price=anchor_lp,
-                                         candidates=retry_pool or None)
+                                         candidates=retry_full_pool or None)
             except Exception as retry_err:
                 logger.debug("Amazon %s retry error: %s", label, retry_err)
 
