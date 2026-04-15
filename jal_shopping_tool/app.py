@@ -186,23 +186,30 @@ def create_app() -> Flask:
         from .site_scrapers import (
             _SHOP_DOMAINS, _shop_primary_domain,
             _bing_query, _duckduckgo_query, _yahoojp_query,
-            _fetch_product_page_price, _simplify_query, _fetch, _soup,
+            _fetch_product_page_price, _build_query_variants,
+            _extract_model_number, _fetch, _soup, _HAS_BROTLI, _HAS_ZSTD,
+            _ACCEPT_ENCODING,
         )
 
         shop = request.args.get("shop", "Amazon.co.jp").strip()
         query = request.args.get("q", "airpods pro").strip()
         domain = _shop_primary_domain(shop, "")
 
-        out: dict = {"shop": shop, "query": query, "domain": domain}
+        out: dict = {
+            "shop": shop, "query": query, "domain": domain,
+            "encoding_capability": {
+                "accept_encoding": _ACCEPT_ENCODING,
+                "has_brotli": _HAS_BROTLI,
+                "has_zstd": _HAS_ZSTD,
+            },
+            "extracted_model_number": _extract_model_number(query),
+        }
         if not domain:
             out["error"] = f"no domain mapped for shop '{shop}'"
             out["known_shops"] = sorted(_SHOP_DOMAINS.keys())[:40]
             return out, 200
 
-        queries = [query]
-        simp = _simplify_query(query)
-        if simp and simp != query:
-            queries.append(simp)
+        queries = _build_query_variants(query)
         out["queries_tried"] = queries
 
         # 各検索エンジンを生で叩いて HTML 長さ・候補件数を報告

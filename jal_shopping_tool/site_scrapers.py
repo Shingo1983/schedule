@@ -94,6 +94,76 @@ def _simplify_query(query: str) -> str | None:
         return None
     return simplified
 
+
+def _extract_model_number(query: str) -> str | None:
+    """クエリから型番らしきトークンを抽出する。
+
+    型番は商品を一意に特定する最強のキーワード。長い具体的なクエリで
+    検索が0件になる場合、型番だけで再検索すると別ショップでも見つかりやすい。
+
+    判定パターン（Japanese 製品の典型的な型番）:
+      - SBM24-W01L  (アルファベット2+ 数字3+ ハイフン 英数字)
+      - WH-1000XM5  (英字+数字+英字)
+      - PC-AB1234   (英字+ハイフン+英数字)
+      - F-04J, GT-S5660 等
+    """
+    if not query:
+        return None
+    candidates = []
+    for w in re.split(r"[\s　]+", query):
+        if len(w) < 3:
+            continue
+        # ハイフン/英数字混在の英大文字主体のトークン
+        if re.match(r"^[A-Z0-9]+(-[A-Z0-9]+)+$", w):
+            candidates.append(w)
+            continue
+        # ハイフンなし: 英大文字+数字+英字 等の混在型
+        if (re.search(r"[A-Z]", w) and re.search(r"\d", w)
+                and re.match(r"^[A-Za-z0-9]+$", w)
+                and len(w) >= 5):
+            candidates.append(w)
+            continue
+        # アンダースコア区切り型番
+        if re.match(r"^[A-Z]+_[A-Z0-9]+$", w):
+            candidates.append(w)
+    if not candidates:
+        return None
+    # 一番長い候補（最も特定性が高い）
+    return max(candidates, key=len)
+
+
+def _build_query_variants(query: str) -> list[str]:
+    """検索エンジン fallback で試すクエリのバリエーションを生成。
+
+    優先順:
+      1. 型番のみ（最も specific で別ショップでもヒットしやすい）
+      2. _simplify_query (サイズ・一般語除去)
+      3. _build_english_query (カタカナ→英語)
+      4. オリジナルクエリ
+    重複は除外。型番が抽出できればそれを最優先で試すことで、
+    ショップ A の長い商品名表記とショップ B の表記揺れに左右されない。
+    """
+    variants: list[str] = []
+    seen = set()
+
+    def _add(q: str | None):
+        if q and q.strip() and q not in seen:
+            seen.add(q)
+            variants.append(q)
+
+    # 1. 型番抽出
+    _add(_extract_model_number(query))
+    # 2. 簡略化
+    _add(_simplify_query(query))
+    # 3. 英語変換
+    try:
+        _add(_build_english_query(query))
+    except Exception:
+        pass
+    # 4. オリジナル
+    _add(query)
+    return variants
+
 def _build_english_query(query: str) -> str | None:
     """カタカナ/日本語キーワードを英語に変換したクエリを構築。
 
@@ -1263,10 +1333,7 @@ def _bing_search_fallback(
     if not domain:
         return None
 
-    queries_to_try = [query]
-    simp = _simplify_query(query)
-    if simp and simp not in queries_to_try:
-        queries_to_try.append(simp)
+    queries_to_try = _build_query_variants(query)
 
     all_candidates: list[tuple[int, str, str]] = []
     source_used = None
