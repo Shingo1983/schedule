@@ -1034,13 +1034,13 @@ _SHOP_DOMAINS: dict[str, list[str]] = {
     "コジマネット": ["kojima.net"],
     "ヤマダウェブコム": ["yamada-denkiweb.com"],
     "Joshin webショップ": ["joshinweb.jp"],
-    "au PAY マーケット": ["wowma.jp", "paymarket.auone.jp"],
-    "セブンネットショッピング": ["7net.omni7.jp"],
+    "au PAY マーケット": ["au-pay-market.jp", "wowma.jp", "paymarket.auone.jp"],
+    "セブンネットショッピング": ["7net.omni7.jp", "7netshopping.jp"],
     "Qoo10": ["qoo10.jp"],
     "エディオンネットショップ": ["edion.com"],
     "ユニクロオンラインストア": ["uniqlo.com"],
     "無印良品ネットストア": ["muji.com"],
-    "JAL Mall": ["mall.jal.co.jp"],
+    "JAL Mall": ["mall.jal.co.jp", "ec.jal.co.jp"],
     "ベルメゾンネット": ["bellemaison.jp"],
     "LOHACO": ["lohaco.yahoo.co.jp", "lohaco.jp"],
     "ニトリネット": ["nitori-net.jp"],
@@ -3125,20 +3125,35 @@ def search_amazon(query: str, _config: Config) -> ShopPrice:
 # ビックカメラ.com (スクレイピング)
 # ============================================================
 def search_biccamera(query: str, _config: Config) -> ShopPrice:
-    search_url = f"https://www.biccamera.com/bc/category/?q={quote(query)}&rowPerPage=25"
+    # ビックカメラ: PC 版はタイムアウトが多発するため軽量な検索 URL を優先試行。
+    q = quote(_normalize_query(query))
+    search_urls = [
+        f"https://www.biccamera.com/bc/category/?q={q}",  # 軽量 (rowPerPage 指定なし)
+        f"https://www.biccamera.com/bc/category/?q={q}&rowPerPage=25",
+    ]
     selectors = [
         (".bcs_listItem", ".bcs_price", ".bcs_title a"),
         (".prod_box", ".val", ".prod_name a"),
         (".bcs_item", ".bcs_price .val", ".bcs_title a"),
         (".product_list_item", ".price", ".product_name a"),
         ("li.prod_item", ".prod_price", ".prod_name a"),
-    ]
-    return _scrape_generic("ビックカメラ.com", search_url, selectors,
-                           "https://www.biccamera.com",
-                           headers={
-                               "Referer": "https://www.biccamera.com/",
-                               "Sec-Fetch-Site": "same-origin",
-                           }, query=query)
+    ] + _GENERIC_SELECTORS
+    headers = {"Referer": "https://www.biccamera.com/",
+               "Sec-Fetch-Site": "same-origin"}
+    last_error = None
+    for url in search_urls:
+        result = _scrape_generic("ビックカメラ.com", url, selectors,
+                                 "https://www.biccamera.com",
+                                 headers=headers, query=query)
+        if result.price is not None:
+            return result
+        if result.error:
+            last_error = result.error
+            # タイムアウト/接続エラー以外は次を試さない
+            if "タイムアウト" not in result.error and "接続" not in result.error:
+                return result
+    return ShopPrice("ビックカメラ.com", None, "", "", search_urls[0],
+                     error=last_error)
 
 
 # ============================================================
@@ -3215,12 +3230,13 @@ def search_joshin(query: str, _config: Config) -> ShopPrice:
 # au PAY マーケット (HTML + JSON-LD + 埋め込みJSON)
 # ============================================================
 def search_aupay(query: str, _config: Config) -> ShopPrice:
-    # au PAY マーケット: wowma.jp
-    # 注: au PAY は bot 対策が厳しく cloudscraper では空ページを返すことが多い。
-    # Phase 2 (Playwright) での再試行に期待。
+    # au PAY マーケット: 旧 wowma.jp は au-pay-market.jp に統合済。
+    # 旧ドメインは 404 を返すため新ドメインを優先。
+    q = quote(_normalize_query(query))
     search_urls = [
-        f"https://wowma.jp/itemlist?keyword={quote(query)}",
-        f"https://wowma.jp/search/{quote(query)}/",
+        f"https://www.au-pay-market.jp/itemlist/?keyword={q}",
+        f"https://wowma.jp/itemlist?keyword={q}",  # 旧ドメイン（リダイレクト保険）
+        f"https://wowma.jp/search/{q}/",
     ]
     selectors = [
         (".itemList__item", ".itemList__price, .price", ".itemList__name a, .product-name a"),
@@ -3231,7 +3247,7 @@ def search_aupay(query: str, _config: Config) -> ShopPrice:
     last_error = None
     for url in search_urls:
         result = _scrape_generic("au PAY マーケット", url, selectors,
-                                 "https://wowma.jp", query=query)
+                                 "https://www.au-pay-market.jp", query=query)
         if result.price is not None:
             return result
         if result.error:
@@ -3244,15 +3260,34 @@ def search_aupay(query: str, _config: Config) -> ShopPrice:
 # セブンネットショッピング (HTML + JSON-LD + 埋め込みJSON)
 # ============================================================
 def search_seven(query: str, _config: Config) -> ShopPrice:
-    search_url = f"https://7net.omni7.jp/search/?keyword={quote(query)}&searchKeywordFlg=1"
+    # セブンネット: omni7 ドメインは 2024 以降 7net.omni7.jp に統合・パス変更あり。
+    # 新旧パスを順に試す。
+    q = quote(_normalize_query(query))
+    search_urls = [
+        f"https://7net.omni7.jp/search/?keyword={q}&searchKeywordFlg=1",
+        f"https://7net.omni7.jp/general/search?keyword={q}",
+        f"https://www.7netshopping.jp/general/search/?keyword={q}",
+    ]
     selectors = [
-        (".productItem", ".productPrice, .price", ".productName a, .product-name a"),
+        (".productItem, .product-list__item", ".productPrice, .price",
+         ".productName a, .product-name a, .product-list__name a"),
         (".product", ".price, .productPrice", ".productName a"),
         (".item", ".price, .item-price", ".item-name a, .productName a"),
         ('[class*="product"]', '[class*="price"]', '[class*="name"] a'),
-    ]
-    return _scrape_generic("セブンネットショッピング", search_url, selectors,
-                           "https://7net.omni7.jp", query=query)
+    ] + _GENERIC_SELECTORS
+    last_error = None
+    for url in search_urls:
+        result = _scrape_generic("セブンネットショッピング", url, selectors,
+                                 "https://7net.omni7.jp", query=query)
+        if result.price is not None:
+            return result
+        if result.error:
+            last_error = result.error
+            # 404 以外の確定エラーは即返す（無駄なリトライ抑止）
+            if "HTTP 404" not in result.error and "HTTP 410" not in result.error:
+                return result
+    return ShopPrice("セブンネットショッピング", None, "", "", search_urls[0],
+                     error=last_error)
 
 
 # ============================================================
@@ -3414,12 +3449,29 @@ search_muji = _make_generic_scraper(
     "https://www.muji.com",
 )
 
-search_jalmall = _make_generic_scraper(
-    "JAL Mall",
-    "https://ec.jal.co.jp/shop/goods/search.aspx?keyword={query}&search=x",
-    "https://ec.jal.co.jp",
-    headers={"Sec-Fetch-Site": "same-origin", "Referer": "https://ec.jal.co.jp/shop/"},
-)
+def search_jalmall(query: str, _config: Config) -> ShopPrice:
+    """JAL Mall: 旧 ec.jal.co.jp から mall.jal.co.jp に統合済み。複数 URL 試行。"""
+    q = quote(_normalize_query(query))
+    search_urls = [
+        f"https://mall.jal.co.jp/shop/searchresult?keyword={q}",
+        f"https://mall.jal.co.jp/shop/goods/search.aspx?keyword={q}&search=x",
+        f"https://ec.jal.co.jp/shop/goods/search.aspx?keyword={q}&search=x",
+    ]
+    headers = {"Sec-Fetch-Site": "same-origin",
+               "Referer": "https://mall.jal.co.jp/shop/"}
+    last_error = None
+    for url in search_urls:
+        result = _scrape_generic("JAL Mall", url, _GENERIC_SELECTORS,
+                                 "https://mall.jal.co.jp", headers=headers,
+                                 query=query)
+        if result.price is not None:
+            return result
+        if result.error:
+            last_error = result.error
+            if "HTTP 404" not in result.error and "HTTP 410" not in result.error:
+                return result
+    return ShopPrice("JAL Mall", None, "", "", search_urls[0],
+                     error=last_error)
 
 search_bellemaison = _make_generic_scraper(
     "ベルメゾンネット",
@@ -3433,11 +3485,31 @@ search_lohaco = _make_generic_scraper(
     "https://lohaco.yahoo.co.jp",
 )
 
-search_nitori = _make_generic_scraper(
-    "ニトリネット",
-    "https://www.nitori-net.jp/ec/search/?q={query}",
-    "https://www.nitori-net.jp",
-)
+def search_nitori(query: str, _config: Config) -> ShopPrice:
+    """ニトリネット: 検索パスのバリエーションが複数あるので順に試行。"""
+    q = quote(_normalize_query(query))
+    search_urls = [
+        f"https://www.nitori-net.jp/ec/search/?keyword={q}",
+        f"https://www.nitori-net.jp/ec/search?KEYWORD={q}",
+        f"https://www.nitori-net.jp/ec/search/?q={q}",
+    ]
+    selectors = [
+        (".productInfo, .product-list-item", ".productPrice, .price",
+         ".productName a, .product-name a"),
+        ('[class*="product"]', '[class*="price"]', '[class*="name"] a'),
+    ] + _GENERIC_SELECTORS
+    last_error = None
+    for url in search_urls:
+        result = _scrape_generic("ニトリネット", url, selectors,
+                                 "https://www.nitori-net.jp", query=query)
+        if result.price is not None:
+            return result
+        if result.error:
+            last_error = result.error
+            if "HTTP 404" not in result.error and "HTTP 410" not in result.error:
+                return result
+    return ShopPrice("ニトリネット", None, "", "", search_urls[0],
+                     error=last_error)
 
 search_zozo = _make_generic_scraper(
     "ZOZOTOWN",
@@ -3457,11 +3529,27 @@ search_fancl = _make_generic_scraper(
     "https://www.fancl.co.jp",
 )
 
-search_sony = _make_generic_scraper(
-    "ソニーストア",
-    "https://pur.store.sony.jp/search/?q={query}",
-    "https://pur.store.sony.jp",
-)
+def search_sony(query: str, _config: Config) -> ShopPrice:
+    """ソニーストア: pur.store.sony.jp は廃止、store.sony.jp に統合。
+    複数 URL パターンを順に試す。"""
+    q = quote(_normalize_query(query))
+    search_urls = [
+        f"https://www.sony.jp/search/?q={q}",
+        f"https://store.sony.jp/Search/?q={q}",
+        f"https://pur.store.sony.jp/search/?q={q}",
+    ]
+    last_error = None
+    for url in search_urls:
+        result = _scrape_generic("ソニーストア", url, _GENERIC_SELECTORS,
+                                 "https://www.sony.jp", query=query)
+        if result.price is not None:
+            return result
+        if result.error:
+            last_error = result.error
+            if "HTTP 404" not in result.error and "HTTP 410" not in result.error:
+                return result
+    return ShopPrice("ソニーストア", None, "", "", search_urls[0],
+                     error=last_error)
 
 search_ksdenki = _make_generic_scraper(
     "ケーズデンキオンラインショップ",
