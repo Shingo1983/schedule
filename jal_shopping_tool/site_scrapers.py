@@ -4835,17 +4835,116 @@ def search_all_shops(query: str, config: Config) -> list[ShopPrice]:
 
     # === Phase 3: クロスショップ価格バリデーション ===
     # 複数ショップの価格を比較し、明らかな外れ値（アクセサリ/無関係商品）を除外
-    _validate_prices_cross_shop(results)
+    _validate_prices_cross_shop(results, query=query)
 
     # === Phase 3.5: 候補プールから定価アンカー近傍の商品を再選定 ===
     # Phase 3 で除外されたショップ (主にアクセサリで弾かれた汎用 EC) について、
     # 検索結果の全候補から「妥当な価格帯」に収まる商品があれば再採用する。
-    _reselect_with_anchor(results)
+    _reselect_with_anchor(results, query=query)
+
+    # === Phase 3.6: 最終サニティチェック ===
+    # Phase 3.5 で再選定に失敗した残りと、スクレイパ内で弱いフィルタしか通っていない
+    # 「明らかにアクセサリ価格」を、cluster-median を基準に最後に弾く。
+    _final_cluster_sanity(results)
 
     return results
 
 
-def _validate_prices_cross_shop(results: list[ShopPrice]) -> None:
+def _compute_cluster_anchor(results: list[ShopPrice]) -> tuple[int | None, int, int]:
+    """複数ショップの「有効価格 + 候補プール」からクロスショップ密集クラスターを
+    検出してアンカー価格を返す。
+
+    戦略:
+    - 各ショップの (price + candidates の上位数件) を代表価格セットとする
+    - 各候補価格を中心 c として、[c*0.5, c*2.0] 範囲に候補を持つ「ユニークショップ数」
+      を数える。最大となる中心価格のクラスターを「本物の価格帯」と判定する
+    - 同じショップから複数候補が入っても 1 票としてカウントするため、
+      単一ショップのアクセサリ大量ヒットに惑わされない
+
+    戻り値: (anchor_price, cluster_shop_count, total_shops)
+      anchor_price = クラスター中央値 (None ならクラスターなし)
+    """
+    shop_prices: dict[str, set[int]] = {}
+    for r in results:
+        ps: set[int] = set()
+        if r.price is not None and r.price >= 100:
+            ps.add(r.price)
+        if r.candidates:
+            for cand in r.candidates[:25]:
+                try:
+                    p = int(cand[0])
+                except Exception:
+                    continue
+                if p >= 100:
+                    ps.add(p)
+        if ps:
+            shop_prices[r.shop_name] = ps
+
+    total_shops = len(shop_prices)
+    if total_shops < 3:
+        return None, 0, total_shops
+
+    all_prices = sorted({p for ps in shop_prices.values() for p in ps})
+    if not all_prices:
+        return None, 0, total_shops
+
+    best_count = 0
+    best_cluster_prices: list[int] = []
+    for center in all_prices:
+        lo = center * 0.5
+        hi = center * 2.0
+        shops_in = set()
+        prices_in: list[int] = []
+        for shop, ps in shop_prices.items():
+            hit = [p for p in ps if lo <= p <= hi]
+            if hit:
+                shops_in.add(shop)
+                prices_in.extend(hit)
+        # タイブレーク: より高価格帯 (本体は accessory より高い) を優先
+        if len(shops_in) > best_count or (
+            len(shops_in) == best_count and prices_in and best_cluster_prices
+            and (sum(prices_in) / len(prices_in))
+                > (sum(best_cluster_prices) / len(best_cluster_prices))
+        ):
+            best_count = len(shops_in)
+            best_cluster_prices = prices_in
+
+    if best_count >= 3 and best_cluster_prices:
+        best_cluster_prices.sort()
+        anchor = best_cluster_prices[len(best_cluster_prices) // 2]
+        return anchor, best_count, total_shops
+    return None, best_count, total_shops
+
+
+def _matches_query_tokens(name: str, query: str, min_ratio: float = 0.5) -> bool:
+    """商品名が検索クエリの主要トークンを十分に含むか判定。
+
+    アクセサリ名 (「MacBook Airケース」) が「MacBook Air M3」クエリで
+    偽陽性しないよう、クエリ固有の識別子 (M3, M2, 数字, 型番等) も
+    含めて評価する。
+    """
+    if not query:
+        return True
+    if not name:
+        return False
+    # クエリトークン (2 文字以上)
+    tokens = [t.lower() for t in re.findall(
+        r'[A-Za-z0-9]+|[ぁ-んァ-ヴー一-龥々]+', query) if len(t) >= 2]
+    if not tokens:
+        return True
+    name_lower = name.lower()
+    matched = sum(1 for t in tokens if t in name_lower)
+    # バージョン識別子 (M3, M2, Pro, 15, 14 等の "数字が入る短いトークン") は
+    # アクセサリ名にはあまり入らないので、マッチしなければ強めに減点
+    has_version_token = any(re.search(r'\d', t) for t in tokens)
+    version_matched = sum(1 for t in tokens if re.search(r'\d', t) and t in name_lower)
+    if has_version_token and version_matched == 0:
+        return False
+    ratio = matched / len(tokens)
+    return ratio >= min_ratio
+
+
+def _validate_prices_cross_shop(results: list[ShopPrice], query: str = "") -> None:
     """クロスショップ価格バリデーション（2パス方式）
 
     複数ショップの結果を統計的に比較し、中央値から大きく外れた結果を
@@ -4869,6 +4968,15 @@ def _validate_prices_cross_shop(results: list[ShopPrice]) -> None:
     # （一番信頼できる定価情報を採用）。
     list_prices = [r.list_price for r in results
                    if r.price is not None and r.list_price and r.list_price >= 2000]
+
+    # list_price が無い場合でも、候補プール + 有効価格から
+    # 「密集クラスター」を見つけてアンカーとして使う (ユーザー方針:
+    # 「定価を中心に製品を絞り込んだうえで其々精査すればちゃんと拾えそう」)
+    cluster_anchor, cluster_shops, total_shops = _compute_cluster_anchor(results)
+    if cluster_anchor:
+        logger.info("Cross-shop cluster anchor: ¥%s (%d/%d shops in cluster)",
+                    f"{cluster_anchor:,}", cluster_shops, total_shops)
+
     if list_prices:
         anchor = max(list_prices)
         lower_bound = int(anchor * 0.70)  # 30%引きまでは許容（80%→70%に緩和）
@@ -4904,6 +5012,35 @@ def _validate_prices_cross_shop(results: list[ShopPrice]) -> None:
             prices_with_idx = new_prices_with_idx
             if len(prices_with_idx) < 3:
                 return  # アンカー除外後、統計判断する母数が不足
+    elif cluster_anchor and cluster_shops >= 3:
+        # list_price が取れないが cluster_anchor が複数ショップで検出されている
+        # → クラスター中央値の 50% 未満を外れ値として除去 (より保守的に 50%)
+        lower_bound = int(cluster_anchor * 0.50)
+        would_remove = sum(1 for p, _ in prices_with_idx if p < lower_bound)
+        # クラスターが全ショップの半分以上を占めていれば強めに適用
+        force_cluster = cluster_shops >= max(3, total_shops // 2)
+        if would_remove and (force_cluster or would_remove < len(prices_with_idx) // 2):
+            logger.info("Cross-shop: cluster anchor=¥%s, lower_bound=¥%s (50%%, %d shops in cluster, force=%s)",
+                        f"{cluster_anchor:,}", f"{lower_bound:,}",
+                        cluster_shops, force_cluster)
+            new_prices_with_idx = []
+            for price, idx in prices_with_idx:
+                if price < lower_bound:
+                    r = results[idx]
+                    reason = f"クラスター中央値¥{cluster_anchor:,}の50%未満（¥{lower_bound:,}）"
+                    logger.info("Cross-shop validation: %s ¥%s removed (%s)",
+                                r.shop_name, f"{price:,}", reason)
+                    results[idx] = ShopPrice(
+                        r.shop_name, None, "", "", r.search_url,
+                        error="価格異常（他店と大きく乖離）",
+                        list_price=r.list_price,
+                        candidates=r.candidates,
+                    )
+                else:
+                    new_prices_with_idx.append((price, idx))
+            prices_with_idx = new_prices_with_idx
+            if len(prices_with_idx) < 3:
+                return
 
     # === Pass 1: 反復的トリミング ===
     # 単純な中央値ベースの下限フィルタでは、半数以上がアクセサリ（低価格帯）の
@@ -4914,7 +5051,9 @@ def _validate_prices_cross_shop(results: list[ShopPrice]) -> None:
     #   iter2: median=17776, threshold=5332 → [10790,17776,27680,35776]
     #   iter3: median=22728, threshold=6818 → no change → 収束
     # (1989, 2918, 5304 が全てアクセサリとして除去される)
-    TRIM_RATIO = 0.30  # 中央値の30%未満は外れ値
+    # 高額商品 (中央値 ¥30k 以上) ではアクセサリ (¥2-5k) との差が大きく、
+    # 30% 閾値だと「中央値 × 0.3 = ¥9k」でアクセサリを刈り切れないケースあり。
+    # 高額商品では 50% に引き上げる。
     MAX_ITERS = 4
     removed_indices: set = set()
     remaining = list(prices_with_idx)
@@ -4924,6 +5063,7 @@ def _validate_prices_cross_shop(results: list[ShopPrice]) -> None:
             break
         ps = sorted(p for p, _ in remaining)
         final_median = ps[len(ps) // 2]
+        TRIM_RATIO = 0.50 if final_median >= 30_000 else 0.30
         threshold = final_median * TRIM_RATIO
         new_remaining = []
         newly_removed = []
@@ -4934,9 +5074,10 @@ def _validate_prices_cross_shop(results: list[ShopPrice]) -> None:
                 new_remaining.append((price, idx))
         if not newly_removed:
             break
+        trim_pct = int(TRIM_RATIO * 100)
         for price, idx in newly_removed:
             r = results[idx]
-            reason = f"価格が低すぎ（反復median¥{final_median:,}の{int(TRIM_RATIO*100)}%未満）"
+            reason = f"価格が低すぎ（反復median¥{final_median:,}の{trim_pct}%未満）"
             logger.info("Cross-shop validation: %s ¥%s removed (%s)",
                         r.shop_name, f"{price:,}", reason)
             results[idx] = ShopPrice(
@@ -4975,27 +5116,33 @@ def _validate_prices_cross_shop(results: list[ShopPrice]) -> None:
 # 「Yahoo/Amazon/楽天 はそりゃアクセサリもヒットするけど、定価を中心に
 #  製品を絞り込んだうえで其々精査すればちゃんと拾えそう」(ユーザー方針)
 # 失敗ショップの ShopPrice.candidates から妥当な価格帯の商品を救い出す。
-def _reselect_with_anchor(results: list[ShopPrice]) -> None:
+def _reselect_with_anchor(results: list[ShopPrice], query: str = "") -> None:
     """Phase 3 で除外されたショップを candidates プールから再選定する。
 
-    アンカー: 成功ショップの list_price 最大値 / または有効価格の中央値。
+    アンカー: list_price max > cluster anchor > valid_prices median の優先順。
     救済範囲: アンカーの 70% 〜 150%。
     対象: candidates を持ち、価格未取得 or 「価格異常」エラーのショップ。
+    候補名がクエリ主要トークン (型番・バージョン) を含むもののみ許容。
     """
     valid_prices = [r.price for r in results if r.price is not None and r.error is None]
     list_prices = [r.list_price for r in results
                    if r.list_price and r.list_price >= 2000]
 
-    if not valid_prices:
-        return  # 比較基準なし
-
+    # アンカーは list_price > クラスター > 中央値 の優先順
     if list_prices:
         anchor = max(list_prices)
         anchor_src = f"list_price max (from {len(list_prices)} shops)"
     else:
-        sp = sorted(valid_prices)
-        anchor = sp[len(sp) // 2]
-        anchor_src = f"median of {len(valid_prices)} valid prices"
+        cluster_anchor, cluster_shops, _ = _compute_cluster_anchor(results)
+        if cluster_anchor and cluster_shops >= 3:
+            anchor = cluster_anchor
+            anchor_src = f"cluster anchor ({cluster_shops} shops)"
+        elif valid_prices:
+            sp = sorted(valid_prices)
+            anchor = sp[len(sp) // 2]
+            anchor_src = f"median of {len(valid_prices)} valid prices"
+        else:
+            return
 
     if anchor < 2000:
         return
@@ -5018,9 +5165,21 @@ def _reselect_with_anchor(results: list[ShopPrice]) -> None:
         # error が再選定対象でない（アクセス制限・タイムアウト等）はスキップ
         if r.error and not any(m in r.error for m in REPLACEABLE_ERRORS):
             continue
-        # 候補から妥当な範囲のものを抽出
-        in_range = [(p, n, u) for p, n, u in r.candidates
-                    if isinstance(p, int) and lower <= p <= upper]
+        # 候補から妥当な範囲 + 名前関連性チェック
+        in_range: list[tuple[int, str, str]] = []
+        for cand in r.candidates:
+            try:
+                p = int(cand[0])
+            except Exception:
+                continue
+            n = cand[1] if len(cand) > 1 else ""
+            u = cand[2] if len(cand) > 2 else ""
+            if not (lower <= p <= upper):
+                continue
+            # 名前トークン検証: アクセサリ名 ("MacBook Airケース") 等を排除
+            if n and query and not _matches_query_tokens(n, query, min_ratio=0.4):
+                continue
+            in_range.append((p, n, u))
         if not in_range:
             continue
         # 最安値を採用（価格帯は妥当なので、その中で最安なら本物の有力候補）
@@ -5048,3 +5207,33 @@ def _reselect_with_anchor(results: list[ShopPrice]) -> None:
     if reselected:
         logger.info("Phase 3.5 (reselect): %d shops recovered with anchor=¥%s",
                     reselected, f"{anchor:,}")
+
+
+def _final_cluster_sanity(results: list[ShopPrice]) -> None:
+    """Phase 3.5 後の最終サニティチェック。
+
+    Phase 3.5 を通ってもなお、cluster anchor から大きく外れた価格があれば
+    「アクセサリ価格がスクレイパを突破した」とみなして除外する。
+
+    cluster_anchor が検出されていて、残っている価格の中で anchor × 0.5 未満の
+    ものがあれば error に変換。
+    """
+    cluster_anchor, cluster_shops, total = _compute_cluster_anchor(results)
+    if not cluster_anchor or cluster_shops < 3:
+        return
+    lower = int(cluster_anchor * 0.50)
+    upper = int(cluster_anchor * 4.0)  # 上限は緩め (正当な高額モデル考慮)
+    for idx, r in enumerate(results):
+        if r.price is None or r.error:
+            continue
+        if r.price < lower or r.price > upper:
+            direction = "安すぎ" if r.price < lower else "高すぎ"
+            logger.info("Final sanity: %s ¥%s removed (cluster ¥%s, %s)",
+                        r.shop_name, f"{r.price:,}",
+                        f"{cluster_anchor:,}", direction)
+            results[idx] = ShopPrice(
+                r.shop_name, None, "", "", r.search_url,
+                error="価格異常（他店と大きく乖離）",
+                list_price=r.list_price,
+                candidates=r.candidates,
+            )
