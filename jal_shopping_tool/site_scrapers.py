@@ -3127,9 +3127,9 @@ def search_amazon(query: str, _config: Config) -> ShopPrice:
 def search_biccamera(query: str, _config: Config) -> ShopPrice:
     # ビックカメラ: PC 版はタイムアウトが多発するため軽量な検索 URL を優先試行。
     q = quote(_normalize_query(query))
+    # rowPerPage 指定なしの軽量版のみ（Railway 30秒タイムアウト対策）
     search_urls = [
-        f"https://www.biccamera.com/bc/category/?q={q}",  # 軽量 (rowPerPage 指定なし)
-        f"https://www.biccamera.com/bc/category/?q={q}&rowPerPage=25",
+        f"https://www.biccamera.com/bc/category/?q={q}",
     ]
     selectors = [
         (".bcs_listItem", ".bcs_price", ".bcs_title a"),
@@ -3233,12 +3233,10 @@ def search_aupay(query: str, _config: Config) -> ShopPrice:
     # au PAY マーケット: wowma.jp は現役。/itemlist?keyword= は旧パス
     # で 404 になるため、現行検索エンドポイントを優先試行。
     q = quote(_normalize_query(query))
+    # 試行は最大2 URL に抑制（Railway 30秒タイムアウト対策）
     search_urls = [
         f"https://wowma.jp/c/wm-search/?keyword={q}",
-        f"https://wowma.jp/wm-search?keyword={q}",
-        f"https://wowma.jp/search?keyword={q}",
         f"https://www.au-pay-market.jp/itemlist/?keyword={q}",
-        f"https://wowma.jp/itemlist?keyword={q}",
     ]
     selectors = [
         (".itemList__item", ".itemList__price, .price", ".itemList__name a, .product-name a"),
@@ -3267,10 +3265,7 @@ def search_seven(query: str, _config: Config) -> ShopPrice:
     q = quote(_normalize_query(query))
     search_urls = [
         f"https://7net.omni7.jp/general/search?keyword={q}",
-        f"https://7net.omni7.jp/general/search/?keyword={q}",
         f"https://7net.omni7.jp/search/?keyword={q}&searchKeywordFlg=1",
-        f"https://7net.omni7.jp/search?keyword={q}",
-        f"https://www.7netshopping.jp/general/search/?keyword={q}",
     ]
     selectors = [
         (".productItem, .product-list__item", ".productPrice, .price",
@@ -3454,11 +3449,10 @@ search_muji = _make_generic_scraper(
 )
 
 def search_jalmall(query: str, _config: Config) -> ShopPrice:
-    """JAL Mall: 旧 ec.jal.co.jp から mall.jal.co.jp に統合済み。複数 URL 試行。"""
+    """JAL Mall: 旧 ec.jal.co.jp から mall.jal.co.jp に統合済み。"""
     q = quote(_normalize_query(query))
     search_urls = [
         f"https://mall.jal.co.jp/shop/searchresult?keyword={q}",
-        f"https://mall.jal.co.jp/shop/goods/search.aspx?keyword={q}&search=x",
         f"https://ec.jal.co.jp/shop/goods/search.aspx?keyword={q}&search=x",
     ]
     headers = {"Sec-Fetch-Site": "same-origin",
@@ -3495,7 +3489,6 @@ def search_nitori(query: str, _config: Config) -> ShopPrice:
     search_urls = [
         f"https://www.nitori-net.jp/ec/search/?keyword={q}",
         f"https://www.nitori-net.jp/ec/search?KEYWORD={q}",
-        f"https://www.nitori-net.jp/ec/search/?q={q}",
     ]
     selectors = [
         (".productInfo, .product-list-item", ".productPrice, .price",
@@ -3539,9 +3532,6 @@ def search_sony(query: str, _config: Config) -> ShopPrice:
     q = quote(_normalize_query(query))
     search_urls = [
         f"https://search.sony.jp/all/search.x?kw={q}&ie=u&tpl=all",
-        f"https://search.sony.jp/all/search.x?kw={q}",
-        f"https://www.sony.jp/search/?q={q}",
-        f"https://store.sony.jp/Search/?q={q}",
     ]
     last_error = None
     for url in search_urls:
@@ -3569,8 +3559,6 @@ def search_nojima(query: str, _config: Config) -> ShopPrice:
     search_urls = [
         f"https://online.nojima.co.jp/search?keyword={q}",
         f"https://online.nojima.co.jp/commodity/list/?searchWord={q}",
-        f"https://online.nojima.co.jp/app/catalog/list/init?searchWord={q}",
-        f"https://online.nojima.co.jp/search/?q={q}",
     ]
     selectors = [
         # ノジマ固有
