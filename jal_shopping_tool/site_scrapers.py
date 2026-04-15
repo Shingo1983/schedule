@@ -3251,8 +3251,9 @@ def search_aupay(query: str, _config: Config) -> ShopPrice:
     # 単純な /itemlist?keyword= だと bot 判定で 404 を返す事があるため、
     # ブラウザがリンクするのと同じ補助パラメータを付ける。
     q = quote(_normalize_query(query))
+    # シンプルな ?keyword= のみ（ipp/at/non_gr 追加で並びが変わりアクセサリ上位
+    # → 誤って ¥3,600 のアクセサリを拾うリグレッションを起こした）
     search_urls = [
-        f"https://wowma.jp/itemlist?keyword={q}&ipp=40&categ_id=&at=FP&non_gr=ex",
         f"https://wowma.jp/itemlist?keyword={q}",
     ]
     selectors = [
@@ -3573,13 +3574,47 @@ search_ksdenki = _make_generic_scraper(
 
 
 def search_apple(query: str, _config: Config) -> ShopPrice:
-    """Apple公式サイト (apple.com/jp): 検索 → 最初の商品ページ → JSON-LD/meta から価格抽出。
+    """Apple公式サイト (apple.com/jp): 検索 → 商品ページ → JSON-LD/meta から価格抽出。
 
-    Apple.com/jp/search?q= は SPA 主体だが、商品ページには JSON-LD と og:price
-    が埋め込まれているので、検索結果の最初の商品リンクをフェッチして抽出する。
+    重要: Apple の検索結果には充電器・ケーブル・キーボード等のアクセサリが
+    混在するため、本体カテゴリ (Mac/iPhone/iPad/Watch/AirPods 等) のクエリ
+    では「アクセサリらしき名前」を厳格に除外する。
     """
     q = quote(_normalize_query(query))
     search_url = f"https://www.apple.com/jp/search/{q}?src=serp"
+
+    # Apple アクセサリの典型的な名前パターン
+    _APPLE_ACCESSORY_PATTERNS = [
+        r'(?:USB[\-\s]?C|Lightning|Thunderbolt)\s*(?:ケーブル|アダプタ|電源|充電|ハブ)',
+        r'(?:電源|充電)\s*アダプタ',
+        r'Magic\s+(?:Keyboard|Mouse|Trackpad)',
+        r'Smart\s+(?:Keyboard|Folio|Cover)',
+        r'AppleCare',
+        r'(?:Apple\s+)?Pencil',
+        r'(?:ケース|カバー|フィルム|スリーブ|スタンド)',
+        r'\b(?:ケーブル|アダプタ|充電器|電源)\b',
+        r'Polishing\s+Cloth', r'磨きクロス',
+        r'Studio\s+Display', r'Pro\s+Display',  # 別商品（モニタ）
+    ]
+
+    def _is_apple_main_product(name: str) -> bool:
+        """Apple 検索クエリで本体商品か判定。アクセサリらしき名前は除外。"""
+        if not name:
+            return False
+        for pat in _APPLE_ACCESSORY_PATTERNS:
+            if re.search(pat, name, re.IGNORECASE):
+                return False
+        # クエリの主要キーワード（最初の英数字トークン）が名前に含まれること
+        query_lower = query.lower()
+        name_lower = name.lower()
+        # 簡易: クエリ語の半分以上が含まれる
+        words = [w for w in re.split(r'[\s　]+', query_lower)
+                 if len(w) >= 2 and not w.isdigit()]
+        if not words:
+            return True
+        matched = sum(1 for w in words if w in name_lower)
+        return matched >= max(1, len(words) // 2)
+
     try:
         resp = _fetch(search_url, headers={
             "Referer": "https://www.apple.com/jp/",
@@ -3590,24 +3625,31 @@ def search_apple(query: str, _config: Config) -> ShopPrice:
                                        f"HTTP {resp.status_code}")
         soup = _soup(resp)
 
-        # 検索結果ページの構造化データ・最初の商品リンクから価格を取得
-        # 1. JSON-LD で取れれば最良
+        # 1. JSON-LD: 本体らしき商品のみ採用 (アクセサリ除外)
         jsonld = _extract_jsonld_prices(soup)
         for item in jsonld:
-            if item.get("price") and _is_relevant_product(query, item.get("name", "")):
-                url = item.get("url") or search_url
-                if url and not url.startswith("http"):
-                    url = "https://www.apple.com" + url
-                return ShopPrice(
-                    shop_name="Apple公式サイト",
-                    price=item["price"],
-                    product_name=item["name"],
-                    product_url=url,
-                    search_url=search_url,
-                )
+            name = item.get("name", "")
+            price = item.get("price")
+            if not (price and name):
+                continue
+            if not _is_apple_main_product(name):
+                logger.debug("Apple JSON-LD skipped (accessory): %s ¥%s",
+                             name[:60], price)
+                continue
+            if not _is_relevant_product(query, name):
+                continue
+            url = item.get("url") or search_url
+            if url and not url.startswith("http"):
+                url = "https://www.apple.com" + url
+            return ShopPrice(
+                shop_name="Apple公式サイト",
+                price=price,
+                product_name=name,
+                product_url=url,
+                search_url=search_url,
+            )
 
-        # 2. 検索結果の商品リンクを取得して個別ページから抽出
-        # Apple search result selectors: .rf-serp-productname a / a[href*="/shop/buy-"]
+        # 2. 検索結果の商品リンク → 個別ページから抽出
         product_links = []
         for sel in ('.rf-serp-productname a',
                     'a[href*="/shop/buy-"]',
@@ -3616,7 +3658,11 @@ def search_apple(query: str, _config: Config) -> ShopPrice:
                     '.rf-serp-explore-tile a'):
             for a in soup.select(sel):
                 href = a.get("href", "")
+                anchor_text = a.get_text(" ", strip=True)
                 if not href:
+                    continue
+                # アクセサリらしき商品リンクは弾く
+                if anchor_text and not _is_apple_main_product(anchor_text):
                     continue
                 if href.startswith("/"):
                     href = "https://www.apple.com" + href
@@ -3633,36 +3679,22 @@ def search_apple(query: str, _config: Config) -> ShopPrice:
                 if presp.status_code != 200:
                     continue
                 psoup = _soup(presp)
-                # Apple 商品ページの価格セレクタ
-                # JSON-LD 優先
                 pj = _extract_jsonld_prices(psoup)
                 for item in pj:
-                    if item.get("price"):
-                        name = item.get("name") or ""
-                        if not name or _is_relevant_product(query, name):
-                            return ShopPrice(
-                                shop_name="Apple公式サイト",
-                                price=item["price"],
-                                product_name=name or query,
-                                product_url=purl,
-                                search_url=search_url,
-                            )
-                # meta og:price
-                for meta_sel in ('meta[property="product:price:amount"]',
-                                 'meta[property="og:price:amount"]',
-                                 'meta[itemprop="price"]'):
-                    m = psoup.select_one(meta_sel)
-                    if m and m.get("content"):
-                        p = _parse_price(m.get("content"))
-                        if p:
-                            title = (psoup.select_one("title") or {}).get_text() if psoup.select_one("title") else query
-                            return ShopPrice(
-                                shop_name="Apple公式サイト",
-                                price=p,
-                                product_name=str(title)[:100],
-                                product_url=purl,
-                                search_url=search_url,
-                            )
+                    if not item.get("price"):
+                        continue
+                    name = item.get("name") or ""
+                    if name and not _is_apple_main_product(name):
+                        continue
+                    if name and not _is_relevant_product(query, name):
+                        continue
+                    return ShopPrice(
+                        shop_name="Apple公式サイト",
+                        price=item["price"],
+                        product_name=name or query,
+                        product_url=purl,
+                        search_url=search_url,
+                    )
             except Exception as e:
                 logger.debug("Apple product page fetch failed: %s", e)
                 continue
@@ -4755,12 +4787,18 @@ def _validate_prices_cross_shop(results: list[ShopPrice]) -> None:
     if list_prices:
         anchor = max(list_prices)
         lower_bound = int(anchor * 0.70)  # 30%引きまでは許容（80%→70%に緩和）
-        # 安全弁: フィルタで半分以上が消える場合は定価が信頼できないと判断しスキップ
+        # 安全弁: 高額商品 (anchor >= ¥30,000) で list_price が複数ショップから
+        # 取れている場合は強制適用 (アクセサリで母数が汚染されていてもアンカー優先)。
+        # それ以外は半数以上消えるならスキップ。
         would_remove = sum(1 for p, _ in prices_with_idx if p < lower_bound)
-        if would_remove > len(prices_with_idx) // 2:
+        force_apply = anchor >= 30_000 and len(list_prices) >= 2
+        if not force_apply and would_remove > len(prices_with_idx) // 2:
             logger.info("Cross-shop: list_price anchor ¥%s would remove %d/%d shops — skipping (likely unreliable anchor)",
                         f"{anchor:,}", would_remove, len(prices_with_idx))
         else:
+            if force_apply and would_remove > len(prices_with_idx) // 2:
+                logger.info("Cross-shop: list_price anchor ¥%s force-applied (anchor>=¥30k & list_prices from %d shops)",
+                            f"{anchor:,}", len(list_prices))
             logger.info("Cross-shop: list_price anchor=¥%s, lower_bound=¥%s (70%%, from %d shops)",
                         f"{anchor:,}", f"{lower_bound:,}", len(list_prices))
             new_prices_with_idx = []
