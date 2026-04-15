@@ -648,21 +648,39 @@ def _is_relevant_product(query: str, product_name: str) -> bool:
     # === クエリエコーバック検出 ===
     # 検索結果0件時にページがクエリを見出しに表示し、無関係商品の価格が
     # 近くにあるケースを防止（例: ユニクロ/GUの「〇〇の検索結果」）
-    # 商品名がクエリとほぼ同一（余分な文字が少ない）なら実商品ではない
+    # 商品名がクエリとほぼ同一（余分な文字が少ない）なら実商品ではない。
+    # ※ 閾値は「装飾文字 + 2-3 文字の付加」を意図している。大きすぎると、
+    #   「Apple MacBook Air M3 8GB/256GB」のような正当な商品名 (query を
+    #   含むが実質的な商品情報が追加されている) を誤って弾いてしまう。
+    #   価格クラスター・アンカー検証 (Phase 3) が誤検出のセーフティネットに
+    #   なっているので、echo-back 検出は「明確に query とほぼ一致するもの」
+    #   だけに絞る。
     _ECHO_STRIP_RE = re.compile(r'[\s　\-/／「」『』【】()（）・、。,.]+')
     _q_normalized = _ECHO_STRIP_RE.sub('', query_lower)
     _n_normalized = _ECHO_STRIP_RE.sub('', name_lower)
     if _q_normalized and _n_normalized:
         # 商品名がクエリとほぼ同じ（前後の装飾文字程度の差）→ エコーバック
-        if (_n_normalized == _q_normalized
-                # 商品名がクエリの先頭部分+少しだけ余分
-                or (_n_normalized.startswith(_q_normalized)
-                    and len(_n_normalized) - len(_q_normalized) < 10)
-                # クエリが商品名に含まれ、差分が小さい
-                or (_q_normalized in _n_normalized
-                    and len(_n_normalized) - len(_q_normalized) < 15)
-                # 商品名がクエリの部分文字列（クエリそのものが短縮されてエコー）
-                or (_n_normalized in _q_normalized)):
+        is_echo = False
+        if _n_normalized == _q_normalized:
+            is_echo = True
+        elif _n_normalized in _q_normalized:
+            # 商品名がクエリの部分文字列（クエリそのものが短縮されてエコー）
+            is_echo = True
+        elif _q_normalized in _n_normalized:
+            # クエリが商品名に含まれる。「検索結果」系の装飾語だけが
+            # 追加されている場合のみエコーバックとみなす。具体的な商品情報
+            # (型番・容量・色など) が追加されている場合は正当な商品名。
+            extra = _n_normalized.replace(_q_normalized, '', 1)
+            if len(extra) < 3:
+                is_echo = True  # 装飾文字のみ
+            else:
+                # "検索結果" 等の echo-back 特有ワードだけで構成されていれば echo
+                _ECHO_WORDS_RE = re.compile(
+                    r'^(?:の|を|で|は|が|に|と|から|まで|検索結果|検索|結果|ページ|該当|なし|件|商品|ありません|みつかり|見つかり|ヒット|products?|results?|search|page|found|items?|no|not)+$'
+                )
+                if _ECHO_WORDS_RE.match(extra):
+                    is_echo = True
+        if is_echo:
             return False
 
     # === キーワードマッチ（先にチェック — 無関係商品を先に弾く） ===
