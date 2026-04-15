@@ -373,6 +373,8 @@ _SHOP_CATEGORIES: dict[str, set[str]] = {
     "無印良品ネットストア": {"home", "clothing", "daily", "tableware", "food"},
     # その他
     "ショップジャパン": {"home", "fitness"},
+    # メーカー直販
+    "Apple公式サイト": {"electronics", "audio", "gaming", "pc"},
 }
 
 
@@ -1058,6 +1060,7 @@ _SHOP_DOMAINS: dict[str, list[str]] = {
     "ショップジャパン": ["shopjapan.co.jp"],
     "iHerb": ["iherb.com"],
     "@cosme SHOPPING": ["cosme.net"],
+    "Apple公式サイト": ["apple.com"],
 }
 
 
@@ -3568,6 +3571,107 @@ search_ksdenki = _make_generic_scraper(
     headers={"Referer": "https://www.ksdenki.com/shop/", "Sec-Fetch-Site": "same-origin"},
 )
 
+
+def search_apple(query: str, _config: Config) -> ShopPrice:
+    """Apple公式サイト (apple.com/jp): 検索 → 最初の商品ページ → JSON-LD/meta から価格抽出。
+
+    Apple.com/jp/search?q= は SPA 主体だが、商品ページには JSON-LD と og:price
+    が埋め込まれているので、検索結果の最初の商品リンクをフェッチして抽出する。
+    """
+    q = quote(_normalize_query(query))
+    search_url = f"https://www.apple.com/jp/search/{q}?src=serp"
+    try:
+        resp = _fetch(search_url, headers={
+            "Referer": "https://www.apple.com/jp/",
+            "Sec-Fetch-Site": "same-origin",
+        })
+        if resp.status_code != 200:
+            return _make_error_result("Apple公式サイト", search_url,
+                                       f"HTTP {resp.status_code}")
+        soup = _soup(resp)
+
+        # 検索結果ページの構造化データ・最初の商品リンクから価格を取得
+        # 1. JSON-LD で取れれば最良
+        jsonld = _extract_jsonld_prices(soup)
+        for item in jsonld:
+            if item.get("price") and _is_relevant_product(query, item.get("name", "")):
+                url = item.get("url") or search_url
+                if url and not url.startswith("http"):
+                    url = "https://www.apple.com" + url
+                return ShopPrice(
+                    shop_name="Apple公式サイト",
+                    price=item["price"],
+                    product_name=item["name"],
+                    product_url=url,
+                    search_url=search_url,
+                )
+
+        # 2. 検索結果の商品リンクを取得して個別ページから抽出
+        # Apple search result selectors: .rf-serp-productname a / a[href*="/shop/buy-"]
+        product_links = []
+        for sel in ('.rf-serp-productname a',
+                    'a[href*="/shop/buy-"]',
+                    'a[href*="/shop/product/"]',
+                    'a.tile__title-link',
+                    '.rf-serp-explore-tile a'):
+            for a in soup.select(sel):
+                href = a.get("href", "")
+                if not href:
+                    continue
+                if href.startswith("/"):
+                    href = "https://www.apple.com" + href
+                if "apple.com/jp" in href and href not in product_links:
+                    product_links.append(href)
+                if len(product_links) >= 3:
+                    break
+            if product_links:
+                break
+
+        for purl in product_links[:2]:
+            try:
+                presp = _fetch(purl, headers={"Referer": search_url})
+                if presp.status_code != 200:
+                    continue
+                psoup = _soup(presp)
+                # Apple 商品ページの価格セレクタ
+                # JSON-LD 優先
+                pj = _extract_jsonld_prices(psoup)
+                for item in pj:
+                    if item.get("price"):
+                        name = item.get("name") or ""
+                        if not name or _is_relevant_product(query, name):
+                            return ShopPrice(
+                                shop_name="Apple公式サイト",
+                                price=item["price"],
+                                product_name=name or query,
+                                product_url=purl,
+                                search_url=search_url,
+                            )
+                # meta og:price
+                for meta_sel in ('meta[property="product:price:amount"]',
+                                 'meta[property="og:price:amount"]',
+                                 'meta[itemprop="price"]'):
+                    m = psoup.select_one(meta_sel)
+                    if m and m.get("content"):
+                        p = _parse_price(m.get("content"))
+                        if p:
+                            title = (psoup.select_one("title") or {}).get_text() if psoup.select_one("title") else query
+                            return ShopPrice(
+                                shop_name="Apple公式サイト",
+                                price=p,
+                                product_name=str(title)[:100],
+                                product_url=purl,
+                                search_url=search_url,
+                            )
+            except Exception as e:
+                logger.debug("Apple product page fetch failed: %s", e)
+                continue
+
+        return _make_error_result("Apple公式サイト", search_url,
+                                   "商品が見つかりませんでした")
+    except Exception as e:
+        return _make_error_result("Apple公式サイト", search_url, f"接続エラー: {e}")
+
 def search_nojima(query: str, _config: Config) -> ShopPrice:
     """ノジマオンライン: bot 検出が厳しいので、フル Sec-Fetch-* ヘッダーで
     通常ブラウザ遷移を模倣する。"""
@@ -3698,6 +3802,7 @@ SCRAPERS = [
     (search_shopjapan, "ショップジャパン"),
     (search_iherb, "iHerb"),
     (search_cosme, "@cosme SHOPPING"),
+    (search_apple, "Apple公式サイト"),
 ]
 
 # スクレイパー対応済みショップ名のセット（自動生成）

@@ -62,8 +62,7 @@ KNOWN_SHOPS = {
         "mile_rate_desc": "200円につき1マイル",
         "yen_per_mile": 200,
         "category": "家電",
-        "search_url_template": "https://www.apple.com/jp/shop/buy-mac",
-        "note": "Apple公式サイトでの購入が対象（検索は非対応）",
+        "search_url_template": "https://www.apple.com/jp/search/{query}",
     },
     "ユニクロオンラインストア": {
         "shop_id": "15087",
