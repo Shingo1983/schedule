@@ -3591,7 +3591,8 @@ search_matsukiyo = _make_generic_scraper(
 
 search_dshopping = _make_generic_scraper(
     "dショッピング",
-    "https://dshopping.docomo.ne.jp/search?keyword={query}",
+    # 実 URL: /products_search?keyword=... (旧 /search は 404)
+    "https://dshopping.docomo.ne.jp/products_search?keyword={query}",
     "https://dshopping.docomo.ne.jp",
     selectors=[
         (".c-productListItem, .productListItem", ".c-productListItem__price, .productPrice",
