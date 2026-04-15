@@ -5161,8 +5161,14 @@ def _reselect_with_anchor(results: list[ShopPrice], query: str = "") -> None:
     if anchor < 2000:
         return
 
-    lower = int(anchor * 0.70)
-    upper = int(anchor * 1.50)
+    # Renewed / 整備済み品 / セール品は定価の 50-60% で出品されることがある
+    # (例: MacBook Air M3 MSRP ¥164,800 → Apple Certified Refurbished ¥116k 前後)
+    # ため、下限は緩めに 50%、上限は 160% に設定。
+    lower = int(anchor * 0.50)
+    upper = int(anchor * 1.60)
+
+    logger.info("Phase 3.5: anchor=¥%s (%s), reselect range=¥%s〜¥%s",
+                f"{anchor:,}", anchor_src, f"{lower:,}", f"{upper:,}")
 
     # 「再選定対象」の判定: 価格未取得 or 価格異常エラー
     REPLACEABLE_ERRORS = (
@@ -5181,6 +5187,8 @@ def _reselect_with_anchor(results: list[ShopPrice], query: str = "") -> None:
             continue
         # 候補から妥当な範囲 + 名前関連性チェック
         in_range: list[tuple[int, str, str]] = []
+        range_fail = 0
+        token_fail = 0
         for cand in r.candidates:
             try:
                 p = int(cand[0])
@@ -5189,12 +5197,18 @@ def _reselect_with_anchor(results: list[ShopPrice], query: str = "") -> None:
             n = cand[1] if len(cand) > 1 else ""
             u = cand[2] if len(cand) > 2 else ""
             if not (lower <= p <= upper):
+                range_fail += 1
                 continue
             # 名前トークン検証: アクセサリ名 ("MacBook Airケース") 等を排除
             if n and query and not _matches_query_tokens(n, query, min_ratio=0.4):
+                token_fail += 1
                 continue
             in_range.append((p, n, u))
         if not in_range:
+            logger.info(
+                "Phase 3.5 no-candidate for %s: pool=%d, range_fail=%d, token_fail=%d",
+                r.shop_name, len(r.candidates), range_fail, token_fail
+            )
             continue
         # 最安値を採用（価格帯は妥当なので、その中で最安なら本物の有力候補）
         in_range.sort(key=lambda c: c[0])
