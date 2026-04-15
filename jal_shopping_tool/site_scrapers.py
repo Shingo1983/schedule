@@ -1034,7 +1034,7 @@ _SHOP_DOMAINS: dict[str, list[str]] = {
     "コジマネット": ["kojima.net"],
     "ヤマダウェブコム": ["yamada-denkiweb.com"],
     "Joshin webショップ": ["joshinweb.jp"],
-    "au PAY マーケット": ["au-pay-market.jp", "wowma.jp", "paymarket.auone.jp"],
+    "au PAY マーケット": ["wowma.jp", "au-pay-market.jp", "paymarket.auone.jp"],
     "セブンネットショッピング": ["7net.omni7.jp", "7netshopping.jp"],
     "Qoo10": ["qoo10.jp"],
     "エディオンネットショップ": ["edion.com"],
@@ -1047,7 +1047,7 @@ _SHOP_DOMAINS: dict[str, list[str]] = {
     "ZOZOTOWN": ["zozo.jp"],
     "DHCオンラインショップ": ["dhc.co.jp"],
     "ファンケルオンライン": ["fancl.co.jp"],
-    "ソニーストア": ["sony.jp"],
+    "ソニーストア": ["sony.jp", "store.sony.jp"],
     "ケーズデンキオンラインショップ": ["ksdenki.com"],
     "ノジマオンライン": ["online.nojima.co.jp", "nojima.co.jp"],
     "マツモトキヨシオンラインストア": ["matsukiyo.co.jp"],
@@ -3230,13 +3230,15 @@ def search_joshin(query: str, _config: Config) -> ShopPrice:
 # au PAY マーケット (HTML + JSON-LD + 埋め込みJSON)
 # ============================================================
 def search_aupay(query: str, _config: Config) -> ShopPrice:
-    # au PAY マーケット: 旧 wowma.jp は au-pay-market.jp に統合済。
-    # 旧ドメインは 404 を返すため新ドメインを優先。
+    # au PAY マーケット: wowma.jp は現役。/itemlist?keyword= は旧パス
+    # で 404 になるため、現行検索エンドポイントを優先試行。
     q = quote(_normalize_query(query))
     search_urls = [
+        f"https://wowma.jp/c/wm-search/?keyword={q}",
+        f"https://wowma.jp/wm-search?keyword={q}",
+        f"https://wowma.jp/search?keyword={q}",
         f"https://www.au-pay-market.jp/itemlist/?keyword={q}",
-        f"https://wowma.jp/itemlist?keyword={q}",  # 旧ドメイン（リダイレクト保険）
-        f"https://wowma.jp/search/{q}/",
+        f"https://wowma.jp/itemlist?keyword={q}",
     ]
     selectors = [
         (".itemList__item", ".itemList__price, .price", ".itemList__name a, .product-name a"),
@@ -3264,8 +3266,10 @@ def search_seven(query: str, _config: Config) -> ShopPrice:
     # 新旧パスを順に試す。
     q = quote(_normalize_query(query))
     search_urls = [
-        f"https://7net.omni7.jp/search/?keyword={q}&searchKeywordFlg=1",
         f"https://7net.omni7.jp/general/search?keyword={q}",
+        f"https://7net.omni7.jp/general/search/?keyword={q}",
+        f"https://7net.omni7.jp/search/?keyword={q}&searchKeywordFlg=1",
+        f"https://7net.omni7.jp/search?keyword={q}",
         f"https://www.7netshopping.jp/general/search/?keyword={q}",
     ]
     selectors = [
@@ -3530,13 +3534,14 @@ search_fancl = _make_generic_scraper(
 )
 
 def search_sony(query: str, _config: Config) -> ShopPrice:
-    """ソニーストア: pur.store.sony.jp は廃止、store.sony.jp に統合。
-    複数 URL パターンを順に試す。"""
+    """ソニーストア: 検索は search.sony.jp/all/search.x に集約。
+    旧 pur.store.sony.jp / store.sony.jp/Search は 404。"""
     q = quote(_normalize_query(query))
     search_urls = [
+        f"https://search.sony.jp/all/search.x?kw={q}&ie=u&tpl=all",
+        f"https://search.sony.jp/all/search.x?kw={q}",
         f"https://www.sony.jp/search/?q={q}",
         f"https://store.sony.jp/Search/?q={q}",
-        f"https://pur.store.sony.jp/search/?q={q}",
     ]
     last_error = None
     for url in search_urls:
