@@ -785,10 +785,15 @@ def _is_relevant_product(query: str, product_name: str) -> bool:
                                   or 'compatible' in name_lower):
         return False
 
-    # === 中古・整備済み品の除外 ===
+    # === 中古・ジャンクの除外（整備済み品は除外しない）===
+    # 「整備済み品 (Renewed/Refurbished)」は Apple 公式の認定再生品や
+    # Amazon Renewed 等の正規商品で、新品同等の品質が保証されている。
+    # マーケットに出回る MacBook/iPhone の多くがこのラベルを持つため、
+    # これを除外するとほぼ全商品が弾かれてしまう。→ 許容する。
+    # 一方、明確に「中古」「ジャンク」「訳あり」は品質が保証されないので除外。
     _USED_PATTERNS = [
-        r'整備済み', r'renewed', r'refurbished', r'中古', r'再生品',
-        r'\bused\b', r'pre[\-\s]?owned', r'訳あり', r'ジャンク',
+        r'中古\s*品', r'\bused\b', r'pre[\-\s]?owned',
+        r'訳あり', r'ジャンク', r'不良品',
     ]
     for pattern in _USED_PATTERNS:
         if re.search(pattern, name_lower, re.IGNORECASE):
@@ -2656,7 +2661,7 @@ def _search_rakuten_api(query: str, config: Config, search_url: str) -> ShopPric
     params = {
         "applicationId": config.rakuten_app_id,
         "keyword": query,
-        "hits": 20,
+        "hits": 30,  # 20 だとアクセサリで埋まって本体が含まれないことがあったので拡大
         "sort": "standard",  # 関連性順（価格順だとアクセサリが先に来る）
         "availability": 1,
     }
