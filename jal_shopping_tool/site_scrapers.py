@@ -329,6 +329,11 @@ class ShopPrice:
     # 定価（メーカー希望小売価格）: 取得できた場合のみ。クロスショップ検証で
     # アンカーとして使う（価格が定価の80%を下回る商品は「怖いので除外」）。
     list_price: int | None = None
+    # 検索結果から拾えた全候補 (price, name, url) のリスト。
+    # クロスショップ検証で「主候補が異常」と判定された際の再選定に使う。
+    # アクセサリ等で安すぎる価格が選ばれてしまっても、本物の商品が同一検索結果
+    # に含まれていれば後段で救済できる。
+    candidates: list[tuple[int, str, str]] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -1644,8 +1649,14 @@ def _extract_price_from_element(el) -> int | None:
 
 
 def _find_price_in_soup(soup: BeautifulSoup, selectors: list[tuple[str, str, str]],
-                        base_url: str = "", query: str = "") -> tuple[int | None, str, str]:
-    """複数のCSSセレクタパターンで商品を探す。(price, name, url)を返す
+                        base_url: str = "", query: str = "",
+                        return_candidates: bool = False):
+    """複数のCSSセレクタパターンで商品を探す。
+
+    戻り値:
+      return_candidates=False (デフォルト): (price, name, url)
+      return_candidates=True: (price, name, url, candidates)
+                              candidates は (price, name, url) のリスト
 
     戦略:
     1. CSSセレクタでHTML要素から抽出
@@ -1656,9 +1667,16 @@ def _find_price_in_soup(soup: BeautifulSoup, selectors: list[tuple[str, str, str
     queryが指定されている場合、各段階で関連性チェックを行い、
     無関係な商品（「airpods pro 3」検索で化粧水等）を除外する。
     """
+    # 全候補プール（後段でアンカー再選定に使う）
+    all_candidates_pool: list[tuple[int, str, str]] = []
+
+    def _ret(price, name, url):
+        if return_candidates:
+            return price, name, url, all_candidates_pool
+        return price, name, url
     # 0. 検索結果なしページを先にチェック
     if _is_no_results_page(soup):
-        return None, "", ""
+        return _ret(None, "", "")
 
     def _extract_url(name_el, item) -> str:
         """商品URLを抽出するヘルパー"""
@@ -1708,6 +1726,10 @@ def _find_price_in_soup(soup: BeautifulSoup, selectors: list[tuple[str, str, str
         if css_candidates:
             break  # 最初にマッチしたセレクタパターンの結果を使う
 
+    # 全候補プールにCSS候補を追加（後段の再選定用、外れ値除去前）
+    if css_candidates:
+        all_candidates_pool.extend(css_candidates)
+
     if css_candidates:
         # 外れ値除去後、最安値を返す
         if len(css_candidates) >= 3:
@@ -1717,28 +1739,36 @@ def _find_price_in_soup(soup: BeautifulSoup, selectors: list[tuple[str, str, str
             css_candidates = [c for c in css_candidates
                               if median_price * 0.3 <= c[0] <= median_price * 2.5]
         if css_candidates:
-            return min(css_candidates, key=lambda c: c[0])
+            best = min(css_candidates, key=lambda c: c[0])
+            return _ret(best[0], best[1], best[2])
 
     # 2. JSON-LD構造化データから探す
     jsonld_items = _extract_jsonld_prices(soup)
     if jsonld_items:
+        # 全候補プールにも追加（関連性フィルタ前）
+        for it in jsonld_items:
+            if it.get("price") and it.get("price") >= 100:
+                all_candidates_pool.append((it["price"], it.get("name", ""), it.get("url", "")))
         # 関連性でフィルタしてから最安値（名前なし or 無関係は除外）
         if query:
             jsonld_items = [i for i in jsonld_items
                            if _is_relevant_product(query, i["name"])]
         if jsonld_items:
             cheapest = min(jsonld_items, key=lambda x: x["price"])
-            return cheapest["price"], cheapest["name"], cheapest["url"]
+            return _ret(cheapest["price"], cheapest["name"], cheapest["url"])
 
     # 3. 埋め込みJSONから探す
     embedded = _extract_embedded_json(str(soup))
     if embedded:
+        for it in embedded:
+            if it.get("price") and it.get("price") >= 100:
+                all_candidates_pool.append((it["price"], it.get("name", ""), it.get("url", "")))
         if query:
             embedded = [i for i in embedded
                         if _is_relevant_product(query, i["name"])]
         if embedded:
             cheapest = min(embedded, key=lambda x: x["price"])
-            return cheapest["price"], cheapest["name"], cheapest["url"]
+            return _ret(cheapest["price"], cheapest["name"], cheapest["url"])
 
     # 4. data-price属性を持つ要素を探す
     for price_el in soup.select('[data-price], [itemprop="price"]'):
@@ -1758,7 +1788,7 @@ def _find_price_in_soup(soup: BeautifulSoup, selectors: list[tuple[str, str, str
                     break
                 href = link.get("href", "")
                 url = href if href.startswith("http") else (f"{base_url}{href}" if href.startswith("/") and base_url else "")
-                return price, name, url
+                return _ret(price, name, url)
 
     # --- エコーバックガード（ステップ5-7共通） ---
     # 抽出結果の商品名がクエリと実質同一ならエコーバックとして拒否
@@ -1790,14 +1820,14 @@ def _find_price_in_soup(soup: BeautifulSoup, selectors: list[tuple[str, str, str
             if name_r and _is_echoback_name(name_r, query):
                 logger.info("Echo-back rejected (text extraction): '%s'", name_r[:80])
             else:
-                return result
+                return _ret(*result)
 
     # 6. フルテキスト近接検索（DOM構造に一切依存しない最終手段）
     # 800KB超のHTMLでもページのプレーンテキストから価格を見つける
     if query:
         result = _extract_price_by_fulltext(soup, query, base_url)
         if result:
-            return result
+            return _ret(*result)
 
     # 7. 生HTML内の価格パターン検索（テキスト抽出で消えた価格を拾う）
     # JSフレームワーク(React/Vue/Next.js等)がデータをscriptタグやdata属性に
@@ -1805,7 +1835,7 @@ def _find_price_in_soup(soup: BeautifulSoup, selectors: list[tuple[str, str, str
     if query:
         result = _extract_price_from_raw_html(str(soup), query, base_url)
         if result:
-            return result
+            return _ret(*result)
 
     # デバッグ: 全ステップ失敗時の情報
     raw_html = str(soup)
@@ -1845,7 +1875,7 @@ def _find_price_in_soup(soup: BeautifulSoup, selectors: list[tuple[str, str, str
                 sample = script_with_data[0].string[:300]
                 logger.info("  Largest script sample: %s...", sample.replace('\n', ' ')[:200])
 
-    return None, "", ""
+    return _ret(None, "", "")
 
 
 # 英語→カタカナのキーワード展開マップ（日本のECサイトはカタカナ表記が多い）
@@ -2573,9 +2603,11 @@ def _scrape_generic(shop_name: str, search_url: str,
                     continue  # リトライ
                 return _make_error_result(shop_name, search_url, "アクセス制限（手動で検索してください）")
 
-            price, name, url = _find_price_in_soup(soup, selectors, base_url, query=query)
+            price, name, url, candidates = _find_price_in_soup(
+                soup, selectors, base_url, query=query, return_candidates=True)
             if price:
-                return ShopPrice(shop_name, price, name, url, search_url)
+                return ShopPrice(shop_name, price, name, url, search_url,
+                                 candidates=candidates or None)
 
             # 価格が見つからなかった理由をログ出力
             text_len = len(soup.get_text())
@@ -2640,16 +2672,20 @@ def _search_rakuten_api(query: str, config: Config, search_url: str) -> ShopPric
             return ShopPrice("楽天市場", None, "", "", search_url)
 
         # 関連性チェック→外れ値除去→最安値選択
+        all_pool: list[tuple[int, str, str]] = []
         candidates = []
         for item_wrapper in items:
             item = item_wrapper.get("Item", {})
             name = item.get("itemName", "")
+            price = item.get("itemPrice", 0)
+            url = item.get("itemUrl", "")
+            if price >= 100:
+                all_pool.append((price, name, url))
             if not _is_relevant_product(query, name):
                 continue
-            price = item.get("itemPrice", 0)
             if price < 100:
                 continue
-            candidates.append((price, name, item.get("itemUrl", "")))
+            candidates.append((price, name, url))
         if candidates:
             candidates.sort(key=lambda x: x[0])
             # 外れ値除去
@@ -2664,9 +2700,11 @@ def _search_rakuten_api(query: str, config: Config, search_url: str) -> ShopPric
                     product_name=name,
                     product_url=url,
                     search_url=search_url,
+                    candidates=all_pool or None,
                 )
         # 全て無関係だった場合
-        return ShopPrice("楽天市場", None, "", "", search_url)
+        return ShopPrice("楽天市場", None, "", "", search_url,
+                         candidates=all_pool or None)
     except Exception:
         return None  # フォールバック
 
@@ -2728,15 +2766,20 @@ def _search_yahoo_api(query: str, config: Config, search_url: str) -> ShopPrice 
             return ShopPrice("Yahoo!ショッピング", None, "", "", search_url)
 
         # 関連性チェック→外れ値除去→最安値選択
+        # 全候補プールも保持（クロスショップ再選定用）
+        all_pool: list[tuple[int, str, str]] = []
         candidates = []
         for hit in hits:
             name = hit.get("name", "")
+            price = int(hit.get("price", 0))
+            url = hit.get("url", "")
+            if price >= 100:
+                all_pool.append((price, name, url))
             if not _is_relevant_product(query, name):
                 continue
-            price = int(hit.get("price", 0))
             if price < 100:
                 continue
-            candidates.append((price, name, hit.get("url", "")))
+            candidates.append((price, name, url))
         if candidates:
             candidates.sort(key=lambda x: x[0])
             # 外れ値除去: 3件以上あれば中央値の30%未満の価格は除外
@@ -2752,8 +2795,10 @@ def _search_yahoo_api(query: str, config: Config, search_url: str) -> ShopPrice 
                     product_name=name,
                     product_url=url,
                     search_url=search_url,
+                    candidates=all_pool or None,
                 )
-        return ShopPrice("Yahoo!ショッピング", None, "", "", search_url)
+        return ShopPrice("Yahoo!ショッピング", None, "", "", search_url,
+                         candidates=all_pool or None)
     except Exception:
         return None  # フォールバック
 
@@ -3009,6 +3054,10 @@ def search_amazon(query: str, _config: Config) -> ShopPrice:
             return _make_error_result("Amazon.co.jp", search_url, "アクセス制限（手動で検索してください）")
 
         all_candidates, nameless_fallback, max_list_price = _extract_amazon_candidates(soup, query)
+        # クロスショップ再選定用に元の候補プールを保存（フィルタ前 / list_price 削除）
+        amazon_pool: list[tuple[int, str, str]] = [
+            (c[0], c[1], c[2]) for c in all_candidates if c[0] and c[0] >= 100
+        ]
         logger.info("Amazon: HTML %d chars, %d candidates extracted (list_price_anchor=%s)",
                      len(resp.text), len(all_candidates),
                      f"¥{max_list_price:,}" if max_list_price else "なし")
@@ -3058,17 +3107,29 @@ def search_amazon(query: str, _config: Config) -> ShopPrice:
                 # 個別 list_price がなければクエリ全体の max_list_price をアンカーとして添付
                 anchor_lp = best_list_price or max_list_price
                 return ShopPrice("Amazon.co.jp", best[0], best[1], best[2], search_url,
-                                 list_price=anchor_lp)
+                                 list_price=anchor_lp,
+                                 candidates=amazon_pool or None)
 
         # 名前付き商品が見つからなかった場合、名前なしでも価格があれば返す
         if first_valid_price_result:
             logger.info("Amazon: using nameless result with price %d", first_valid_price_result.price)
+            if amazon_pool:
+                first_valid_price_result = ShopPrice(
+                    first_valid_price_result.shop_name,
+                    first_valid_price_result.price,
+                    first_valid_price_result.product_name,
+                    first_valid_price_result.product_url,
+                    first_valid_price_result.search_url,
+                    candidates=amazon_pool,
+                )
             return first_valid_price_result
 
         # JSON-LD/embedded JSONもフォールバックとして試す
-        price, name, url = _find_price_in_soup(soup, [], "https://www.amazon.co.jp", query=query)
+        price, name, url, soup_pool = _find_price_in_soup(
+            soup, [], "https://www.amazon.co.jp", query=query, return_candidates=True)
         if price:
-            return ShopPrice("Amazon.co.jp", price, name, url, search_url)
+            return ShopPrice("Amazon.co.jp", price, name, url, search_url,
+                             candidates=(amazon_pool or soup_pool) or None)
 
         # === 簡略クエリ / 英語クエリでリトライ ===
         # 1) サイズ/一般語を除いたクエリ
@@ -3112,12 +3173,15 @@ def search_amazon(query: str, _config: Config) -> ShopPrice:
                         anchor_lp = best_list_price or retry_max_list
                         logger.info("Amazon %s retry OK: ¥%s (%s)", label,
                                     f"{best[0]:,}", best[1][:50])
+                        retry_pool = [(c[0], c[1], c[2]) for c in retry_candidates if c[0]]
                         return ShopPrice("Amazon.co.jp", best[0], best[1], best[2],
-                                         retry_url, list_price=anchor_lp)
+                                         retry_url, list_price=anchor_lp,
+                                         candidates=retry_pool or None)
             except Exception as retry_err:
                 logger.debug("Amazon %s retry error: %s", label, retry_err)
 
-        return ShopPrice("Amazon.co.jp", None, "", "", search_url)
+        return ShopPrice("Amazon.co.jp", None, "", "", search_url,
+                         candidates=amazon_pool or None)
 
     except Exception as e:
         logger.warning("Amazon scrape error: %s", e)
@@ -3626,7 +3690,18 @@ def search_apple(query: str, _config: Config) -> ShopPrice:
         soup = _soup(resp)
 
         # 1. JSON-LD: 本体らしき商品のみ採用 (アクセサリ除外)
+        # 全候補プール（クロスショップ再選定で使う / アクセサリ含む全商品）
+        apple_pool: list[tuple[int, str, str]] = []
         jsonld = _extract_jsonld_prices(soup)
+        for item in jsonld:
+            name = item.get("name", "")
+            price = item.get("price")
+            if not (price and name):
+                continue
+            url = item.get("url") or search_url
+            if url and not url.startswith("http"):
+                url = "https://www.apple.com" + url
+            apple_pool.append((int(price), name, url))
         for item in jsonld:
             name = item.get("name", "")
             price = item.get("price")
@@ -3647,6 +3722,7 @@ def search_apple(query: str, _config: Config) -> ShopPrice:
                 product_name=name,
                 product_url=url,
                 search_url=search_url,
+                candidates=apple_pool or None,
             )
 
         # 2. 検索結果の商品リンク → 個別ページから抽出
@@ -3694,13 +3770,15 @@ def search_apple(query: str, _config: Config) -> ShopPrice:
                         product_name=name or query,
                         product_url=purl,
                         search_url=search_url,
+                        candidates=apple_pool or None,
                     )
             except Exception as e:
                 logger.debug("Apple product page fetch failed: %s", e)
                 continue
 
-        return _make_error_result("Apple公式サイト", search_url,
-                                   "商品が見つかりませんでした")
+        return ShopPrice("Apple公式サイト", None, "", "", search_url,
+                         error="商品が見つかりませんでした",
+                         candidates=apple_pool or None)
     except Exception as e:
         return _make_error_result("Apple公式サイト", search_url, f"接続エラー: {e}")
 
@@ -4478,9 +4556,11 @@ def _retry_with_browser(results: list[ShopPrice], query: str) -> None:
                                     "(JS found items but none matched)", r.shop_name)
                     elif not js_extracted:
                         # 汎用抽出（CSS + JSON-LD + fulltext）
-                        price, name, url = _find_price_in_soup(soup, selectors, base, query=query)
+                        price, name, url, br_candidates = _find_price_in_soup(
+                            soup, selectors, base, query=query, return_candidates=True)
                         if price:
-                            results[idx] = ShopPrice(r.shop_name, price, name, url, r.search_url)
+                            results[idx] = ShopPrice(r.shop_name, price, name, url, r.search_url,
+                                                     candidates=br_candidates or None)
                             logger.info("Browser retry success: %s = ¥%s (%s)",
                                         r.shop_name, f"{price:,}", name[:50])
                         else:
@@ -4757,6 +4837,11 @@ def search_all_shops(query: str, config: Config) -> list[ShopPrice]:
     # 複数ショップの価格を比較し、明らかな外れ値（アクセサリ/無関係商品）を除外
     _validate_prices_cross_shop(results)
 
+    # === Phase 3.5: 候補プールから定価アンカー近傍の商品を再選定 ===
+    # Phase 3 で除外されたショップ (主にアクセサリで弾かれた汎用 EC) について、
+    # 検索結果の全候補から「妥当な価格帯」に収まる商品があれば再採用する。
+    _reselect_with_anchor(results)
+
     return results
 
 
@@ -4810,7 +4895,9 @@ def _validate_prices_cross_shop(results: list[ShopPrice]) -> None:
                                 r.shop_name, f"{price:,}", reason)
                     results[idx] = ShopPrice(
                         r.shop_name, None, "", "", r.search_url,
-                        error="価格が定価の70%未満（アクセサリ等の可能性）"
+                        error="価格が定価の70%未満（アクセサリ等の可能性）",
+                        list_price=r.list_price,
+                        candidates=r.candidates,
                     )
                 else:
                     new_prices_with_idx.append((price, idx))
@@ -4854,7 +4941,9 @@ def _validate_prices_cross_shop(results: list[ShopPrice]) -> None:
                         r.shop_name, f"{price:,}", reason)
             results[idx] = ShopPrice(
                 r.shop_name, None, "", "", r.search_url,
-                error="価格異常（他店と大きく乖離）"
+                error="価格異常（他店と大きく乖離）",
+                list_price=r.list_price,
+                candidates=r.candidates,
             )
             removed_indices.add(idx)
         remaining = new_remaining
@@ -4875,5 +4964,87 @@ def _validate_prices_cross_shop(results: list[ShopPrice]) -> None:
                         r.shop_name, f"{price:,}", reason)
             results[idx] = ShopPrice(
                 r.shop_name, None, "", "", r.search_url,
-                error="価格異常（他店と大きく乖離）"
+                error="価格異常（他店と大きく乖離）",
+                candidates=r.candidates,  # 候補は保持（Phase 3.5 で再選定）
             )
+
+
+# ============================================================
+# Phase 3.5: 候補プールからアンカー近傍の商品を再選定
+# ============================================================
+# 「Yahoo/Amazon/楽天 はそりゃアクセサリもヒットするけど、定価を中心に
+#  製品を絞り込んだうえで其々精査すればちゃんと拾えそう」(ユーザー方針)
+# 失敗ショップの ShopPrice.candidates から妥当な価格帯の商品を救い出す。
+def _reselect_with_anchor(results: list[ShopPrice]) -> None:
+    """Phase 3 で除外されたショップを candidates プールから再選定する。
+
+    アンカー: 成功ショップの list_price 最大値 / または有効価格の中央値。
+    救済範囲: アンカーの 70% 〜 150%。
+    対象: candidates を持ち、価格未取得 or 「価格異常」エラーのショップ。
+    """
+    valid_prices = [r.price for r in results if r.price is not None and r.error is None]
+    list_prices = [r.list_price for r in results
+                   if r.list_price and r.list_price >= 2000]
+
+    if not valid_prices:
+        return  # 比較基準なし
+
+    if list_prices:
+        anchor = max(list_prices)
+        anchor_src = f"list_price max (from {len(list_prices)} shops)"
+    else:
+        sp = sorted(valid_prices)
+        anchor = sp[len(sp) // 2]
+        anchor_src = f"median of {len(valid_prices)} valid prices"
+
+    if anchor < 2000:
+        return
+
+    lower = int(anchor * 0.70)
+    upper = int(anchor * 1.50)
+
+    # 「再選定対象」の判定: 価格未取得 or 価格異常エラー
+    REPLACEABLE_ERRORS = (
+        "価格異常",
+        "価格が定価の70%未満",
+    )
+
+    reselected = 0
+    for idx, r in enumerate(results):
+        if not r.candidates:
+            continue
+        if r.price is not None and r.error is None:
+            continue  # 既に正常採用済み
+        # error が再選定対象でない（アクセス制限・タイムアウト等）はスキップ
+        if r.error and not any(m in r.error for m in REPLACEABLE_ERRORS):
+            continue
+        # 候補から妥当な範囲のものを抽出
+        in_range = [(p, n, u) for p, n, u in r.candidates
+                    if isinstance(p, int) and lower <= p <= upper]
+        if not in_range:
+            continue
+        # 最安値を採用（価格帯は妥当なので、その中で最安なら本物の有力候補）
+        in_range.sort(key=lambda c: c[0])
+        new_price, new_name, new_url = in_range[0]
+        old_price_str = f"¥{r.price:,}" if r.price else "(なし)"
+        logger.info(
+            "Reselect: %s %s → ¥%s [anchor=¥%s (%s), range=¥%s〜¥%s] %s",
+            r.shop_name, old_price_str, f"{new_price:,}",
+            f"{anchor:,}", anchor_src,
+            f"{lower:,}", f"{upper:,}",
+            (new_name or "")[:60]
+        )
+        results[idx] = ShopPrice(
+            shop_name=r.shop_name,
+            price=new_price,
+            product_name=new_name or "",
+            product_url=new_url or r.search_url,
+            search_url=r.search_url,
+            list_price=r.list_price,
+            candidates=r.candidates,
+        )
+        reselected += 1
+
+    if reselected:
+        logger.info("Phase 3.5 (reselect): %d shops recovered with anchor=¥%s",
+                    reselected, f"{anchor:,}")
