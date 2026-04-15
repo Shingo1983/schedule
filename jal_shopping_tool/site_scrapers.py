@@ -1040,7 +1040,7 @@ _SHOP_DOMAINS: dict[str, list[str]] = {
     "エディオンネットショップ": ["edion.com"],
     "ユニクロオンラインストア": ["uniqlo.com"],
     "無印良品ネットストア": ["muji.com"],
-    "JAL Mall": ["mall.jal.co.jp", "ec.jal.co.jp"],
+    "JAL Mall": ["ec.jal.co.jp", "mall.jal.co.jp"],
     "ベルメゾンネット": ["bellemaison.jp"],
     "LOHACO": ["lohaco.yahoo.co.jp", "lohaco.jp"],
     "ニトリネット": ["nitori-net.jp"],
@@ -3125,11 +3125,18 @@ def search_amazon(query: str, _config: Config) -> ShopPrice:
 # ビックカメラ.com (スクレイピング)
 # ============================================================
 def search_biccamera(query: str, _config: Config) -> ShopPrice:
-    # ビックカメラ: PC 版はタイムアウトが多発するため軽量な検索 URL を優先試行。
-    q = quote(_normalize_query(query))
-    # rowPerPage 指定なしの軽量版のみ（Railway 30秒タイムアウト対策）
+    # ビックカメラ: 検索クエリは **Shift-JIS** エンコード必須。
+    # 実 URL 例: /bc/category/?q=%83m%81%5B%83g%83p%83%5C%83R%83%93&sg=
+    # UTF-8 で叩くとサーバが解釈できずタイムアウト/空応答になる。
+    normalized = _normalize_query(query)
+    try:
+        q_sjis = quote(normalized.encode("shift_jis", errors="replace"))
+    except Exception:
+        q_sjis = quote(normalized)
+    q_utf = quote(normalized)
     search_urls = [
-        f"https://www.biccamera.com/bc/category/?q={q}",
+        f"https://www.biccamera.com/bc/category/?q={q_sjis}&sg=",
+        f"https://www.biccamera.com/bc/category/?q={q_utf}",  # UTF-8 fallback
     ]
     selectors = [
         (".bcs_listItem", ".bcs_price", ".bcs_title a"),
@@ -3176,10 +3183,11 @@ def search_kojima(query: str, _config: Config) -> ShopPrice:
 # ヤマダウェブコム (スクレイピング)
 # ============================================================
 def search_yamada(query: str, _config: Config) -> ShopPrice:
-    # ヤマダ: /search/query/ と ?keyword= の2パターンを試行
+    # ヤマダ: 実 URL は /search/{keyword}/?category=all&searchbox=1 (パスベース)
+    q = quote(_normalize_query(query))
     search_urls = [
-        f"https://www.yamada-denkiweb.com/search?keyword={quote(query)}",
-        f"https://www.yamada-denkiweb.com/search/{quote(query)}/",
+        f"https://www.yamada-denkiweb.com/search/{q}/?category=all&searchbox=1",
+        f"https://www.yamada-denkiweb.com/search/{q}/",
     ]
     selectors = [
         (".searchResult__item", ".searchResult__price, .pPrice", ".searchResult__name a, .pName a"),
@@ -3230,13 +3238,13 @@ def search_joshin(query: str, _config: Config) -> ShopPrice:
 # au PAY マーケット (HTML + JSON-LD + 埋め込みJSON)
 # ============================================================
 def search_aupay(query: str, _config: Config) -> ShopPrice:
-    # au PAY マーケット: wowma.jp は現役。/itemlist?keyword= は旧パス
-    # で 404 になるため、現行検索エンドポイントを優先試行。
+    # au PAY マーケット (wowma.jp): 実 URL から逆算した正しいパラメータ群。
+    # 単純な /itemlist?keyword= だと bot 判定で 404 を返す事があるため、
+    # ブラウザがリンクするのと同じ補助パラメータを付ける。
     q = quote(_normalize_query(query))
-    # 試行は最大2 URL に抑制（Railway 30秒タイムアウト対策）
     search_urls = [
-        f"https://wowma.jp/c/wm-search/?keyword={q}",
-        f"https://www.au-pay-market.jp/itemlist/?keyword={q}",
+        f"https://wowma.jp/itemlist?keyword={q}&ipp=40&categ_id=&at=FP&non_gr=ex",
+        f"https://wowma.jp/itemlist?keyword={q}",
     ]
     selectors = [
         (".itemList__item", ".itemList__price, .price", ".itemList__name a, .product-name a"),
@@ -3263,8 +3271,10 @@ def search_seven(query: str, _config: Config) -> ShopPrice:
     # セブンネット: omni7 ドメインは 2024 以降 7net.omni7.jp に統合・パス変更あり。
     # 新旧パスを順に試す。
     q = quote(_normalize_query(query))
+    # 実 URL: /search/?keyword=...&searchKeywordFlg=1&userKeywordFlg=1
+    # bot 判定回避のため userKeywordFlg=1 が必要。
     search_urls = [
-        f"https://7net.omni7.jp/general/search?keyword={q}",
+        f"https://7net.omni7.jp/search/?keyword={q}&searchKeywordFlg=1&userKeywordFlg=1",
         f"https://7net.omni7.jp/search/?keyword={q}&searchKeywordFlg=1",
     ]
     selectors = [
@@ -3312,10 +3322,10 @@ def search_qoo10(query: str, _config: Config) -> ShopPrice:
 # エディオンネットショップ (HTML + JSON-LD + 埋め込みJSON)
 # ============================================================
 def search_edion(query: str, _config: Config) -> ShopPrice:
-    # エディオン: detail_search.html と /search/ の両方を試す
+    # エディオン: 実 URL は /item_list.html?keyword=
     search_urls = [
+        f"https://www.edion.com/item_list.html?keyword={quote(_normalize_query(query))}",
         f"https://www.edion.com/search/?keyword={quote(query)}",
-        f"https://www.edion.com/detail_search.html?q={quote(query)}",
     ]
     selectors = [
         (".goods-list-item, .goodsListItem", ".goods-price, .goodsPrice, .price",
@@ -3449,27 +3459,13 @@ search_muji = _make_generic_scraper(
 )
 
 def search_jalmall(query: str, _config: Config) -> ShopPrice:
-    """JAL Mall: 旧 ec.jal.co.jp から mall.jal.co.jp に統合済み。"""
+    """JAL Mall: 実 URL は ec.jal.co.jp/shop/goods/search.aspx?search=x&keyword="""
     q = quote(_normalize_query(query))
-    search_urls = [
-        f"https://mall.jal.co.jp/shop/searchresult?keyword={q}",
-        f"https://ec.jal.co.jp/shop/goods/search.aspx?keyword={q}&search=x",
-    ]
+    search_url = f"https://ec.jal.co.jp/shop/goods/search.aspx?search=x&keyword={q}"
     headers = {"Sec-Fetch-Site": "same-origin",
-               "Referer": "https://mall.jal.co.jp/shop/"}
-    last_error = None
-    for url in search_urls:
-        result = _scrape_generic("JAL Mall", url, _GENERIC_SELECTORS,
-                                 "https://mall.jal.co.jp", headers=headers,
-                                 query=query)
-        if result.price is not None:
-            return result
-        if result.error:
-            last_error = result.error
-            if "HTTP 404" not in result.error and "HTTP 410" not in result.error:
-                return result
-    return ShopPrice("JAL Mall", None, "", "", search_urls[0],
-                     error=last_error)
+               "Referer": "https://ec.jal.co.jp/shop/"}
+    return _scrape_generic("JAL Mall", search_url, _GENERIC_SELECTORS,
+                           "https://ec.jal.co.jp", headers=headers, query=query)
 
 search_bellemaison = _make_generic_scraper(
     "ベルメゾンネット",
@@ -3556,9 +3552,10 @@ search_ksdenki = _make_generic_scraper(
 def search_nojima(query: str, _config: Config) -> ShopPrice:
     """ノジマオンライン: 複数URLパターン試行"""
     q = quote(_normalize_query(query))
+    # 実 URL: /app/catalog/list/init?searchCategoryCode=0&searchMethod=0&searchWord=
     search_urls = [
+        f"https://online.nojima.co.jp/app/catalog/list/init?searchCategoryCode=0&searchMethod=0&searchWord={q}",
         f"https://online.nojima.co.jp/search?keyword={q}",
-        f"https://online.nojima.co.jp/commodity/list/?searchWord={q}",
     ]
     selectors = [
         # ノジマ固有
