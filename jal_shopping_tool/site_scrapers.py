@@ -1315,7 +1315,8 @@ def _yahoojp_query(q: str, domain: str) -> list[tuple[int, str, str]]:
 
 
 def _bing_search_fallback(
-    shop_name: str, query: str, original_search_url: str
+    shop_name: str, query: str, original_search_url: str,
+    extra_query_variants: list[str] | None = None,
 ) -> ShopPrice | None:
     """Web 検索エンジンの `site:<domain>` 検索を組み合わせた汎用価格フォールバック。
 
@@ -1328,12 +1329,40 @@ def _bing_search_fallback(
     2. 候補が取れなければ簡略クエリで Bing を再検索
     3. それでも取れなければ DuckDuckGo で検索
     4. 最後の手段として Yahoo! JAPAN 検索
+
+    extra_query_variants: 他ショップで既に成功した「正式商品名」のリスト。
+      ユーザー入力と表記揺れがある場合（例: ユーザー「イッシン iWalk スマートバスマット」
+      vs Rakuten「ISSIN スマートバスマット プロ」）に有効。
+      型番抽出と simplified の間に挿入し、長すぎるものは短縮する。
     """
     domain = _shop_primary_domain(shop_name, original_search_url)
     if not domain:
         return None
 
     queries_to_try = _build_query_variants(query)
+
+    # 成功ショップの正式商品名を追加クエリ候補として注入（重複排除）。
+    # 表記揺れ・カナ表記差で本検索が0件になる失敗ショップを救済する。
+    if extra_query_variants:
+        seen_lower = {q.lower() for q in queries_to_try}
+        injected = []
+        for canonical in extra_query_variants:
+            if not canonical:
+                continue
+            # 長すぎる商品名は最初の 5 トークンに切り詰め（検索精度向上）
+            tokens = re.split(r"[\s　]+", canonical.strip())
+            short = " ".join(tokens[:5]) if len(tokens) > 5 else canonical.strip()
+            for cand in (canonical, short):
+                cl = cand.lower()
+                if cand and cl not in seen_lower:
+                    seen_lower.add(cl)
+                    injected.append(cand)
+        # 型番(先頭1件) の直後・simplified の前に挿入
+        if injected:
+            insert_at = 1 if queries_to_try else 0
+            queries_to_try = (queries_to_try[:insert_at]
+                              + injected
+                              + queries_to_try[insert_at:])
 
     all_candidates: list[tuple[int, str, str]] = []
     source_used = None
@@ -4429,13 +4458,46 @@ def search_all_shops(query: str, config: Config) -> list[ShopPrice]:
         shop_list = [r.shop_name for _, r in bing_targets]
         logger.info("Phase 2.6: web-search fallback for %d shops: %s",
                      len(bing_targets), ", ".join(shop_list[:15]))
+
+        # Phase 1/1.5/2/2.5 で価格取得に成功したショップの正式商品名を収集。
+        # 信頼性の高い順（Rakuten・Yahoo・Yamada 等の実店舗 EC を優先）に並べ、
+        # 失敗ショップへのクエリ多様化として再注入する。
+        _CANONICAL_PRIORITY = (
+            "楽天市場", "Yahoo!ショッピング", "ヤマダウェブコム",
+            "Amazon.co.jp", "ヨドバシ.com", "ビックカメラ.com", "ジョーシン",
+        )
+        canonical_names: list[str] = []
+        seen_canon: set[str] = set()
+        # 優先順ショップから先に
+        priority_map = {n: i for i, n in enumerate(_CANONICAL_PRIORITY)}
+        ordered = sorted(
+            (r for r in results if r.price is not None and r.product_name),
+            key=lambda r: priority_map.get(r.shop_name, 99),
+        )
+        for r in ordered:
+            name = (r.product_name or "").strip()
+            if not name or len(name) < 5:
+                continue
+            key = name.lower()
+            if key in seen_canon:
+                continue
+            seen_canon.add(key)
+            canonical_names.append(name)
+            if len(canonical_names) >= 3:  # 上位3件まで（クエリ爆発を抑制）
+                break
+        if canonical_names:
+            logger.info("Phase 2.6: injecting %d canonical product names: %s",
+                        len(canonical_names),
+                        " | ".join(n[:40] for n in canonical_names))
+
         recovered_shops = []
         failed_shops = []
         # 検索エンジンへの連続アクセスは並列を抑える（レートリミット対策）
         with ThreadPoolExecutor(max_workers=3) as executor:
             future_to_idx = {
                 executor.submit(
-                    _bing_search_fallback, r.shop_name, query, r.search_url
+                    _bing_search_fallback, r.shop_name, query, r.search_url,
+                    canonical_names,
                 ): idx
                 for idx, r in bing_targets
             }
