@@ -3211,10 +3211,16 @@ def search_yamada(query: str, _config: Config) -> ShopPrice:
 # Joshin webショップ (スクレイピング)
 # ============================================================
 def search_joshin(query: str, _config: Config) -> ShopPrice:
-    # Joshin: 複数URLパターン試行（servletは遅いのでシンプルなURLを優先）
+    # Joshin: クエリは **Shift-JIS** エンコード必須。実 URL:
+    # /srhzs.html?QK={shift-jis}&KEY=ZS_ALL&KEY_M=ALL&REQUEST_CODE=1
+    normalized = _normalize_query(query)
+    try:
+        q_sjis = quote(normalized.encode("shift_jis", errors="replace"))
+    except Exception:
+        q_sjis = quote(normalized)
     search_urls = [
-        f"https://joshinweb.jp/search?keyword={quote(query)}",
-        f"https://joshinweb.jp/servlet/emall.odr_wp?QS=&REQUEST_CODE=1&category_id=&SHP=0&QK={quote(query)}&PID=srhzs",
+        f"https://joshinweb.jp/srhzs.html?KEYWORD=&KEY=ZS_ALL&KEY_M=ALL&QS=&QK={q_sjis}&category_id=&REQUEST_CODE=1",
+        f"https://joshinweb.jp/search?keyword={quote(normalized)}",
     ]
     selectors = [
         (".productList__item", ".productList__price", ".productList__name a"),
