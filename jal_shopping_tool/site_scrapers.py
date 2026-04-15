@@ -3309,19 +3309,32 @@ def search_seven(query: str, _config: Config) -> ShopPrice:
 # Qoo10 (HTML + JSON-LD + 埋め込みJSON)
 # ============================================================
 def search_qoo10(query: str, _config: Config) -> ShopPrice:
-    search_url = f"https://www.qoo10.jp/s/{quote(query)}?keyword={quote(query)}"
+    # Qoo10 PC 版は SPA で初期 HTML に価格が無いため、モバイル版を優先試行
+    # (m.qoo10.jp は初期 HTML に価格を埋め込むことが多い)
+    q = quote(_normalize_query(query))
+    search_urls = [
+        f"https://m.qoo10.jp/s/{q}?keyword={q}",
+        f"https://www.qoo10.jp/s/{q}?keyword={q}&keyword_auto_change=&furusato_gdlc_cd=",
+    ]
     selectors = [
         (".sc-prd", ".prc .prc-dc, .prc", ".tit a, .sbj a"),
         (".item_g", ".price, .prc", ".sbj a"),
-        # Qoo10 2025年版セレクタ
         ('[class*="goods"]', '[class*="price"], [class*="prc"]',
          '[class*="name"] a, [class*="sbj"] a, [class*="tit"] a'),
         (".gd_list li, .lst_cont li", ".prc, .price", ".tit a, .sbj a, .name a"),
         ('[class*="product"]', '[class*="price"]', '[class*="title"] a, [class*="name"] a'),
         (".goods_item", ".price", ".goods_name a, .title a"),
-    ]
-    return _scrape_generic("Qoo10", search_url, selectors,
-                           "https://www.qoo10.jp", query=query)
+    ] + _GENERIC_SELECTORS
+    last_error = None
+    for url in search_urls:
+        result = _scrape_generic("Qoo10", url, selectors,
+                                 "https://www.qoo10.jp", query=query)
+        if result.price is not None:
+            return result
+        if result.error:
+            last_error = result.error
+    return ShopPrice("Qoo10", None, "", "", search_urls[0],
+                     error=last_error)
 
 
 # ============================================================
@@ -3556,32 +3569,29 @@ search_ksdenki = _make_generic_scraper(
 )
 
 def search_nojima(query: str, _config: Config) -> ShopPrice:
-    """ノジマオンライン: 複数URLパターン試行"""
+    """ノジマオンライン: bot 検出が厳しいので、フル Sec-Fetch-* ヘッダーで
+    通常ブラウザ遷移を模倣する。"""
     q = quote(_normalize_query(query))
-    # 実 URL: /app/catalog/list/init?searchCategoryCode=0&searchMethod=0&searchWord=
-    search_urls = [
-        f"https://online.nojima.co.jp/app/catalog/list/init?searchCategoryCode=0&searchMethod=0&searchWord={q}",
-        f"https://online.nojima.co.jp/search?keyword={q}",
-    ]
+    search_url = (f"https://online.nojima.co.jp/app/catalog/list/init"
+                  f"?searchCategoryCode=0&searchMethod=0&searchWord={q}")
     selectors = [
-        # ノジマ固有
         (".catalogListItem, .list-item", ".catalogPrice, .price, .item-price",
          ".catalogName a, .item-name a, .product-name a"),
         (".commodity-item", ".commodity-price, .price", ".commodity-name a"),
         ('[class*="catalog"]', '[class*="price"]', '[class*="name"] a'),
         ('[class*="commodity"]', '[class*="price"]', '[class*="name"] a'),
     ] + _GENERIC_SELECTORS
-    for url in search_urls:
-        result = _scrape_generic("ノジマオンライン", url, selectors,
-                                 "https://online.nojima.co.jp", query=query)
-        if result.price is not None:
-            return result
-        # HTTP 404なら次のURLを試す、それ以外のエラーなら返す
-        if result.error and "HTTP 404" not in (result.error or ""):
-            if "接続エラー" not in (result.error or ""):
-                return result
-    return ShopPrice("ノジマオンライン", None, "", "", search_urls[0],
-                     error=result.error if result else None)
+    headers = {
+        "Referer": "https://online.nojima.co.jp/",
+        "Sec-Fetch-Site": "same-origin",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-User": "?1",
+        "Upgrade-Insecure-Requests": "1",
+    }
+    return _scrape_generic("ノジマオンライン", search_url, selectors,
+                           "https://online.nojima.co.jp",
+                           headers=headers, query=query)
 
 search_matsukiyo = _make_generic_scraper(
     "マツモトキヨシオンラインストア",
