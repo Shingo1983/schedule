@@ -647,22 +647,29 @@ def _is_relevant_product(query: str, product_name: str) -> bool:
 
     # === クエリエコーバック検出 ===
     # 検索結果0件時にページがクエリを見出しに表示し、無関係商品の価格が
-    # 近くにあるケースを防止（例: ユニクロ/GUの「〇〇の検索結果」）
-    # 商品名がクエリとほぼ同一（余分な文字が少ない）なら実商品ではない
+    # 近くにあるケースを防止（例: ユニクロ/GUの「〇〇の検索結果」）。
+    # ここでは「商品名がほぼクエリそのもの + 検索結果系の接辞」のみを弾く。
+    # 商品記述（ワイヤレスイヤホン・256GB 等）が付与されている real product は
+    # 必ず通すために、substring + 緩い diff 判定は使わない（誤除外の主因）。
     _ECHO_STRIP_RE = re.compile(r'[\s　\-/／「」『』【】()（）・、。,.]+')
     _q_normalized = _ECHO_STRIP_RE.sub('', query_lower)
     _n_normalized = _ECHO_STRIP_RE.sub('', name_lower)
     if _q_normalized and _n_normalized:
-        # 商品名がクエリとほぼ同じ（前後の装飾文字程度の差）→ エコーバック
-        if (_n_normalized == _q_normalized
-                # 商品名がクエリの先頭部分+少しだけ余分
-                or (_n_normalized.startswith(_q_normalized)
-                    and len(_n_normalized) - len(_q_normalized) < 10)
-                # クエリが商品名に含まれ、差分が小さい
-                or (_q_normalized in _n_normalized
-                    and len(_n_normalized) - len(_q_normalized) < 15)
-                # 商品名がクエリの部分文字列（クエリそのものが短縮されてエコー）
-                or (_n_normalized in _q_normalized)):
+        # 1) 完全一致（ほぼ無い想定だが念のため）
+        if _n_normalized == _q_normalized:
+            return False
+        # 2) 商品名 = クエリ + 「の検索結果」「検索結果」「一覧」「商品一覧」等の接辞のみ
+        _ECHO_SUFFIX_RE = re.compile(
+            r'^(?:の?検索結果|検索結果|商品一覧|一覧|の?商品|商品|'
+            r'results?|search\s*results?)$',
+            re.IGNORECASE,
+        )
+        if _n_normalized.startswith(_q_normalized):
+            tail = _n_normalized[len(_q_normalized):]
+            if tail and _ECHO_SUFFIX_RE.match(tail):
+                return False
+        # 3) 商品名がクエリの部分文字列 → クエリより短い疑似商品名（無意味）
+        if _n_normalized in _q_normalized and len(_n_normalized) < len(_q_normalized):
             return False
 
     # === キーワードマッチ（先にチェック — 無関係商品を先に弾く） ===
@@ -720,6 +727,23 @@ def _is_relevant_product(query: str, product_name: str) -> bool:
             if match_count < required:
                 return False
 
+        # === バージョン/世代トークンの強制マッチ ===
+        # クエリに「m3」「pro3」「gen2」等のバージョン/世代トークンが含まれる場合、
+        # 商品名にも同一トークンが必須。キーワード過半数一致で誤魔化して異世代品を
+        # 通してしまうのを防止する。例:
+        #   query="MacBook Air M3" → "MacBook Air M2チップ" は除外（m2 ≠ m3）
+        #   query="MacBook Air M3" → "NIMASO MacBook air1 m5対応" は除外（m5 ≠ m3）
+        #   query="AirPods Pro 3"  → "AirPods Pro 2" は除外（'3' 単独はワードバウンダリ済み）
+        # 1-3 文字の英字 + 1-2 桁の数字に限定（Apple チップ m3/pro3、世代 gen2 等）。
+        # 4 文字以上の英字は Apple 型番（mtjv3 等）の可能性があるので除外する。
+        _VERSION_TOKEN_RE = re.compile(r'^(?:[a-z]{1,3}\d{1,2}|gen\d{1,2})$')
+        version_tokens = [kw for kw in keywords if _VERSION_TOKEN_RE.match(kw)]
+        for vt in version_tokens:
+            # 商品名側もワードバウンダリでトークンを探索
+            pattern = r'(?<![a-zA-Z0-9])' + re.escape(vt) + r'(?![a-zA-Z0-9])'
+            if not re.search(pattern, product_name, re.IGNORECASE):
+                return False
+
     # === アクセサリ除外（パターンベース） ===
     # クエリ自体がアクセサリを指している場合はスキップ
     _ACCESSORY_QUERY_WORDS = [
@@ -747,6 +771,14 @@ def _is_relevant_product(query: str, product_name: str) -> bool:
         # 常にアクセサリ（単体で十分明確）
         r'イヤーフック', r'イヤーピース', r'イヤーチップ', r'イヤーパッド',
         r'保護フィルム', r'ガラスフィルム', r'液晶保護',
+        r'覗き見防止', r'のぞき見防止', r'プライバシー\s*フィルム',
+        r'フィルム(?:\s*\d+\s*枚)?(?:$|\s|、|，|／|/)',  # 末尾「フィルム」「フィルム 2枚」
+        r'ブルーライトカット',
+        r'\bフィルタ(?:ー|ｰ)?\b',
+        # 保証・サービス（物理商品ではない）
+        r'AppleCare\s*\+?',
+        r'applecare\s*\+?',
+        r'\b延長保証\b', r'\b保証サービス\b',
         r'保護ケース', r'保護カバー', r'保護ガラス',
         r'ストラップ',
         r'クリーナー', r'クリーニング',
@@ -2983,6 +3015,7 @@ def _extract_amazon_candidates(soup, query_for_filter: str):
     full_pool: list[tuple[int, str, str]] = []
     nameless_fallback = None  # (price, url)
     max_list_price = None
+    list_price_count = 0  # list_price を持つ関連商品の件数
 
     for result in results_found:
         sponsored = result.select_one('.s-label-popover-default')
@@ -3017,13 +3050,32 @@ def _extract_amazon_candidates(soup, query_for_filter: str):
         # list_price は通常 price 以上。逆転していたら異常値として無視。
         if list_price and list_price < price:
             list_price = None
-        if list_price and (max_list_price is None or list_price > max_list_price):
-            max_list_price = list_price
+        if list_price:
+            list_price_count += 1
+            if max_list_price is None or list_price > max_list_price:
+                max_list_price = list_price
 
         if name:
             all_candidates.append((price, name, url, list_price))
         elif nameless_fallback is None:
             nameless_fallback = (price, url)
+
+    # === list_price の信頼性ガード ===
+    # list_price を持つ関連商品が 1 件しかなく、かつ max_list_price が
+    # 候補プールの中央値より低い場合、それはアクセサリ等の外れ値である
+    # 可能性が高い（例: ¥2,980 の覗き見防止フィルムが本体検索に混入）。
+    # このような値をアンカーに使うと、真の本体商品（¥150k 等）の
+    # 下限フィルタが機能しなくなる or 逆に誤フィルタされるので無効化する。
+    if max_list_price and all_candidates:
+        prices = sorted(c[0] for c in all_candidates)
+        median = prices[len(prices) // 2] if prices else 0
+        # 定価アンカーは候補群の中央値以上が期待される（定価 ≥ 販売価格）。
+        # 中央値より低い list_price は誤検出として破棄。
+        # また、list_price を持つ商品が 1 件だけで絶対値が小さい (<¥5,000) 場合も破棄。
+        if max_list_price < median or (list_price_count <= 1 and max_list_price < 5000):
+            logger.info("Amazon: max_list_price ¥%s discarded (median=¥%s, lp_count=%d) — likely accessory noise",
+                        f"{max_list_price:,}", f"{median:,}", list_price_count)
+            max_list_price = None
 
     return all_candidates, nameless_fallback, max_list_price, full_pool
 
@@ -4771,9 +4823,11 @@ def search_all_shops(query: str, config: Config) -> list[ShopPrice]:
     # === Phase 2.6: 検索エンジン site: 検索による汎用フォールバック ===
     # kakaku でも拾えなかったショップ向け。Bing/DDG/Yahoo JP を順に試行する
     # 水平思考アプローチ。商品ページ URL が取れれば直接フェッチして価格抽出。
-    # 「取扱ジャンル外」で事前に弾かれた shop も、ユーザーは「全件取れる」と
-    # 確信しているのでここでは genre フィルタを通さない（総合モールは全商品扱う）。
-    _SKIP_BING_ERRORS = {"APIキー"}
+    # Phase 0 で「取扱ジャンル外」として弾かれた shop は、そもそも対象商品を
+    # 取り扱っていないのでここでも検索しない（gunicorn タイムアウト対策）。
+    # 総合モール（楽天等）は genre="all" 扱いで除外されないため、実質的な
+    # 網羅性は変わらない。
+    _SKIP_BING_ERRORS = {"APIキー", "取扱ジャンル外"}
     bing_targets = [
         (i, r) for i, r in enumerate(results)
         if r.price is None
