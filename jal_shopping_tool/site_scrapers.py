@@ -482,6 +482,33 @@ def _detect_product_genres(query: str) -> set[str]:
     return genres if genres else {"all"}
 
 
+# ---------------------------------------------------------------------------
+# 自社ブランド専門店: クエリにブランド名を含まない場合はスキップ対象。
+# Phase 0 で事前除外し、Phase 2 (_retry_with_browser) でも同じテーブルを参照。
+# ---------------------------------------------------------------------------
+_HOUSE_BRAND_SHOPS: dict[str, list[str]] = {
+    "DHCオンラインショップ": ["dhc"],
+    "ファンケルオンライン": ["ファンケル", "fancl"],
+    # Sony Store は Sony 製品のみ。Apple/他社家電は扱わないので、
+    # クエリに sony 関連語が無いとき検索しても「商品が見つかりません」で終わる。
+    "ソニーストア": [
+        "sony", "ソニー", "bravia", "ブラビア", "walkman", "ウォークマン",
+        "wh-", "wf-", "linkbuds", "xperia", "playstation", "ps5", "ps4",
+        "alpha", "rx100", "fx3", "fx30", "a7", "zv-", "dsc-", "ilce-",
+        "ブルーレイ", "bdz-", "ht-a", "srs-",
+    ],
+}
+
+
+def _shop_is_off_brand(shop_name: str, query: str) -> bool:
+    """自社ブランド専門店かつクエリが別ブランドなら True（取扱対象外）。"""
+    keywords = _HOUSE_BRAND_SHOPS.get(shop_name)
+    if not keywords:
+        return False
+    ql = query.lower()
+    return not any(kw in ql for kw in keywords)
+
+
 def _is_shop_relevant(shop_name: str, genres: set[str]) -> bool:
     """ショップが検索ジャンルに関連するか判定
 
@@ -876,11 +903,14 @@ def _is_relevant_product(query: str, product_name: str) -> bool:
     _USED_PATTERNS = [
         # 中古: 「中古品」に限らず「マックブック 中古 Apple...」等の単独表記も除外
         # (整備済み品 "リファービッシュ"/"Refurbished"/"Renewed" は別ルートで許容)
-        r'(?:^|[\s　\[【「『・,、/／])中古(?:$|[\s　\]】」』・,、/／]|品|市場|販売|ショップ|モール)',
-        r'\bused\b', r'pre[\-\s]?owned',
-        r'訳あり', r'ジャンク', r'不良品', r'動作未確認',
+        # 「中古パソコン」「中古スマホ」「中古PC」「中古iPhone」等の複合語も対象
+        r'(?:^|[\s　\[【「『・,、/／])中古(?:$|[\s　\]】」』・,、/／]|品|市場|販売|ショップ|モール|パソコン|スマホ|pc|iphone|ipad|macbook|mac|android|カメラ|家電|機種|ノート|デスクトップ|タブレット)',
+        r'\bused\b', r'pre[\-\s]?owned', r'\bsecond[\s\-]?hand\b',
+        r'訳あり', r'ジャンク', r'不良品', r'動作未確認', r'訳アリ',
         # ジャンク扱いの省略形
         r'\bjunk\b',
+        # リサイクル/買取店
+        r'リユース', r'リサイクル品',
     ]
     for pattern in _USED_PATTERNS:
         if re.search(pattern, name_lower, re.IGNORECASE):
@@ -1475,14 +1505,17 @@ def _bing_search_fallback(
         ("Bing", _bing_query),
         ("DDG", _duckduckgo_query),
     ]
+    # 診断: どのエンジンが何回トライして何件返したかを記録
+    trace: list[str] = []
     for engine_name, engine_fn in engines:
         for q in queries_to_try:
             try:
                 cands = engine_fn(q, domain)
             except Exception as e:
-                logger.debug("Search engine %s error for %s: %s",
-                             engine_name, shop_name, e)
+                trace.append(f"{engine_name}[{q[:20]}]=ERR({type(e).__name__})")
                 cands = []
+            else:
+                trace.append(f"{engine_name}[{q[:20]}]={len(cands)}")
             if cands:
                 all_candidates = cands
                 source_used = f"{engine_name}[{q[:30]}]"
@@ -1491,8 +1524,8 @@ def _bing_search_fallback(
             break
 
     if not all_candidates:
-        logger.debug("Web search fallback: no candidates for %s (domain=%s)",
-                     shop_name, domain)
+        logger.info("Web search fallback FAIL: %s (domain=%s) trace=[%s]",
+                     shop_name, domain, ", ".join(trace[:6]))
         return None
 
     # 外れ値除去（中央値の30%未満除外 — アクセサリ対策）
@@ -4544,12 +4577,6 @@ def _retry_with_browser(results: list[ShopPrice], query: str) -> None:
     # 「商品が見つかりませんでした」もリトライ対象に含む(クエリ簡略化やJS描画で
     # 解決する可能性があるため)。HTTP 404/410 は確定的にスキップ。
     _SKIP_ERRORS = {"APIキー", "HTTP 404", "HTTP 410", "取扱ジャンル外"}
-    # 自社ブランド専門店：Phase 2でも他ブランド検索は無駄なのでスキップ
-    _HOUSE_BRAND_SHOPS = {
-        "DHCオンラインショップ": ["dhc"],
-        "ファンケルオンライン": ["ファンケル", "fancl"],
-    }
-    query_lower = query.lower()
     retry_normal = []   # Phase1でHTMLは取れたがprice抽出失敗 → 成功見込み高
     retry_timeout = []  # Phase1でタイムアウト/アクセス制限 → ブラウザなら成功の可能性
     for i, r in enumerate(results):
@@ -4560,8 +4587,8 @@ def _retry_with_browser(results: list[ShopPrice], query: str) -> None:
         if not r.search_url:
             continue
         # 自社ブランド専門店は、クエリにブランド名がない場合スキップ
-        brand_keywords = _HOUSE_BRAND_SHOPS.get(r.shop_name)
-        if brand_keywords and not any(bk in query_lower for bk in brand_keywords):
+        # （Phase 0 で既に除外済みだが、手動入力経路などの保険として残す）
+        if _shop_is_off_brand(r.shop_name, query):
             logger.info("Phase 2: skipping %s (house brand only)", r.shop_name)
             continue
         if r.error and ("タイムアウト" in r.error or "アクセス制限" in r.error):
@@ -4588,7 +4615,10 @@ def _retry_with_browser(results: list[ShopPrice], query: str) -> None:
 
     # Phase 2 全体の時間制限（3分）
     phase2_start = time.time()
-    PHASE2_BUDGET = 300  # 秒（ジャンル絞り込みにより対象ショップ減 → 余裕を持たせる）
+    # Phase 2 の時間予算 (秒)。gunicorn worker timeout 300 秒の内訳:
+    #   Phase 1: ~60秒, Phase 2: <=180秒, Phase 2.5/2.6: <=50秒, Phase 3: <5秒
+    # Phase 2 が 200 秒以上占有すると Phase 2.6 が SIGTERM で落ちるため抑制。
+    PHASE2_BUDGET = 180
 
     def _launch_browser(pw):
         """ブラウザ起動: Chrome → Chromiumの順にフォールバック"""
@@ -4903,6 +4933,18 @@ def search_all_shops(query: str, config: Config) -> list[ShopPrice]:
     for _, name in SCRAPERS:
         if not _is_shop_relevant(name, genres):
             skipped_shops.add(name)
+    # 自社ブランド専門店のオフブランドクエリはここで除外
+    #   例: "MacBook Air" → ソニーストア, "L'Oreal" → DHC/FANCL
+    off_brand_shops = set()
+    for _, name in SCRAPERS:
+        if name in skipped_shops:
+            continue
+        if _shop_is_off_brand(name, query):
+            off_brand_shops.add(name)
+    if off_brand_shops:
+        logger.info("House-brand filter: skipping %d off-brand shops (%s)",
+                     len(off_brand_shops), ", ".join(sorted(off_brand_shops)))
+        skipped_shops |= off_brand_shops
     if skipped_shops:
         logger.info("Genre filter: %s → skipping %d shops (%s)",
                      genres, len(skipped_shops),
@@ -5106,8 +5148,26 @@ def search_all_shops(query: str, config: Config) -> list[ShopPrice]:
             (r for r in results if r.price is not None and r.product_name),
             key=lambda r: priority_map.get(r.shop_name, 99),
         )
+        # 商品名のノイズ除去: [PR]/【中古xxx】/【整備済み品】/【全額返金保証】等の
+        # 販売ノーマライゼーション・プロモ・中古表記を除去してから検索クエリ化する
+        _NAME_NOISE_RE = re.compile(
+            r'\[(?:PR|pr|広告|Ad|AD)\]|'
+            r'【(?:PR|広告|Ad|AD|中古[^】]*|整備済み品|整備済[^】]*|'
+            r'全額返金保証|最速発送|即納|送料無料|あす楽[^】]*|'
+            r'正規品|正規販売店|新品[^】]*|未使用品|展示品|[0-9]+倍|'
+            r'クーポン[^】]*|セール[^】]*|ポイント[^】]*|限定[^】]*|'
+            r'Amazon[^】]*|楽天[^】]*|Yahoo[^】]*)】'
+        )
+        def _clean_canonical(name: str) -> str:
+            cleaned = _NAME_NOISE_RE.sub("", name)
+            # 連続する空白を単一空白に
+            cleaned = re.sub(r"[\s　]+", " ", cleaned).strip()
+            # 先頭の記号類を削除
+            cleaned = re.sub(r"^[・\-\|／/]+", "", cleaned).strip()
+            return cleaned
+
         for r in ordered:
-            name = (r.product_name or "").strip()
+            name = _clean_canonical((r.product_name or "").strip())
             if not name or len(name) < 5:
                 continue
             key = name.lower()
