@@ -1772,17 +1772,58 @@ def _find_price_in_soup(soup: BeautifulSoup, selectors: list[tuple[str, str, str
         return url
 
     # 1. CSSセレクタで探す（複数候補を収集し外れ値除去）
+    # 分割払い月額・ポイント表示を除外するための正規表現
+    _INSTALLMENT_NOISE_RE = re.compile(
+        r'月々|月額|分割|回払い|回の?お?支払|\d+\s*回\s*[でのと]|'
+        r'ポイント\s*(?:進呈|還元|付与|獲得|\()|'
+        r'\d+\s*pt\b|\d+\s*point\b|'
+        r'還元|付与|ポイント\s*\d|'
+        r'\b\d+\s*%\s*(?:off|OFF|引き|割引)|'
+        r'送料|配送料|手数料',
+        re.IGNORECASE,
+    )
+
+    def _pick_main_price(item, price_sel: str) -> int | None:
+        """アイテム内の複数価格要素から「主価格」を選ぶ。
+
+        分割払い月額・ポイント・送料等のラベルが付いた要素を除外し、
+        残った中で最大値を採用する（通常、分割/ポイントは主価格より小さい）。
+        全て除外されたらフィルタなしで最大値を採用。
+        """
+        price_els = item.select(price_sel)
+        if not price_els:
+            return None
+        main_prices: list[int] = []
+        fallback_prices: list[int] = []
+        for pe in price_els:
+            p = _extract_price_from_element(pe)
+            if not p or p > 99_999_999:
+                continue
+            fallback_prices.append(p)
+            # 要素自身+親の文脈テキストで分割払い/ポイント判定
+            ctx = pe.get_text(" ", strip=True)
+            if pe.parent is not None:
+                try:
+                    ctx += " " + pe.parent.get_text(" ", strip=True)[:200]
+                except Exception:
+                    pass
+            if _INSTALLMENT_NOISE_RE.search(ctx):
+                continue
+            main_prices.append(p)
+        if main_prices:
+            return max(main_prices)
+        if fallback_prices:
+            return max(fallback_prices)
+        return None
+
     css_candidates = []
     for item_sel, price_sel, name_sel in selectors:
         items = soup.select(item_sel)
         if not items:
             continue
         for item in items[:10]:  # 最初の10件だけチェック
-            price_el = item.select_one(price_sel)
-            if not price_el:
-                continue
-            price = _extract_price_from_element(price_el)
-            if not price or price > 99_999_999:
+            price = _pick_main_price(item, price_sel)
+            if not price:
                 continue
 
             name_el = item.select_one(name_sel)
@@ -2424,6 +2465,19 @@ def _extract_price_from_raw_html(html: str, query: str,
         return None
 
     price = candidates[0]
+
+    # 低額候補 (¥10k 未満) の場合は強いコンセンサスを要求: 少なくとも 3 件以上の
+    # 同水準の数字が HTML 全体に散らばっていることを確認する。そうでない場合、
+    # Apple/au PAY/セブンネット等の SPA が空に近く、返ってきたテキストから
+    # たまたま拾った数字（¥1,000, ¥3,000, ¥7,480 等）の可能性が高いので拒否。
+    if price < 10_000:
+        same_range = [c for c in candidates if c < 10_000]
+        if len(same_range) < 3:
+            logger.info("Raw HTML extraction: skipping low price ¥%s "
+                        "(weak consensus: %d low candidates)",
+                        f"{price:,}", len(same_range))
+            return None
+
     logger.info("Raw HTML extraction found price: ¥%s", f"{price:,}")
     # 商品名は不明（生HTMLからは商品名を確実に取得できない）
     # クエリをフォールバックにするとエコーバックの原因になるため空文字列を返す
@@ -2887,6 +2941,11 @@ def _search_yahoo_api(query: str, config: Config, search_url: str) -> ShopPrice 
             candidates.append((price, name, url))
         logger.info("Yahoo API: %d/%d candidates passed relevance filter",
                     len(candidates), len(all_pool))
+        # 診断: 全件 reject された場合、プール上位 3 件のサンプルを出力
+        # (フィルタが厳しすぎるケースを発見しやすくする)
+        if not candidates and all_pool:
+            samples = [(p, (n or "")[:60]) for p, n, _ in all_pool[:3]]
+            logger.info("Yahoo API: all rejected — pool samples: %s", samples)
         if candidates:
             candidates.sort(key=lambda x: x[0])
             # 反復的外れ値除去（アクセサリ混入対策）
@@ -5175,6 +5234,35 @@ def _validate_prices_cross_shop(results: list[ShopPrice], query: str = "") -> No
                 if price < lower_bound:
                     r = results[idx]
                     reason = f"クラスター中央値¥{cluster_anchor:,}の50%未満（¥{lower_bound:,}）"
+                    logger.info("Cross-shop validation: %s ¥%s removed (%s)",
+                                r.shop_name, f"{price:,}", reason)
+                    results[idx] = ShopPrice(
+                        r.shop_name, None, "", "", r.search_url,
+                        error="価格異常（他店と大きく乖離）",
+                        list_price=r.list_price,
+                        candidates=r.candidates,
+                    )
+                else:
+                    new_prices_with_idx.append((price, idx))
+            prices_with_idx = new_prices_with_idx
+            if len(prices_with_idx) < 3:
+                return
+
+    # === Pass 0.5: クラスター上限チェック ===
+    # list_price が無くても、複数ショップで強いクラスターが形成されている場合
+    # クラスター中央値の 1.4 倍を超える価格は「高すぎ」と判定する。
+    # JAL Mall 等のマイル優先ショップで異なる構成 (AppleCare 同梱等) が
+    # 混入するケースを捕捉する。
+    # 注: Pass 2 の 3.5 倍上限だとこのレベルの乖離 (¥149k → ¥214k, 1.43x) を見逃す。
+    if cluster_anchor and cluster_shops >= 3:
+        upper_cluster_bound = int(cluster_anchor * 1.40)
+        cluster_force = cluster_shops >= max(3, total_shops // 2)
+        if cluster_force:
+            new_prices_with_idx = []
+            for price, idx in prices_with_idx:
+                if price > upper_cluster_bound:
+                    r = results[idx]
+                    reason = f"クラスター中央値¥{cluster_anchor:,}の1.4倍超（¥{upper_cluster_bound:,}）"
                     logger.info("Cross-shop validation: %s ¥%s removed (%s)",
                                 r.shop_name, f"{price:,}", reason)
                     results[idx] = ShopPrice(
