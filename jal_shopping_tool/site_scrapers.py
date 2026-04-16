@@ -786,6 +786,14 @@ def _is_relevant_product(query: str, product_name: str) -> bool:
         r'交換用',
         r'互換', r'(?:類似|模倣|コピー)\s*品',
         r'(?:収納|持ち運び)\s*(?:ケース|ポーチ|バッグ)',
+        # PC スリーブ・ラップトップバッグ (MacBook 用アクセサリの定番)
+        r'(?:ラップトップ|ノート\s*パソコン|pc|ノートpc|macbook|laptop)\s*(?:ケース|バッグ|スリーブ|カバー|sleeve|bag)',
+        r'(?:スリーブ|sleeve)\s*(?:ケース|case)',
+        r'\bスリーブ\b', r'\bsleeve\b',
+        r'\bhardshell\b', r'ハード\s*シェル',
+        r'キャリング\s*ケース', r'\bcarrying\s*case\b',
+        r'パームレスト', r'トラックパッド\s*(?:カバー|プロテクタ|フィルム)',
+        r'キーボード\s*カバー', r'キー\s*キャップ',
         r'ダストガード', r'ダスト\s*カバー',
         r'(?:充電|変換)\s*(?:ケーブル|アダプタ)',
         # USB ハブ/ドッキング系
@@ -822,6 +830,23 @@ def _is_relevant_product(query: str, product_name: str) -> bool:
                                   or 'compatible' in name_lower):
         return False
 
+    # === 複数チップ/世代を列挙する多機種対応アクセサリの除外 ===
+    # 例: "be.ez MacBook Air M4 2025 M3 2024 M2 2023 M1 ..." (スリーブケース)
+    # 「Mx」「mx年」形式の異なるチップ/世代が2つ以上出現 → ほぼアクセサリ
+    _CHIP_TOKENS_RE = re.compile(
+        r'(?<![A-Za-z0-9])(m[1-9]\d?)(?![A-Za-z0-9])',
+        re.IGNORECASE,
+    )
+    chip_tokens = {t.lower() for t in _CHIP_TOKENS_RE.findall(product_name)}
+    if len(chip_tokens) >= 2:
+        return False
+    # iPhone 等の世代列挙 (13/14/15/16) - スラッシュ区切りで 2 個以上
+    _IPHONE_GEN_RE = re.compile(r'(?<![0-9])(\d{2})\s*[/／]\s*(\d{2})', re.IGNORECASE)
+    if _IPHONE_GEN_RE.search(product_name):
+        # 数字世代を列挙するアクセサリ (iPhone 13/14/15 対応 等)
+        if '対応' in name_lower or '互換' in name_lower or 'compatible' in name_lower:
+            return False
+
     # === 中古・ジャンクの除外（整備済み品は除外しない）===
     # 「整備済み品 (Renewed/Refurbished)」は Apple 公式の認定再生品や
     # Amazon Renewed 等の正規商品で、新品同等の品質が保証されている。
@@ -829,8 +854,13 @@ def _is_relevant_product(query: str, product_name: str) -> bool:
     # これを除外するとほぼ全商品が弾かれてしまう。→ 許容する。
     # 一方、明確に「中古」「ジャンク」「訳あり」は品質が保証されないので除外。
     _USED_PATTERNS = [
-        r'中古\s*品', r'\bused\b', r'pre[\-\s]?owned',
-        r'訳あり', r'ジャンク', r'不良品',
+        # 中古: 「中古品」に限らず「マックブック 中古 Apple...」等の単独表記も除外
+        # (整備済み品 "リファービッシュ"/"Refurbished"/"Renewed" は別ルートで許容)
+        r'(?:^|[\s　\[【「『・,、/／])中古(?:$|[\s　\]】」』・,、/／]|品|市場|販売|ショップ|モール)',
+        r'\bused\b', r'pre[\-\s]?owned',
+        r'訳あり', r'ジャンク', r'不良品', r'動作未確認',
+        # ジャンク扱いの省略形
+        r'\bjunk\b',
     ]
     for pattern in _USED_PATTERNS:
         if re.search(pattern, name_lower, re.IGNORECASE):
