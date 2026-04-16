@@ -3264,11 +3264,18 @@ def search_amazon(query: str, _config: Config) -> ShopPrice:
             return first_valid_price_result
 
         # JSON-LD/embedded JSONもフォールバックとして試す
-        price, name, url, soup_pool = _find_price_in_soup(
-            soup, [], "https://www.amazon.co.jp", query=query, return_candidates=True)
-        if price:
-            return ShopPrice("Amazon.co.jp", price, name, url, search_url,
-                             candidates=(amazon_pool or soup_pool) or None)
+        # ただし full_pool に商品があった（= Amazon は結果を返したが全て関連性フィルタで
+        # 除外された）場合は、raw HTML から拾い直すと除外したアクセサリの価格を
+        # 誤って取ってしまう（例: ¥42,831 のドッキングステーション）ためスキップする。
+        if full_pool:
+            logger.info("Amazon: pool had %d items but all filtered — skipping raw HTML fallback, "
+                        "will try simplified/english retry", len(full_pool))
+        else:
+            price, name, url, soup_pool = _find_price_in_soup(
+                soup, [], "https://www.amazon.co.jp", query=query, return_candidates=True)
+            if price:
+                return ShopPrice("Amazon.co.jp", price, name, url, search_url,
+                                 candidates=(amazon_pool or soup_pool) or None)
 
         # === 簡略クエリ / 英語クエリでリトライ ===
         # 1) サイズ/一般語を除いたクエリ
@@ -4588,7 +4595,7 @@ def _retry_with_browser(results: list[ShopPrice], query: str) -> None:
                         "ビックカメラ.com", "ヤマダウェブコム",
                         "Joshin webショップ", "ケーズデンキオンラインショップ",
                         "セブンネットショッピング", "ベルメゾンネット",
-                        "ZOZOTOWN", "ノジマオンライン",
+                        "ZOZOTOWN", "ノジマオンライン", "コジマネット",
                         "LOHACO", "ニトリネット", "JAL Mall",
                         "マツモトキヨシオンラインストア",
                     }
