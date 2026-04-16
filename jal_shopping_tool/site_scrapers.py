@@ -759,7 +759,7 @@ def _is_relevant_product(query: str, product_name: str) -> bool:
         # 「〜用」パターン（アクセサリの最も確実な指標）
         r'用\s*(?:ケース|カバー|フィルム|スタンド|ホルダー|ポーチ|バンド|充電器|充電パッド|充電スタンド|ランヤード|ストラップ)',
         r'専用\s*(?:ケース|カバー|フィルム|イヤーピース|イヤーチップ|スタンド|ホルダー|充電器|充電パッド)',
-        r'対応\s*(?:ケース|カバー|フィルム|充電器|スタンド|ホルダー|ポーチ|バンド|充電パッド|充電スタンド|ランヤード|ストラップ)',
+        r'対応\s*(?:ケース|カバー|フィルム|充電器|スタンド|ホルダー|ポーチ|バンド|充電パッド|充電スタンド|ランヤード|ストラップ|ハブ|hub)',
         # 素材+ケース（ケース製品を示す）
         r'(?:シリコン|TPU|レザー|ハード|ソフト|クリア|透明)\s*ケース',
         # スタンドアロンのアクセサリワード（「付き」で終わらないもの）
@@ -788,6 +788,11 @@ def _is_relevant_product(query: str, product_name: str) -> bool:
         r'(?:収納|持ち運び)\s*(?:ケース|ポーチ|バッグ)',
         r'ダストガード', r'ダスト\s*カバー',
         r'(?:充電|変換)\s*(?:ケーブル|アダプタ)',
+        # USB ハブ/ドッキング系
+        r'(?:USB|usb)[A-Za-z\s\-]*(?:ハブ|hub)',
+        r'ドッキング\s*ステーション',
+        r'(?:\d+\s*in\s*\d+|\d+ポート)\s*(?:ハブ|hub)',
+        r'(?:Type[\s\-]*C|type[\s\-]*c)[A-Za-z\s\-]*(?:ハブ|hub)',
         # ワイヤレス充電器系（Belkin 等のアクセサリが AirPods/iPhone を対応機種として列挙しがち）
         r'ワイヤレス\s*充電',
         r'(?:Qi|qi)\s*(?:認証|充電|対応)',
@@ -2681,6 +2686,36 @@ def _scrape_generic(shop_name: str, search_url: str,
     return _make_error_result(shop_name, search_url, "取得失敗（手動で検索してください）")
 
 
+def _iterative_trim_candidates(
+    candidates: list[tuple], max_iters: int = 3,
+) -> list[tuple]:
+    """価格ソート済み候補リストから低価格の外れ値を反復的に除去する。
+
+    単発の median×0.3 フィルタでは、アクセサリ（¥2k-¥5k）が多数混入して
+    中央値が汚染されるケースで機能しない。反復的に下位を刈り取ることで
+    安定した中央値に収束させる。
+
+    例: [¥1,980, ¥2,980, ¥3,500, ¥148,800, ¥155,000, ¥165,000]
+      iter1: median=¥3,500, threshold=¥1,750 (50%) → [¥2,980, ¥3,500, ¥148,800, ...]
+      iter2: median=¥148,800, threshold=¥74,400 → [¥148,800, ¥155,000, ¥165,000]
+      iter3: 安定 → 収束
+    """
+    remaining = list(candidates)
+    for _ in range(max_iters):
+        if len(remaining) < 3:
+            break
+        ps = [c[0] for c in remaining]
+        median = ps[len(ps) // 2]
+        # 高額商品（¥30k+）は 50%、低額は 30% で刈り取り
+        ratio = 0.50 if median >= 30_000 else 0.30
+        threshold = median * ratio
+        new = [c for c in remaining if c[0] >= threshold]
+        if len(new) == len(remaining):
+            break  # 収束
+        remaining = new
+    return remaining
+
+
 # ============================================================
 # 楽天市場 (API + Webスクレイピングフォールバック)
 # ============================================================
@@ -2723,14 +2758,17 @@ def _search_rakuten_api(query: str, config: Config, search_url: str) -> ShopPric
             if price < 100:
                 continue
             candidates.append((price, name, url))
+        logger.info("楽天API: %d/%d candidates passed relevance filter",
+                    len(candidates), len(all_pool))
         if candidates:
             candidates.sort(key=lambda x: x[0])
-            # 外れ値除去
-            if len(candidates) >= 3:
-                median_price = candidates[len(candidates) // 2][0]
-                candidates = [c for c in candidates if c[0] >= median_price * 0.3]
+            # 反復的外れ値除去（アクセサリ混入対策）
+            # 単発 median×0.3 だと、低価格アクセサリが多数の場合に中央値が
+            # 汚染されて機能しない。反復で安定点まで刈り込む。
+            candidates = _iterative_trim_candidates(candidates)
             if candidates:
                 price, name, url = candidates[0]
+                logger.info("楽天API: best=¥%s (%s)", f"{price:,}", name[:50])
                 return ShopPrice(
                     shop_name="楽天市場",
                     price=price,
@@ -2817,15 +2855,15 @@ def _search_yahoo_api(query: str, config: Config, search_url: str) -> ShopPrice 
             if price < 100:
                 continue
             candidates.append((price, name, url))
+        logger.info("Yahoo API: %d/%d candidates passed relevance filter",
+                    len(candidates), len(all_pool))
         if candidates:
             candidates.sort(key=lambda x: x[0])
-            # 外れ値除去: 3件以上あれば中央値の30%未満の価格は除外
-            # （アクセサリがフィルタをすり抜けた場合の安全策）
-            if len(candidates) >= 3:
-                median_price = candidates[len(candidates) // 2][0]
-                candidates = [c for c in candidates if c[0] >= median_price * 0.3]
+            # 反復的外れ値除去（アクセサリ混入対策）
+            candidates = _iterative_trim_candidates(candidates)
             if candidates:
                 price, name, url = candidates[0]
+                logger.info("Yahoo API: best=¥%s (%s)", f"{price:,}", name[:50])
                 return ShopPrice(
                     shop_name="Yahoo!ショッピング",
                     price=price,
@@ -3128,6 +3166,12 @@ def search_amazon(query: str, _config: Config) -> ShopPrice:
         logger.info("Amazon: HTML %d chars, %d filtered candidates / %d total pool (list_price_anchor=%s)",
                      len(resp.text), len(all_candidates), len(full_pool),
                      f"¥{max_list_price:,}" if max_list_price else "なし")
+        if all_candidates:
+            sample = [(c[0], (c[1] or "")[:40]) for c in all_candidates[:3]]
+            logger.info("Amazon: top candidates: %s", sample)
+        elif full_pool:
+            sample = [(c[0], (c[1] or "")[:40]) for c in full_pool[:3]]
+            logger.info("Amazon: 0 filtered candidates. Pool samples: %s", sample)
 
         first_valid_price_result = None
         if nameless_fallback:
@@ -3162,11 +3206,9 @@ def search_amazon(query: str, _config: Config) -> ShopPrice:
                         median = prices[len(prices) // 2]
                         all_candidates = [c for c in all_candidates if c[0] >= median * 0.3]
             else:
-                # 定価不明時のみ中央値ベースの外れ値除去
-                prices = sorted(c[0] for c in all_candidates)
-                if len(prices) >= 3:
-                    median = prices[len(prices) // 2]
-                    all_candidates = [c for c in all_candidates if c[0] >= median * 0.3]
+                # 定価不明時: 反復的外れ値除去
+                all_candidates.sort(key=lambda c: c[0])
+                all_candidates = _iterative_trim_candidates(all_candidates)
             if all_candidates:
                 best = min(all_candidates, key=lambda c: c[0])
                 # best: (price, name, url, list_price)
@@ -5259,9 +5301,17 @@ def _reselect_with_anchor(results: list[ShopPrice], query: str = "") -> None:
                 continue
             in_range.append((p, n, u))
         if not in_range:
+            pool_prices = sorted(int(c[0]) for c in r.candidates if c[0])
+            pool_range = f"¥{pool_prices[0]:,}〜¥{pool_prices[-1]:,}" if pool_prices else "empty"
+            # サンプル: 価格帯内なのにトークン不一致で落ちた候補を表示
+            sample_names = []
+            for cand in r.candidates[:5]:
+                p, n = int(cand[0]) if cand[0] else 0, (cand[1] if len(cand) > 1 else "")
+                sample_names.append(f"¥{p:,} {n[:40]}")
             logger.info(
-                "Phase 3.5 no-candidate for %s: pool=%d, range_fail=%d, token_fail=%d",
-                r.shop_name, len(r.candidates), range_fail, token_fail
+                "Phase 3.5 no-candidate for %s: pool=%d (%s), range_fail=%d, token_fail=%d, samples=[%s]",
+                r.shop_name, len(r.candidates), pool_range, range_fail, token_fail,
+                " | ".join(sample_names[:3])
             )
             continue
         # 最安値を採用（価格帯は妥当なので、その中で最安なら本物の有力候補）
