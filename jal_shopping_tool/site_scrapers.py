@@ -1793,6 +1793,14 @@ def _find_price_in_soup(soup: BeautifulSoup, selectors: list[tuple[str, str, str
         price_els = item.select(price_sel)
         if not price_els:
             return None
+        # アイテムカード全体のテキストを取得 (月々ラベルが親ではなく兄弟にある
+        # ケースを捕捉するため)。カード全体に「月々」等がある場合は、各価格要素
+        # のコンテキストが不明でも installment 候補として扱う。
+        try:
+            card_text = item.get_text(" ", strip=True)
+        except Exception:
+            card_text = ""
+        card_has_installment = bool(_INSTALLMENT_NOISE_RE.search(card_text))
         main_prices: list[int] = []
         fallback_prices: list[int] = []
         for pe in price_els:
@@ -1804,7 +1812,7 @@ def _find_price_in_soup(soup: BeautifulSoup, selectors: list[tuple[str, str, str
             ctx = pe.get_text(" ", strip=True)
             if pe.parent is not None:
                 try:
-                    ctx += " " + pe.parent.get_text(" ", strip=True)[:200]
+                    ctx += " " + pe.parent.get_text(" ", strip=True)[:300]
                 except Exception:
                     pass
             if _INSTALLMENT_NOISE_RE.search(ctx):
@@ -1812,6 +1820,10 @@ def _find_price_in_soup(soup: BeautifulSoup, selectors: list[tuple[str, str, str
             main_prices.append(p)
         if main_prices:
             return max(main_prices)
+        # カード全体に月々/分割があり main_prices が空 = 全要素が installment
+        # 混入している → カード単位で無視 (誤価格を拾わない)
+        if card_has_installment and fallback_prices:
+            return None
         if fallback_prices:
             return max(fallback_prices)
         return None
@@ -1937,18 +1949,25 @@ def _find_price_in_soup(soup: BeautifulSoup, selectors: list[tuple[str, str, str
 
     # 6. フルテキスト近接検索（DOM構造に一切依存しない最終手段）
     # 800KB超のHTMLでもページのプレーンテキストから価格を見つける
+    fulltext_state = {"echoback_fired": False}
     if query:
-        result = _extract_price_by_fulltext(soup, query, base_url)
+        result = _extract_price_by_fulltext(soup, query, base_url, state=fulltext_state)
         if result:
             return _ret(*result)
 
     # 7. 生HTML内の価格パターン検索（テキスト抽出で消えた価格を拾う）
     # JSフレームワーク(React/Vue/Next.js等)がデータをscriptタグやdata属性に
     # 格納している場合、get_text()では取得できない
-    if query:
+    # ただし、ステップ6 でエコーバックガードが発動した場合は、同じ HTML を
+    # 生テキストで見ても結局ノイズ（検索窓のエコーや AppleCare 等のサイド価格）
+    # を拾うだけなので、スキップする。
+    # (例: セブンネット ¥1,000 / au PAY ¥3,000 / Apple公式 ¥7,480 誤検出)
+    if query and not fulltext_state.get("echoback_fired"):
         result = _extract_price_from_raw_html(str(soup), query, base_url)
         if result:
             return _ret(*result)
+    elif query and fulltext_state.get("echoback_fired"):
+        logger.info("Raw HTML: skipping — fulltext echo-back fired on same HTML")
 
     # デバッグ: 全ステップ失敗時の情報
     raw_html = str(soup)
@@ -2101,13 +2120,19 @@ def _expand_keywords(keywords: list[str]) -> list[str]:
 
 
 def _extract_price_by_fulltext(soup: BeautifulSoup, query: str,
-                                base_url: str) -> tuple[int, str, str] | None:
+                                base_url: str,
+                                state: dict | None = None) -> tuple[int, str, str] | None:
     """フルテキスト近接検索（DOM構造に完全に依存しない最終手段）
 
     ページの全テキストを抽出し、価格パターンの近くにクエリキーワードがあるかを
     テキスト位置ベースでチェックする。800KB超のHTMLでも動作する。
 
     CSSセレクタやDOM走査に依存しないため、あらゆるHTML構造に対応。
+
+    state (optional dict): 呼び出し元に内部状態を返すための dict。
+      - "echoback_fired": True if echo-back ガードが発動した場合。
+        発動時、Raw HTML フォールバックも同じ汚染 HTML を見るので
+        後続の _extract_price_from_raw_html をスキップすべき。
     """
     # キーワード準備（カタカナ展開込み）
     query_lower = query.lower()
@@ -2350,11 +2375,15 @@ def _extract_price_by_fulltext(soup: BeautifulSoup, query: str,
             logger.info("Fulltext echo-back rejected: name='%s' ≈ query='%s'",
                         name[:80], query[:80])
             name = ""
+            if state is not None:
+                state["echoback_fired"] = True
 
     # 商品名が取得できなかった場合は結果を返さない（エコーバック防止）
     if not name:
         logger.info("Fulltext: price ¥%s found but no valid product name (echo-back guard)",
                     f"{price:,}")
+        if state is not None:
+            state["echoback_fired"] = True
         return None
 
     # URLは検索URL（フルテキストからは個別URL取得困難）
