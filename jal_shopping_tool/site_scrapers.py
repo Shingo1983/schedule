@@ -814,6 +814,26 @@ def _is_relevant_product(query: str, product_name: str) -> bool:
         r'\bscreen\s+protector\b', r'\bprotector\b',
         r'\bear\s*(?:tips?|hooks?)\b', r'\bsleeve\b',
         r'\bcase\b', r'\bcover\b',
+        # 英語アクセサリ語（汎用的な PC/Mac 周辺機器）
+        # Yahoo!ショッピングで 「Aluminum Alloy Laptop Stand for MacBook Air 13 M3」
+        # 等の英語商品名を掴む対策。
+        r'\bstand\b', r'\bstands\b',
+        r'\bholder\b', r'\bholders\b',
+        r'\bmount\b', r'\bmounts\b',
+        r'\btray\b', r'\btrays\b',
+        r'\bdock(?:ing)?\s*(?:station)?\b',
+        r'\bkeyboard\b(?!\s*(?:and|&)\s*mouse)',  # keyboard 単体はアクセサリ
+        r'\bmouse\b(?!\s*(?:and|&)\s*keyboard)',
+        r'\bwireless\s+charger\b', r'\bcharging\s+(?:pad|stand|mat)\b',
+        r'\bcable\b', r'\badapter\b', r'\bconverter\b',
+        r'\bhub\b',
+        r'\benclosure\b',  # HDD/SSD 外付けケース
+        r'\bpouch\b', r'\bbag\b(?!\s*(?:of|full))',
+        r'\bstrap\b', r'\blanyard\b',
+        r'\bskin\b(?:\s+sticker)?', r'\bdecal\b',
+        r'\bfilm\b', r'\bfilter\b',
+        r'\baluminum\s+alloy\b.*\b(?:stand|holder|mount)\b',
+        r'\bfor\s+(?:macbook|ipad|iphone|airpods)\b',  # "for MacBook" はアクセサリ特徴
     ]
     for pattern in _ACCESSORY_PATTERNS:
         if re.search(pattern, name_lower, re.IGNORECASE):
@@ -4792,10 +4812,40 @@ def _retry_with_browser(results: list[ShopPrice], query: str) -> None:
                         price, name, url, br_candidates = _find_price_in_soup(
                             soup, selectors, base, query=query, return_candidates=True)
                         if price:
-                            results[idx] = ShopPrice(r.shop_name, price, name, url, r.search_url,
-                                                     candidates=br_candidates or None)
-                            logger.info("Browser retry success: %s = ¥%s (%s)",
-                                        r.shop_name, f"{price:,}", name[:50])
+                            # サニティチェック: 既に他店で取れた価格の中央値と比較し、
+                            # 異常に低い (30%未満) 場合は誤抽出として破棄する。
+                            # コジマ ¥9,940 / エディオン ¥1,580 / Yahoo ¥2,447 等の
+                            # 分割払い・アクセサリ誤検出を Phase 2 段階で遮断することで、
+                            # Phase 2.6 の Web 検索フォールバック対象に残す。
+                            other_prices = [
+                                rr.price for i2, rr in enumerate(results)
+                                if i2 != idx and rr.price is not None
+                                and rr.error is None and rr.price >= 10_000
+                            ]
+                            sanity_ok = True
+                            if len(other_prices) >= 2:
+                                other_prices.sort()
+                                other_median = other_prices[len(other_prices) // 2]
+                                if price < other_median * 0.30:
+                                    logger.info(
+                                        "Browser retry: %s ¥%s rejected (suspiciously low: "
+                                        "%.0f%% of other-shops median ¥%s) — %s",
+                                        r.shop_name, f"{price:,}",
+                                        price / other_median * 100,
+                                        f"{other_median:,}", (name or "")[:60])
+                                    sanity_ok = False
+                            if sanity_ok:
+                                results[idx] = ShopPrice(r.shop_name, price, name, url, r.search_url,
+                                                         candidates=br_candidates or None)
+                                logger.info("Browser retry success: %s = ¥%s (%s)",
+                                            r.shop_name, f"{price:,}", name[:50])
+                            else:
+                                # 候補プールは保持 → Phase 2.6/3.5 で救済チャンス
+                                results[idx] = ShopPrice(
+                                    r.shop_name, None, "", "", r.search_url,
+                                    error="価格異常（他店と大きく乖離）",
+                                    candidates=br_candidates or None,
+                                )
                         else:
                             logger.info("Browser retry: no price found for %s (HTML %d chars)",
                                         r.shop_name, len(html))
@@ -4986,6 +5036,41 @@ def search_all_shops(query: str, config: Config) -> list[ShopPrice]:
                         phase25_found - phase2_found)
     else:
         phase25_found = phase2_found
+
+    # === Phase 2.55: 外れ値サニティチェック → 価格リセット ===
+    # Phase 1 (cloudscraper) が「分割払い月額」や「アクセサリ」価格を誤抽出した場合、
+    # Phase 2/2.5 はスキップされてしまう（price が既に埋まっているため）。
+    # ここで他店の中央値に対し 25% 未満 / 400% 超のショップを外れ値として price=None に
+    # リセットし、続く Phase 2.6 (Web 検索フォールバック) の救済対象に回す。
+    #
+    # 対象: コジマネット ¥9,940（月々分割）/ エディオン ¥1,580（送料）/
+    # Yahoo ¥2,447（Laptop Stand for MacBook）/ JAL Mall ¥214,600（関連品誤検出）等。
+    _sanity_prices = [r.price for r in results if r.price is not None and r.price >= 5_000]
+    if len(_sanity_prices) >= 3:
+        _sanity_prices.sort()
+        _sanity_median = _sanity_prices[len(_sanity_prices) // 2]
+        _LOW_CUTOFF = _sanity_median * 0.25
+        _HIGH_CUTOFF = _sanity_median * 4.0
+        _outlier_reset = []
+        for i, r in enumerate(results):
+            if r.price is None:
+                continue
+            if r.price < _LOW_CUTOFF or r.price > _HIGH_CUTOFF:
+                reason = ("低すぎ(分割払い/アクセサリ疑い)" if r.price < _LOW_CUTOFF
+                          else "高すぎ(別商品疑い)")
+                logger.info(
+                    "Phase 2.55 outlier reset: %s ¥%s → None [%s, median=¥%s, product=%s]",
+                    r.shop_name, f"{r.price:,}", reason,
+                    f"{_sanity_median:,}", (r.product_name or "")[:50])
+                _outlier_reset.append(r.shop_name)
+                results[i] = ShopPrice(
+                    r.shop_name, None, "", "", r.search_url,
+                    error=f"価格異常（{reason}）",
+                    candidates=r.candidates,
+                )
+        if _outlier_reset:
+            logger.info("Phase 2.55 reset %d outlier shops: %s",
+                        len(_outlier_reset), ", ".join(_outlier_reset))
 
     # === Phase 2.6: 検索エンジン site: 検索による汎用フォールバック ===
     # kakaku でも拾えなかったショップ向け。Bing/DDG/Yahoo JP を順に試行する
