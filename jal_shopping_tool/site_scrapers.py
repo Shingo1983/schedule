@@ -1447,6 +1447,7 @@ def _yahoojp_query(q: str, domain: str) -> list[tuple[int, str, str]]:
 def _bing_search_fallback(
     shop_name: str, query: str, original_search_url: str,
     extra_query_variants: list[str] | None = None,
+    reference_median: int | None = None,
 ) -> ShopPrice | None:
     """Web 検索エンジンの `site:<domain>` 検索を組み合わせた汎用価格フォールバック。
 
@@ -1464,6 +1465,11 @@ def _bing_search_fallback(
       ユーザー入力と表記揺れがある場合（例: ユーザー「イッシン iWalk スマートバスマット」
       vs Rakuten「ISSIN スマートバスマット プロ」）に有効。
       型番抽出と simplified の間に挿入し、長すぎるものは短縮する。
+
+    reference_median: 他ショップで取得済み価格の中央値（任意）。
+      渡された場合、その 35% 未満 / 400% 超の候補は除外する。後段 Phase 3 で
+      「価格異常（他店と大きく乖離）」と弾かれる recovery を事前に防ぎ、
+      ユーザーには単に「取得失敗」として表示させる（誤解を避ける）。
     """
     domain = _shop_primary_domain(shop_name, original_search_url)
     if not domain:
@@ -1528,7 +1534,7 @@ def _bing_search_fallback(
                      shop_name, domain, ", ".join(trace[:6]))
         return None
 
-    # 外れ値除去（中央値の30%未満除外 — アクセサリ対策）
+    # 外れ値除去（snippet 群の中央値の30%未満除外 — アクセサリ対策）
     if len(all_candidates) >= 3:
         ps = sorted(p for p, _, _ in all_candidates)
         median = ps[len(ps) // 2]
@@ -1536,6 +1542,25 @@ def _bing_search_fallback(
 
     if not all_candidates:
         return None
+
+    # 他ショップ中央値との整合性チェック（Phase 3 の事前フィルタ）
+    # 35% 未満 or 400% 超の候補は除去する。
+    # すべての候補が外れた場合は recovery せず None を返す
+    # （→ shop は「失敗」表示、Phase 3 で 「価格異常」とマークされない）。
+    if reference_median and reference_median >= 5_000:
+        low_cut = int(reference_median * 0.35)
+        high_cut = int(reference_median * 4.0)
+        prev_count = len(all_candidates)
+        all_candidates = [
+            c for c in all_candidates if low_cut <= c[0] <= high_cut
+        ]
+        if not all_candidates:
+            logger.info(
+                "Web search fallback REJECT: %s — all %d candidates out of "
+                "sanity range [¥%s, ¥%s] (ref median=¥%s, domain=%s)",
+                shop_name, prev_count, f"{low_cut:,}", f"{high_cut:,}",
+                f"{reference_median:,}", domain)
+            return None
 
     best = min(all_candidates, key=lambda c: c[0])
     logger.info("Web search fallback OK: %s = ¥%s (%s) [src=%s]",
@@ -5182,6 +5207,17 @@ def search_all_shops(query: str, config: Config) -> list[ShopPrice]:
                         len(canonical_names),
                         " | ".join(n[:40] for n in canonical_names))
 
+        # 他ショップの取得済み価格中央値（Phase 2.6 候補のサニティフロアに使う）
+        _good_prices = sorted(
+            r.price for r in results
+            if r.price is not None and r.error is None and r.price >= 5_000
+        )
+        ref_median = (_good_prices[len(_good_prices) // 2]
+                      if len(_good_prices) >= 3 else None)
+        if ref_median:
+            logger.info("Phase 2.6: using reference median ¥%s (from %d good prices)",
+                        f"{ref_median:,}", len(_good_prices))
+
         recovered_shops = []
         failed_shops = []
         # 検索エンジンへの連続アクセスは並列を抑える（レートリミット対策）
@@ -5189,7 +5225,7 @@ def search_all_shops(query: str, config: Config) -> list[ShopPrice]:
             future_to_idx = {
                 executor.submit(
                     _bing_search_fallback, r.shop_name, query, r.search_url,
-                    canonical_names,
+                    canonical_names, ref_median,
                 ): idx
                 for idx, r in bing_targets
             }
