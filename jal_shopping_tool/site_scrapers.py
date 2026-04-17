@@ -1051,6 +1051,176 @@ _KAKAKU_SHOP_ALIASES: dict[str, list[str]] = {
 }
 
 
+def _lookup_reference_price(query: str) -> tuple[int | None, str]:
+    """Phase 0.5: 定価/参考価格の事前取得。
+
+    全ショップのスクレイピングを始める**前に**、kakaku.com (価格.com) で
+    商品の市場相場を調べ、参考価格を返す。
+
+    これにより:
+    - Phase 1~3 で「アクセサリ価格を本体価格と取り違える」問題を防止
+      (例: Meta Quest 3S の定価 ¥48,400 に対し ¥4,500 のケースが最安値として選ばれる)
+    - list_price が Amazon のストライクスルーのみに依存する状態を解消
+
+    Returns: (reference_price, product_name) — 取れなかった場合は (None, "")
+
+    精度を上げるため、kakaku.com の検索結果 **最安価格** と商品ページの
+    **メーカー希望小売価格** の両方を取得し、高い方を返す（定価 ≥ 最安）。
+    """
+    try:
+        ks_url = f"https://kakaku.com/search_results/{quote(query)}/"
+        resp = _fetch(ks_url, headers={"Referer": "https://kakaku.com/"})
+        if resp.status_code != 200:
+            logger.info("Phase 0.5: kakaku search HTTP %d", resp.status_code)
+            return None, ""
+        soup = _soup(resp)
+        if _is_bot_blocked_page(soup):
+            logger.info("Phase 0.5: kakaku bot-blocked")
+            return None, ""
+
+        # 検索結果から最初の関連商品を特定
+        product_url = None
+        product_name = ""
+        best_price_in_search = None
+        for a in soup.select('a[href*="/item/"]'):
+            href = a.get('href', '') or ''
+            m = re.search(r'/item/([KJ]?\d+)/', href)
+            if not m:
+                continue
+            candidate = a.get_text(strip=True)
+            if len(candidate) < 5:
+                continue
+            if not _is_relevant_product(query, candidate):
+                continue
+            product_id = m.group(1)
+            product_url = f"https://kakaku.com/item/{product_id}/"
+            product_name = candidate
+            break
+
+        # 検索結果一覧から「最安価格」テキストを拾う (複数セレクタ)
+        for sel in ['.p-result_price', '.price', '.pryen', '[class*="price"]']:
+            for el in soup.select(sel):
+                p = _parse_price(el.get_text())
+                if p and p >= 500:
+                    if best_price_in_search is None or p < best_price_in_search:
+                        best_price_in_search = p
+                    break
+            if best_price_in_search:
+                break
+
+        if not product_url:
+            logger.info("Phase 0.5: kakaku no relevant product for '%s'", query)
+            # 検索結果の最安価格だけ取れていれば返す
+            if best_price_in_search:
+                logger.info("Phase 0.5: search-result price ¥%s (no product page)",
+                            f"{best_price_in_search:,}")
+                return best_price_in_search, ""
+            return None, ""
+
+        # 商品ページにアクセスして、より正確な情報を取得
+        resp2 = _fetch(product_url, headers={"Referer": ks_url})
+        if resp2.status_code != 200:
+            if best_price_in_search:
+                return best_price_in_search, product_name
+            return None, ""
+        soup2 = _soup(resp2)
+        if _is_bot_blocked_page(soup2):
+            if best_price_in_search:
+                return best_price_in_search, product_name
+            return None, ""
+
+        # 商品ページから価格情報を抽出
+        reference = best_price_in_search
+        # 最安価格
+        for sel in ['.p-priceBox_price', '.priceBox .yen', '.pryen',
+                    '#priceBox .yen', '.pricetxt', '[class*="lowPrice"]',
+                    '.p-result_price']:
+            el = soup2.select_one(sel)
+            if el:
+                p = _parse_price(el.get_text())
+                if p and p >= 500:
+                    if reference is None or p > reference:
+                        reference = p
+                    break
+
+        # メーカー希望小売価格 (定価)
+        page_text = soup2.get_text(" ", strip=True)
+        msrp_match = re.search(
+            r'(?:メーカー希望小売価格|定価|参考価格|標準価格|オープン価格)'
+            r'.*?[¥￥][\s]*([\d,]+)',
+            page_text
+        )
+        if msrp_match:
+            msrp = _parse_price(msrp_match.group(0))
+            if msrp and msrp >= 1000:
+                if reference is None or msrp > reference:
+                    reference = msrp
+
+        # JSON-LD からも取れることがある
+        for script in soup2.select('script[type="application/ld+json"]'):
+            try:
+                data = json.loads(script.string or "")
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if isinstance(data, dict):
+                offers = data.get("offers", {})
+                if isinstance(offers, dict):
+                    lp = offers.get("lowPrice") or offers.get("price")
+                    if lp:
+                        p = _parse_price(str(lp))
+                        if p and p >= 500:
+                            if reference is None or p > reference:
+                                reference = p
+
+        if reference:
+            logger.info("Phase 0.5 OK: reference_price=¥%s product=%s (kakaku=%s)",
+                        f"{reference:,}", product_name[:50], product_url)
+        else:
+            logger.info("Phase 0.5: kakaku product page found but no price extracted (%s)",
+                        product_url)
+        return reference, product_name
+
+    except Exception as e:
+        logger.info("Phase 0.5 error: %s", e)
+        return None, ""
+
+
+def _lookup_reference_price_web(query: str) -> int | None:
+    """Phase 0.5 フォールバック: kakaku.com が使えない場合に YahooJP 検索 snippet から
+    参考価格を推定する。「{query} 定価」「{query} 価格」で検索し、
+    snippet 内の価格群から中央値を返す。
+    """
+    try:
+        for suffix in ["定価 税込", "価格 税込"]:
+            q = f"{query} {suffix}"
+            yj_url = f"https://search.yahoo.co.jp/search?p={quote(q)}&ei=UTF-8"
+            resp = _fetch(yj_url, headers={"Referer": "https://search.yahoo.co.jp/"})
+            if resp.status_code != 200:
+                continue
+            soup = _soup(resp)
+            # snippet から価格を抽出（ドメインフィルタなし）
+            prices: list[int] = []
+            for el in soup.select(".sw-Card__summary, .Desc, .compText, p"):
+                text = el.get_text(" ", strip=True)
+                p = _parse_price(text)
+                if p and 1000 <= p <= 9_999_999:
+                    prices.append(p)
+            # タイトルからも
+            for el in soup.select("a.sw-Card__titleInner, h3 a, a.Title"):
+                p = _parse_price(el.get_text())
+                if p and 1000 <= p <= 9_999_999:
+                    prices.append(p)
+            if len(prices) >= 3:
+                prices.sort()
+                median = prices[len(prices) // 2]
+                logger.info("Phase 0.5 web fallback: ¥%s (from %d snippet prices, query='%s')",
+                            f"{median:,}", len(prices), q[:30])
+                return median
+    except Exception as e:
+        logger.debug("Phase 0.5 web fallback error: %s", e)
+    return None
+
+
 def _kakaku_fallback(shop_name: str, query: str, original_search_url: str) -> ShopPrice | None:
     """kakaku.com の価格比較表から指定ショップの価格を抽出する（フォールバック）。
 
@@ -4975,6 +5145,23 @@ def search_all_shops(query: str, config: Config) -> list[ShopPrice]:
                      genres, len(skipped_shops),
                      ", ".join(sorted(skipped_shops)))
 
+    # === Phase 0.5: 定価/参考価格の事前取得 ===
+    # 全ショップをスクレイプする前に kakaku.com (価格.com) で参考価格を取得し、
+    # アクセサリや無関係商品の誤検出フロアを確立する。
+    # (例: Meta Quest 3S → 定価 ¥48,400 を取得 → ¥4,500 のケースを排除)
+    reference_price, reference_name = _lookup_reference_price(query)
+    if not reference_price:
+        reference_price = _lookup_reference_price_web(query)
+    if reference_price:
+        logger.info("Phase 0.5: reference price ¥%s established%s",
+                     f"{reference_price:,}",
+                     f" ({reference_name[:40]})" if reference_name else "")
+        # 参考価格フロア: 定価の 35% 未満はアクセサリと判定して弾く
+        _REFERENCE_FLOOR = int(reference_price * 0.35)
+    else:
+        logger.info("Phase 0.5: no reference price found — relying on cluster validation only")
+        _REFERENCE_FLOOR = 0
+
     # === Phase 1: cloudscraper（並列実行・分散遅延付き） ===
     with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as executor:
         future_to_name: dict = {}
@@ -5006,6 +5193,40 @@ def search_all_shops(query: str, config: Config) -> list[ShopPrice]:
 
     phase1_found = sum(1 for r in results if r.price is not None)
     logger.info("Phase 1 complete: %d/%d shops found prices", phase1_found, len(results))
+
+    # === Phase 0.5 enforcement: 参考価格フロアで Phase 1 結果をフィルタ ===
+    # 定価/参考価格を取得できた場合、それを使って明らかなアクセサリを除外。
+    # 参考価格の 35% 未満の価格はアクセサリ/関連品の誤検出とみなし price=None に戻す。
+    # (例: Meta Quest 3S 定価¥48,400 → floor ¥16,940 → ¥4,500ケースを除外)
+    if _REFERENCE_FLOOR > 0:
+        _floor_rejected = []
+        for i, r in enumerate(results):
+            if r.price is not None and r.price < _REFERENCE_FLOOR:
+                _floor_rejected.append(f"{r.shop_name}=¥{r.price:,}")
+                logger.info(
+                    "Phase 0.5 floor: %s ¥%s < floor ¥%s → rejected (%s)",
+                    r.shop_name, f"{r.price:,}", f"{_REFERENCE_FLOOR:,}",
+                    (r.product_name or "")[:40])
+                results[i] = ShopPrice(
+                    r.shop_name, None, "", "", r.search_url,
+                    error=f"価格異常（参考価格¥{reference_price:,}の35%未満）",
+                    candidates=r.candidates,
+                )
+        if _floor_rejected:
+            logger.info("Phase 0.5 floor rejected %d shops: %s",
+                        len(_floor_rejected), ", ".join(_floor_rejected))
+            phase1_found = sum(1 for r in results if r.price is not None)
+
+    # Also set reference_price as list_price on all successful results
+    # (so _validate_prices_cross_shop can use it as a strong anchor)
+    if reference_price:
+        for i, r in enumerate(results):
+            if r.price is not None and r.list_price is None:
+                results[i] = ShopPrice(
+                    r.shop_name, r.price, r.product_name, r.product_url,
+                    r.search_url, error=r.error, list_price=reference_price,
+                    candidates=r.candidates,
+                )
 
     # === Phase 1.5: 簡略クエリでリトライ ===
     # 長いクエリで結果が少ない場合、サイズ/一般語を除いた短いクエリで再検索
@@ -5112,23 +5333,40 @@ def search_all_shops(query: str, config: Config) -> list[ShopPrice]:
     #
     # 対象: コジマネット ¥9,940（月々分割）/ エディオン ¥1,580（送料）/
     # Yahoo ¥2,447（Laptop Stand for MacBook）/ JAL Mall ¥214,600（関連品誤検出）等。
+    # Phase 0.5 参考価格が存在する場合はそちらを優先アンカーとして使う。
+    # アクセサリだらけの場合、中央値自体がアクセサリ価格帯に汚染されるため、
+    # kakaku/web 由来の定価を信頼する。
     _sanity_prices = [r.price for r in results if r.price is not None and r.price >= 5_000]
-    if len(_sanity_prices) >= 3:
+    # 定価アンカーがあればそれを使い、なければ従来の中央値フォールバック
+    if _REFERENCE_FLOOR > 0:
+        _sanity_floor = _REFERENCE_FLOOR
+        _sanity_ceiling = int(reference_price * 4.0) if reference_price else 0
+        _has_sanity_anchor = True
+    elif len(_sanity_prices) >= 3:
         _sanity_prices.sort()
         _sanity_median = _sanity_prices[len(_sanity_prices) // 2]
-        _LOW_CUTOFF = _sanity_median * 0.25
-        _HIGH_CUTOFF = _sanity_median * 4.0
+        _sanity_floor = int(_sanity_median * 0.25)
+        _sanity_ceiling = int(_sanity_median * 4.0)
+        _has_sanity_anchor = True
+    else:
+        _has_sanity_anchor = False
+        _sanity_floor = 0
+        _sanity_ceiling = 0
+
+    if _has_sanity_anchor:
         _outlier_reset = []
         for i, r in enumerate(results):
             if r.price is None:
                 continue
-            if r.price < _LOW_CUTOFF or r.price > _HIGH_CUTOFF:
-                reason = ("低すぎ(分割払い/アクセサリ疑い)" if r.price < _LOW_CUTOFF
+            if r.price < _sanity_floor or (_sanity_ceiling and r.price > _sanity_ceiling):
+                reason = ("低すぎ(分割払い/アクセサリ疑い)" if r.price < _sanity_floor
                           else "高すぎ(別商品疑い)")
+                anchor_str = (f"参考価格¥{reference_price:,}" if _REFERENCE_FLOOR > 0
+                              else f"median¥{_sanity_prices[len(_sanity_prices)//2]:,}")
                 logger.info(
-                    "Phase 2.55 outlier reset: %s ¥%s → None [%s, median=¥%s, product=%s]",
+                    "Phase 2.55 outlier reset: %s ¥%s → None [%s, %s, product=%s]",
                     r.shop_name, f"{r.price:,}", reason,
-                    f"{_sanity_median:,}", (r.product_name or "")[:50])
+                    anchor_str, (r.product_name or "")[:50])
                 _outlier_reset.append(r.shop_name)
                 results[i] = ShopPrice(
                     r.shop_name, None, "", "", r.search_url,
@@ -5207,13 +5445,17 @@ def search_all_shops(query: str, config: Config) -> list[ShopPrice]:
                         len(canonical_names),
                         " | ".join(n[:40] for n in canonical_names))
 
-        # 他ショップの取得済み価格中央値（Phase 2.6 候補のサニティフロアに使う）
-        _good_prices = sorted(
-            r.price for r in results
-            if r.price is not None and r.error is None and r.price >= 5_000
-        )
-        ref_median = (_good_prices[len(_good_prices) // 2]
-                      if len(_good_prices) >= 3 else None)
+        # Phase 2.6 候補のサニティフロア: reference_price (定価) を優先、
+        # なければ他ショップ中央値にフォールバック。
+        if reference_price:
+            ref_median = reference_price
+        else:
+            _good_prices = sorted(
+                r.price for r in results
+                if r.price is not None and r.error is None and r.price >= 5_000
+            )
+            ref_median = (_good_prices[len(_good_prices) // 2]
+                          if len(_good_prices) >= 3 else None)
         if ref_median:
             logger.info("Phase 2.6: using reference median ¥%s (from %d good prices)",
                         f"{ref_median:,}", len(_good_prices))
