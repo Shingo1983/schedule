@@ -5120,6 +5120,13 @@ def search_all_shops(query: str, config: Config) -> list[ShopPrice]:
     # クエリ正規化（全角→半角スペース・英数字）
     query = _normalize_query(query)
 
+    # 全体の時間予算 (Railway edge first_byte_timeout ≒ 5min 対策)
+    # 200s で打ち切り、それ以降の重い phase はスキップして即返却。
+    _GLOBAL_DEADLINE = 200.0
+    _global_start = time.time()
+    def _budget_left() -> float:
+        return max(0.0, _GLOBAL_DEADLINE - (time.time() - _global_start))
+
     results: list[ShopPrice] = []
 
     # === Phase 0: 商品ジャンル推定 → 不要ショップのスキップ ===
@@ -5264,6 +5271,10 @@ def search_all_shops(query: str, config: Config) -> list[ShopPrice]:
     # === Phase 1.5: 簡略クエリでリトライ ===
     # 長いクエリで結果が少ない場合、サイズ/一般語を除いた短いクエリで再検索
     simplified_query = _simplify_query(query)
+    if simplified_query and phase1_found < 4 and _budget_left() < 60:
+        logger.warning("Phase 1.5 SKIPPED: budget left %.0fs (need ≥60s)",
+                       _budget_left())
+        simplified_query = None
     if simplified_query and phase1_found < 4:
         _SKIP_ERRORS_RETRY = {"APIキー", "HTTP 404", "HTTP 410", "取扱ジャンル外"}
         scraper_map = {name: fn for fn, name in SCRAPERS}
@@ -5330,6 +5341,10 @@ def search_all_shops(query: str, config: Config) -> list[ShopPrice]:
         (i, r) for i, r in enumerate(results)
         if r.price is None and r.shop_name in _KAKAKU_SHOP_ALIASES
     ]
+    if kakaku_targets and _budget_left() < 30:
+        logger.warning("Phase 2.5 SKIPPED: budget left %.0fs (need ≥30s)",
+                       _budget_left())
+        kakaku_targets = []
     if kakaku_targets:
         logger.info("Phase 2.5: kakaku.com fallback for %d shops", len(kakaku_targets))
         # kakaku.com への並列アクセスは控えめに（相手サーバ負荷＆bot検出回避）
@@ -5424,6 +5439,21 @@ def search_all_shops(query: str, config: Config) -> list[ShopPrice]:
         and not (r.error and any(s in r.error for s in _SKIP_BING_ERRORS))
         and _shop_primary_domain(r.shop_name, r.search_url)
     ]
+    # 全体の時間予算が少なくなったら Phase 2.6 自体を諦める。
+    # 1ショップあたり ~3-5s かかるので、残予算で処理可能な数に制限。
+    if bing_targets:
+        _budget = _budget_left()
+        if _budget < 20:
+            logger.warning("Phase 2.6 SKIPPED: budget left %.0fs (need ≥20s)", _budget)
+            bing_targets = []
+        else:
+            # 並列度3で1バッチ ~5s, 残予算/5*3 を上限とする
+            _max_targets = max(3, int((_budget - 10) / 5 * 3))
+            if len(bing_targets) > _max_targets:
+                logger.warning(
+                    "Phase 2.6 trimmed: %d → %d targets (budget=%.0fs)",
+                    len(bing_targets), _max_targets, _budget)
+                bing_targets = bing_targets[:_max_targets]
     if bing_targets:
         shop_list = [r.shop_name for _, r in bing_targets]
         logger.info("Phase 2.6: web-search fallback for %d shops: %s",
