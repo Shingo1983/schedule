@@ -5490,8 +5490,12 @@ def search_all_shops(query: str, config: Config) -> list[ShopPrice]:
             ref_median = (_good_prices[len(_good_prices) // 2]
                           if len(_good_prices) >= 3 else None)
         if ref_median:
-            logger.info("Phase 2.6: using reference median ¥%s (from %d good prices)",
-                        f"{ref_median:,}", len(_good_prices))
+            if reference_price:
+                logger.info("Phase 2.6: using reference price ¥%s as sanity anchor",
+                            f"{ref_median:,}")
+            else:
+                logger.info("Phase 2.6: using reference median ¥%s (from %d good prices)",
+                            f"{ref_median:,}", len(_good_prices))
 
         recovered_shops = []
         failed_shops = []

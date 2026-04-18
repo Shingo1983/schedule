@@ -1,6 +1,8 @@
 """Flask Webアプリケーション"""
 
+import logging
 import os
+import traceback
 
 from flask import Flask, render_template, request, redirect, url_for, flash, make_response
 
@@ -318,19 +320,25 @@ def create_app() -> Flask:
 
     @app.route("/search")
     def search():
+        logger = logging.getLogger("jal_shopping")
         config = Config.load()
         query = request.args.get("q", "").strip()
         if not query:
             return redirect(url_for("index"))
 
-        # 全ショップを検索
-        shop_prices = search_all_sites(query, config)
+        try:
+            # 全ショップを検索
+            shop_prices = search_all_sites(query, config)
 
-        # エラー一覧（画面表示用）
-        errors = [sp.error for sp in shop_prices if sp.error]
+            # エラー一覧（画面表示用）
+            errors = [sp.error for sp in shop_prices if sp.error]
 
-        # 分析
-        analysis = analyze(query, shop_prices, config)
+            # 分析
+            analysis = analyze(query, shop_prices, config)
+        except Exception:
+            tb = traceback.format_exc()
+            logger.error("search_all_sites crashed: %s", tb)
+            return f"<h1>検索エラー</h1><pre>{tb}</pre>", 500
 
         # 手動検索ショップのURL生成（スクレイパー未対応の全ショップ）
         jal_shops = get_shops()
