@@ -36,5 +36,73 @@
             <p class="text-small">※ マイルレートは変更される場合があります。最新情報は<a href="https://partner.jal.co.jp/shoplist/" target="_blank" rel="noopener">JAL公式サイト</a>でご確認ください。</p>
         </div>
     </footer>
+
+    <div id="search-progress" class="progress-overlay" style="display:none;">
+        <div class="progress-modal">
+            <h2 id="progress-query"></h2>
+            <div class="progress-bar-container">
+                <div class="progress-bar" id="progress-bar"></div>
+            </div>
+            <p class="progress-phase" id="progress-phase"></p>
+            <p class="progress-detail" id="progress-detail"></p>
+        </div>
+    </div>
+
+    <script>
+    (function(){
+        var phases = [
+            {at:0,   pct:5,   phase:"Phase 0.5", detail:"定価/参考価格を取得中..."},
+            {at:3,   pct:10,  phase:"Phase 1",   detail:"全32ショップを並列検索中..."},
+            {at:30,  pct:30,  phase:"Phase 1",   detail:"各ショップの価格を抽出中..."},
+            {at:60,  pct:40,  phase:"Phase 1.5",  detail:"簡略クエリでリトライ中..."},
+            {at:75,  pct:50,  phase:"Phase 2",   detail:"ブラウザで動的ページをレンダリング中..."},
+            {at:120, pct:65,  phase:"Phase 2.5",  detail:"価格.comから補完情報を取得中..."},
+            {at:140, pct:75,  phase:"Phase 2.6",  detail:"検索エンジンでフォールバック中..."},
+            {at:170, pct:85,  phase:"Phase 3",   detail:"クロスショップ価格バリデーション中..."},
+            {at:190, pct:95,  phase:"完了間近",    detail:"結果をまとめています..."},
+        ];
+        function startProgress(query){
+            var el=document.getElementById('search-progress');
+            document.getElementById('progress-query').textContent='「'+query+'」を検索中...';
+            document.getElementById('progress-bar').style.width='2%';
+            document.getElementById('progress-phase').textContent='準備中...';
+            document.getElementById('progress-detail').textContent='検索を開始します';
+            el.style.display='flex';
+            var start=Date.now();
+            var timer=setInterval(function(){
+                var elapsed=(Date.now()-start)/1000;
+                var current=phases[0];
+                for(var i=0;i<phases.length;i++){
+                    if(elapsed>=phases[i].at) current=phases[i];
+                }
+                var pct=current.pct;
+                if(elapsed>current.at){
+                    var nextIdx=phases.indexOf(current)+1;
+                    if(nextIdx<phases.length){
+                        var next=phases[nextIdx];
+                        var frac=(elapsed-current.at)/(next.at-current.at);
+                        pct=current.pct+frac*(next.pct-current.pct);
+                    }
+                }
+                pct=Math.min(pct,98);
+                document.getElementById('progress-bar').style.width=pct+'%';
+                document.getElementById('progress-phase').textContent=current.phase;
+                document.getElementById('progress-detail').textContent=current.detail;
+                var min=Math.floor(elapsed/60);
+                var sec=Math.floor(elapsed%60);
+                var timeStr=min>0?(min+'分'+sec+'秒経過'):(sec+'秒経過');
+                document.getElementById('progress-detail').textContent=current.detail+' ('+timeStr+')';
+            },500);
+        }
+        document.addEventListener('submit',function(e){
+            var form=e.target;
+            if(!form.action||form.action.indexOf('/search')===-1) return;
+            var input=form.querySelector('input[name="q"]');
+            if(input&&input.value.trim()){
+                startProgress(input.value.trim());
+            }
+        });
+    })();
+    </script>
 </body>
 </html>

@@ -1083,23 +1083,28 @@ def _lookup_reference_price(query: str) -> tuple[int | None, str]:
             return None, ""
 
         # 検索結果から最初の関連商品を特定
+        def _find_product_link(soup_obj, q):
+            for a in soup_obj.select('a[href*="/item/"]'):
+                href = a.get('href', '') or ''
+                m = re.search(r'/item/([KJ]?\d+)/', href)
+                if not m:
+                    continue
+                candidate = a.get_text(strip=True)
+                if len(candidate) < 5:
+                    continue
+                if not _is_relevant_product(q, candidate):
+                    continue
+                return f"https://kakaku.com/item/{m.group(1)}/", candidate
+            return None, ""
+
         product_url = None
         product_name = ""
         best_price_in_search = None
-        for a in soup.select('a[href*="/item/"]'):
-            href = a.get('href', '') or ''
-            m = re.search(r'/item/([KJ]?\d+)/', href)
-            if not m:
-                continue
-            candidate = a.get_text(strip=True)
-            if len(candidate) < 5:
-                continue
-            if not _is_relevant_product(query, candidate):
-                continue
-            product_id = m.group(1)
-            product_url = f"https://kakaku.com/item/{product_id}/"
-            product_name = candidate
-            break
+        product_url, product_name = _find_product_link(soup, query)
+        if not product_url:
+            simplified = _simplify_query(query)
+            if simplified and simplified.lower() != query.lower():
+                product_url, product_name = _find_product_link(soup, simplified)
 
         # 検索結果一覧から「最安価格」テキストを拾う (複数セレクタ)
         for sel in ['.p-result_price', '.price', '.pryen', '[class*="price"]']:
@@ -1346,23 +1351,41 @@ def _kakaku_batch_fetch(query: str) -> dict[str, tuple[int, str, str]] | None:
         if _is_bot_blocked_page(soup):
             return None
 
-        product_url = None
-        product_name = ""
-        for a in soup.select('a[href*="/item/"]'):
-            href = a.get('href', '') or ''
-            m = re.search(r'/item/([KJ]?\d+)/', href)
-            if not m:
-                continue
-            candidate = a.get_text(strip=True)
-            if len(candidate) < 5:
-                continue
-            if not _is_relevant_product(query, candidate):
-                continue
-            product_id = m.group(1)
-            product_url = f"https://kakaku.com/item/{product_id}/"
-            product_name = candidate
-            break
+        def _find_kakaku_product(soup_obj, q):
+            for a in soup_obj.select('a[href*="/item/"]'):
+                href = a.get('href', '') or ''
+                m = re.search(r'/item/([KJ]?\d+)/', href)
+                if not m:
+                    continue
+                candidate = a.get_text(strip=True)
+                if len(candidate) < 5:
+                    continue
+                if not _is_relevant_product(q, candidate):
+                    continue
+                return f"https://kakaku.com/item/{m.group(1)}/", candidate
+            return None, ""
 
+        product_url, product_name = _find_kakaku_product(soup, query)
+        if not product_url:
+            simplified = _simplify_query(query)
+            if simplified and simplified.lower() != query.lower():
+                product_url, product_name = _find_kakaku_product(soup, simplified)
+                if product_url:
+                    logger.info("kakaku batch: found via simplified query '%s'",
+                                simplified)
+        if not product_url:
+            # フォールバック: 関連性チェックを緩和してリンクテキスト5文字以上の最初の商品を採用
+            for a in soup.select('a[href*="/item/"]'):
+                href = a.get('href', '') or ''
+                m = re.search(r'/item/([KJ]?\d+)/', href)
+                if m:
+                    candidate = a.get_text(strip=True)
+                    if len(candidate) >= 5:
+                        product_url = f"https://kakaku.com/item/{m.group(1)}/"
+                        product_name = candidate
+                        logger.info("kakaku batch: relaxed match '%s'",
+                                    candidate[:50])
+                        break
         if not product_url:
             return None
 
