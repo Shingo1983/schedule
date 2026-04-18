@@ -762,8 +762,12 @@ def _is_relevant_product(query: str, product_name: str) -> bool:
         #   query="MacBook Air M3" → "NIMASO MacBook air1 m5対応" は除外（m5 ≠ m3）
         #   query="AirPods Pro 3"  → "AirPods Pro 2" は除外（'3' 単独はワードバウンダリ済み）
         # 1-3 文字の英字 + 1-2 桁の数字に限定（Apple チップ m3/pro3、世代 gen2 等）。
+        # 数字先行 + 英字 (3s, 5g 等) も対応 — Meta Quest 3S / iPhone 5G 等の
+        # 世代/バリアント識別子を捕捉する。
         # 4 文字以上の英字は Apple 型番（mtjv3 等）の可能性があるので除外する。
-        _VERSION_TOKEN_RE = re.compile(r'^(?:[a-z]{1,3}\d{1,2}|gen\d{1,2})$')
+        _VERSION_TOKEN_RE = re.compile(
+            r'^(?:[a-z]{1,3}\d{1,2}|\d{1,2}[a-z]{1,2}|gen\d{1,2})$'
+        )
         version_tokens = [kw for kw in keywords if _VERSION_TOKEN_RE.match(kw)]
         for vt in version_tokens:
             # 商品名側もワードバウンダリでトークンを探索
@@ -2616,10 +2620,13 @@ def _extract_price_by_fulltext(soup: BeautifulSoup, query: str,
         _echo_strip = re.compile(r'[\s　\-/／「」『』【】()（）・、。,.]+')
         _n_norm = _echo_strip.sub('', name.lower())
         _q_norm = _echo_strip.sub('', query.lower())
-        if _n_norm and _q_norm and (
-                _n_norm == _q_norm
-                or _n_norm in _q_norm
-                or _q_norm in _n_norm):
+        _is_echo = False
+        if _n_norm and _q_norm:
+            if _n_norm == _q_norm:
+                _is_echo = True
+            elif _n_norm in _q_norm:
+                _is_echo = True
+        if _is_echo:
             logger.info("Fulltext echo-back rejected: name='%s' ≈ query='%s'",
                         name[:80], query[:80])
             name = ""
@@ -3141,8 +3148,9 @@ def _search_rakuten_api(query: str, config: Config, search_url: str) -> ShopPric
         # 全て無関係だった場合
         return ShopPrice("楽天市場", None, "", "", search_url,
                          candidates=all_pool or None)
-    except Exception:
-        return None  # フォールバック
+    except Exception as e:
+        logger.info("楽天API exception: %s", e)
+        return None
 
 
 def search_rakuten(query: str, config: Config) -> ShopPrice:
@@ -5447,9 +5455,17 @@ def search_all_shops(query: str, config: Config) -> list[ShopPrice]:
             logger.warning("Phase 2.6 SKIPPED: budget left %.0fs (need ≥20s)", _budget)
             bing_targets = []
         else:
-            # 並列度3で1バッチ ~5s, 残予算/5*3 を上限とする
             _max_targets = max(3, int((_budget - 10) / 5 * 3))
             if len(bing_targets) > _max_targets:
+                _PRIORITY_SHOPS = {
+                    "楽天市場", "Amazon.co.jp", "Yahoo!ショッピング",
+                    "ビックカメラ.com", "ヤマダウェブコム", "コジマネット",
+                    "ケーズデンキオンラインショップ", "エディオンネットショップ",
+                    "ノジマオンライン", "Joshin webショップ", "Qoo10",
+                    "au PAY マーケット",
+                }
+                bing_targets.sort(
+                    key=lambda t: (0 if t[1].shop_name in _PRIORITY_SHOPS else 1))
                 logger.warning(
                     "Phase 2.6 trimmed: %d → %d targets (budget=%.0fs)",
                     len(bing_targets), _max_targets, _budget)
