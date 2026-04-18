@@ -5196,15 +5196,46 @@ def search_all_shops(query: str, config: Config) -> list[ShopPrice]:
 
     # === Phase 0.5 enforcement: 参考価格フロアで Phase 1 結果をフィルタ ===
     # 定価/参考価格を取得できた場合、それを使って明らかなアクセサリを除外。
-    # 参考価格の 35% 未満の価格はアクセサリ/関連品の誤検出とみなし price=None に戻す。
-    # (例: Meta Quest 3S 定価¥48,400 → floor ¥16,940 → ¥4,500ケースを除外)
-    if _REFERENCE_FLOOR > 0:
+    # 参考価格の 35% 未満の価格はアクセサリ/関連品の誤検出とみなし、
+    # candidates プールから妥当な価格を再選定する。
+    # 再選定できなければ price=None に戻し、Phase 2.6 で recovery させる。
+    # (例: Meta Quest 3S 定価¥48,400 → floor ¥16,940
+    #      Amazon ¥3,872ケース → candidates から ¥70,526 128GB版を再選定)
+    if _REFERENCE_FLOOR > 0 and reference_price:
         _floor_rejected = []
+        _floor_reselected = []
+        _ceiling = int(reference_price * 3.0)  # 上限: 定価の3倍
         for i, r in enumerate(results):
-            if r.price is not None and r.price < _REFERENCE_FLOOR:
+            if r.price is None or r.price >= _REFERENCE_FLOOR:
+                continue
+            # candidates から「フロア以上・天井以下・関連商品」のものを探す
+            reselected = None
+            if r.candidates:
+                # 価格昇順で絞り込み（最安優先）
+                for cand in sorted(r.candidates, key=lambda c: c[0]):
+                    cp, cn, cu = cand[0], cand[1], cand[2]
+                    if cp < _REFERENCE_FLOOR or cp > _ceiling:
+                        continue
+                    if cn and not _is_relevant_product(query, cn):
+                        continue
+                    reselected = (cp, cn, cu)
+                    break
+            if reselected:
+                cp, cn, cu = reselected
+                _floor_reselected.append(f"{r.shop_name}: ¥{r.price:,}→¥{cp:,}")
+                logger.info(
+                    "Phase 0.5 reselect: %s ¥%s→¥%s from %d candidates (%s)",
+                    r.shop_name, f"{r.price:,}", f"{cp:,}",
+                    len(r.candidates or []), (cn or "")[:40])
+                results[i] = ShopPrice(
+                    r.shop_name, cp, cn, cu, r.search_url,
+                    error=None, list_price=reference_price,
+                    candidates=r.candidates,
+                )
+            else:
                 _floor_rejected.append(f"{r.shop_name}=¥{r.price:,}")
                 logger.info(
-                    "Phase 0.5 floor: %s ¥%s < floor ¥%s → rejected (%s)",
+                    "Phase 0.5 floor: %s ¥%s < floor ¥%s, no viable candidate (%s)",
                     r.shop_name, f"{r.price:,}", f"{_REFERENCE_FLOOR:,}",
                     (r.product_name or "")[:40])
                 results[i] = ShopPrice(
@@ -5212,9 +5243,11 @@ def search_all_shops(query: str, config: Config) -> list[ShopPrice]:
                     error=f"価格異常（参考価格¥{reference_price:,}の35%未満）",
                     candidates=r.candidates,
                 )
-        if _floor_rejected:
-            logger.info("Phase 0.5 floor rejected %d shops: %s",
-                        len(_floor_rejected), ", ".join(_floor_rejected))
+        if _floor_rejected or _floor_reselected:
+            logger.info(
+                "Phase 0.5 enforcement: %d rejected [%s], %d reselected [%s]",
+                len(_floor_rejected), ", ".join(_floor_rejected[:10]),
+                len(_floor_reselected), ", ".join(_floor_reselected[:10]))
             phase1_found = sum(1 for r in results if r.price is not None)
 
     # Also set reference_price as list_price on all successful results
