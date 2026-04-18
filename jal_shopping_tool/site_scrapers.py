@@ -4928,12 +4928,13 @@ def _retry_with_browser(results: list[ShopPrice], query: str) -> None:
 
     logger.info("Phase 2: Playwright browser retry for %d shops", len(retry_indices))
 
-    # Phase 2 全体の時間制限（3分）
+    # Phase 2 全体の時間制限
     phase2_start = time.time()
-    # Phase 2 の時間予算 (秒)。gunicorn worker timeout 300 秒の内訳:
-    #   Phase 1: ~60秒, Phase 2: <=180秒, Phase 2.5/2.6: <=50秒, Phase 3: <5秒
-    # Phase 2 が 200 秒以上占有すると Phase 2.6 が SIGTERM で落ちるため抑制。
-    PHASE2_BUDGET = 180
+    # Phase 2 の時間予算 (秒)。Phase 2.5 (kakaku バッチ) を先行実行するため
+    # Playwright は絞った shop だけを処理すればよい → 60秒で打ち切り。
+    # 200s 全体予算 - Phase1 90s - Phase0.5 10s - 他 20s ≒ 80s、
+    # そのうち 60s を Playwright、残り 20s を Phase 2.6 Web検索 に配分。
+    PHASE2_BUDGET = 60
 
     def _launch_browser(pw):
         """ブラウザ起動: Chrome → Chromiumの順にフォールバック"""
@@ -5467,16 +5468,53 @@ def search_all_shops(query: str, config: Config) -> list[ShopPrice]:
                 logger.info("Phase 1.5 recovered %d additional shops",
                             phase15_found - phase1_found)
 
-    # === Phase 2: Playwright ブラウザレンダリング（失敗分のみ） ===
-    _retry_with_browser(results, query)
+    # === Phase 2.5 (先行実行): kakaku.com 一括取得 ===
+    # Playwright より先に kakaku バッチを走らせる。1回の kakaku フェッチで
+    # ビックカメラ/ケーズ/ヤマダ/エディオン/ノジマ/Joshin/コジマ/Amazon/
+    # 楽天/Yahoo/au PAY/LOHACO/セブン/ソニー等 最大14shopを高速に補完できる。
+    # これにより Phase 2 (Playwright, per-shop 10-15秒) の負荷を激減させる。
+    kakaku_targets = [
+        (i, r) for i, r in enumerate(results)
+        if r.price is None and r.shop_name in _KAKAKU_SHOP_ALIASES
+    ]
+    if kakaku_targets and _budget_left() >= 20:
+        logger.info("Phase 2.5 (pre-Playwright): kakaku batch for %d shops",
+                    len(kakaku_targets))
+        batch = _kakaku_batch_fetch(query)
+        if batch:
+            recovered = []
+            for idx, r in kakaku_targets:
+                entry = batch.get(r.shop_name)
+                if not entry:
+                    continue
+                price, pname, purl = entry
+                results[idx] = ShopPrice(
+                    shop_name=r.shop_name,
+                    price=price,
+                    product_name=pname or "(価格.com経由)",
+                    product_url=purl,
+                    search_url=r.search_url,
+                    list_price=r.list_price,
+                    candidates=r.candidates,
+                )
+                recovered.append(f"{r.shop_name}=¥{price:,}")
+            if recovered:
+                logger.info("Phase 2.5 batch recovered %d shops: %s",
+                            len(recovered), ", ".join(recovered[:15]))
+
+    # === Phase 2: Playwright ブラウザレンダリング（kakaku でも拾えなかった分のみ） ===
+    # kakaku で既に取得済みの shop は Playwright を省略 → 大幅時短
+    if _budget_left() >= 20:
+        _retry_with_browser(results, query)
+    else:
+        logger.warning("Phase 2 SKIPPED: budget left %.0fs (need ≥20s)",
+                       _budget_left())
 
     phase2_found = sum(1 for r in results if r.price is not None)
     if phase2_found > phase1_found:
         logger.info("Phase 2 recovered %d additional shops", phase2_found - phase1_found)
 
-    # === Phase 2.5: kakaku.com 経由フォールバック ===
-    # Akamai IPブロックで Phase 1/2 ともに失敗する家電量販店向け。
-    # kakaku.com の価格比較表から各ショップの価格を抽出する。
+    # === Phase 2.5b: 残りの kakaku 対象を再試行（Playwright 後に失敗したもの） ===
     kakaku_targets = [
         (i, r) for i, r in enumerate(results)
         if r.price is None and r.shop_name in _KAKAKU_SHOP_ALIASES
