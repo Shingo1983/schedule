@@ -1325,6 +1325,94 @@ def _kakaku_fallback(shop_name: str, query: str, original_search_url: str) -> Sh
         return None
 
 
+def _kakaku_batch_fetch(query: str) -> dict[str, tuple[int, str, str]] | None:
+    """kakaku.com 比較ページを1回だけ取得し、全ショップの価格をまとめて返す。
+
+    Phase 2.5 の per-shop フェッチだと N ショップで 3N リクエストになり時間予算を圧迫。
+    ここでは 検索→商品ページ→比較ページ を1サイクル実行し、比較表の全行から
+    ショップ名と価格のペアを抽出する。
+
+    Returns:
+        {shop_key: (price, product_name, compare_url)}
+        shop_key は row text に現れるショップ名（alias 照合で JAL ショップ名に変換）。
+        取得できなければ None。
+    """
+    try:
+        ks_search_url = f"https://kakaku.com/search_results/{quote(query)}/"
+        resp = _fetch(ks_search_url, headers={"Referer": "https://kakaku.com/"})
+        if resp.status_code != 200:
+            return None
+        soup = _soup(resp)
+        if _is_bot_blocked_page(soup):
+            return None
+
+        product_url = None
+        product_name = ""
+        for a in soup.select('a[href*="/item/"]'):
+            href = a.get('href', '') or ''
+            m = re.search(r'/item/([KJ]?\d+)/', href)
+            if not m:
+                continue
+            candidate = a.get_text(strip=True)
+            if len(candidate) < 5:
+                continue
+            if not _is_relevant_product(query, candidate):
+                continue
+            product_id = m.group(1)
+            product_url = f"https://kakaku.com/item/{product_id}/"
+            product_name = candidate
+            break
+
+        if not product_url:
+            return None
+
+        compare_url = product_url + "itemlist.aspx"
+        resp2 = _fetch(compare_url, headers={"Referer": product_url})
+        if resp2.status_code != 200:
+            resp2 = _fetch(product_url, headers={"Referer": ks_search_url})
+            if resp2.status_code != 200:
+                return None
+        soup2 = _soup(resp2)
+        if _is_bot_blocked_page(soup2):
+            return None
+
+        # 比較表の全行を走査し、JAL ショップ名 (alias マッチ) + 価格 のペアを収集
+        result: dict[str, tuple[int, str, str]] = {}
+        for row in soup2.select('tr'):
+            row_text = row.get_text(" ", strip=True)
+            if not row_text or len(row_text) < 5:
+                continue
+            # 価格抽出
+            price = None
+            for sel in ['.p-PriceTable_price', '.pricetext', '.td-priceSet',
+                        '[class*="price"] .num', '[class*="Price"] .num',
+                        '[class*="price"]']:
+                price_el = row.select_one(sel)
+                if price_el:
+                    price = _parse_price(price_el.get_text())
+                    if price:
+                        break
+            if not price:
+                price = _parse_price(row_text)
+            if not price or price < 100:
+                continue
+            # どのJALショップに該当するか判定 (最初にマッチしたエイリアスで採用)
+            for shop_name, aliases in _KAKAKU_SHOP_ALIASES.items():
+                if any(alias in row_text for alias in aliases):
+                    prev = result.get(shop_name)
+                    # 複数行マッチ時は最安値を保持
+                    if prev is None or price < prev[0]:
+                        result[shop_name] = (price, product_name, compare_url)
+                    break
+
+        logger.info("kakaku batch: extracted %d shops from %s",
+                    len(result), product_url)
+        return result
+    except Exception as e:
+        logger.info("kakaku batch error: %s", e)
+        return None
+
+
 # ---------------------------------------------------------------------------
 # ショップ名 → 公式ドメイン（Bing site: 検索で使う）
 # 検索URLから自動推定できないケース or 別ドメインで商品ページを持つケースを補完
@@ -5354,25 +5442,29 @@ def search_all_shops(query: str, config: Config) -> list[ShopPrice]:
                        _budget_left())
         kakaku_targets = []
     if kakaku_targets:
-        logger.info("Phase 2.5: kakaku.com fallback for %d shops", len(kakaku_targets))
-        # kakaku.com への並列アクセスは控えめに（相手サーバ負荷＆bot検出回避）
-        with ThreadPoolExecutor(max_workers=3) as executor:
-            future_to_idx = {
-                executor.submit(
-                    _kakaku_fallback, r.shop_name, query, r.search_url
-                ): idx
-                for idx, r in kakaku_targets
-            }
-            for future in as_completed(future_to_idx):
-                idx = future_to_idx[future]
-                try:
-                    fb = future.result(timeout=_TIMEOUT_SLOW + 10)
-                except Exception as e:
-                    logger.debug("Phase 2.5 exception for %s: %s",
-                                 results[idx].shop_name, e)
+        logger.info("Phase 2.5: kakaku.com batch fallback for %d shops", len(kakaku_targets))
+        # 比較ページを一度だけ取得し、全対象ショップに配布 (大幅時間短縮)
+        batch = _kakaku_batch_fetch(query)
+        if batch:
+            recovered = []
+            for idx, r in kakaku_targets:
+                entry = batch.get(r.shop_name)
+                if not entry:
                     continue
-                if fb and fb.price is not None:
-                    results[idx] = fb
+                price, pname, purl = entry
+                results[idx] = ShopPrice(
+                    shop_name=r.shop_name,
+                    price=price,
+                    product_name=pname or "(価格.com経由)",
+                    product_url=purl,
+                    search_url=r.search_url,
+                    list_price=r.list_price,
+                    candidates=r.candidates,
+                )
+                recovered.append(f"{r.shop_name}=¥{price:,}")
+            if recovered:
+                logger.info("Phase 2.5 batch recovered %d shops: %s",
+                            len(recovered), ", ".join(recovered[:15]))
 
         phase25_found = sum(1 for r in results if r.price is not None)
         if phase25_found > phase2_found:
