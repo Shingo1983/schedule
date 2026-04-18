@@ -20,6 +20,7 @@ import time
 import random
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import TimeoutError as _FuturesTimeout
 from dataclasses import dataclass
 from urllib.parse import quote, urlparse
 
@@ -313,7 +314,7 @@ _SLOW_SHOPS: set[str] = {
 
 # 並列実行のワーカー数（各ショップは別ドメインだが bot 検出器が共有 CDN(Akamai/Cloudflare)
 # 上で動いているサイトが多いので、同時接続過多は逆効果。5 並列で十分）
-_MAX_WORKERS = 5
+_MAX_WORKERS = 10
 
 
 @dataclass
@@ -5289,22 +5290,28 @@ def search_all_shops(query: str, config: Config) -> list[ShopPrice]:
         _REFERENCE_FLOOR = 0
 
     # === Phase 1: cloudscraper（並列実行・分散遅延付き） ===
-    with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as executor:
-        future_to_name: dict = {}
-        for i, (scraper_fn, name) in enumerate(SCRAPERS):
-            if name in skipped_shops:
-                results.append(ShopPrice(name, None, "", "", "",
-                                         error="取扱ジャンル外"))
-                continue
-            # 各ショップは別ドメインなので遅延は最小限
-            delay = random.uniform(0, 0.5)
-            future = executor.submit(_delayed_scrape, scraper_fn, query, config, delay)
-            future_to_name[future] = name
+    # Hard time budget: 90秒で打ち切り、残った shop は「タイムアウト」扱い。
+    # 個別 scraper が内部リトライ等でハングしても全体を止めない。
+    PHASE1_BUDGET = 90.0
+    phase1_start = time.time()
+    executor = ThreadPoolExecutor(max_workers=_MAX_WORKERS)
+    future_to_name: dict = {}
+    for i, (scraper_fn, name) in enumerate(SCRAPERS):
+        if name in skipped_shops:
+            results.append(ShopPrice(name, None, "", "", "",
+                                     error="取扱ジャンル外"))
+            continue
+        delay = random.uniform(0, 0.5)
+        future = executor.submit(_delayed_scrape, scraper_fn, query, config, delay)
+        future_to_name[future] = name
 
-        for future in as_completed(future_to_name):
+    pending = set(future_to_name.keys())
+    try:
+        for future in as_completed(future_to_name, timeout=PHASE1_BUDGET):
             name = future_to_name[future]
+            pending.discard(future)
             try:
-                result = future.result(timeout=_TIMEOUT + 10)
+                result = future.result(timeout=5)
                 results.append(result)
                 if result.price:
                     logger.info("Phase1 OK: %s = ¥%s (%s)",
@@ -5316,6 +5323,20 @@ def search_all_shops(query: str, config: Config) -> list[ShopPrice]:
             except Exception as e:
                 logger.warning("Phase1 EXCEPTION: %s = %s", name, e)
                 results.append(ShopPrice(name, None, "", "", "", error=str(e)))
+    except _FuturesTimeout:
+        # Phase 1 予算超過: 残りの shop はタイムアウト扱いで打ち切り
+        elapsed = time.time() - phase1_start
+        stalled_names = [future_to_name[f] for f in pending]
+        logger.warning(
+            "Phase 1 budget exceeded (%.0fs), abandoning %d stalled shops: %s",
+            elapsed, len(stalled_names), ", ".join(stalled_names[:10]))
+        for f in pending:
+            f.cancel()
+            name = future_to_name[f]
+            results.append(ShopPrice(
+                name, None, "", "", "",
+                error="タイムアウト（手動で検索してください）"))
+    executor.shutdown(wait=False, cancel_futures=True)
 
     phase1_found = sum(1 for r in results if r.price is not None)
     logger.info("Phase 1 complete: %d/%d shops found prices", phase1_found, len(results))
