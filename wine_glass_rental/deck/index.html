@@ -11,7 +11,7 @@
 </head>
 <body>
 <div class="progress"><div class="progress-bar" id="bar"></div></div>
-<div class="counter" id="counter">01 / 34</div>
+<div class="counter" id="counter">01 / 36</div>
 <div class="hint" id="hint">← → / Space で移動 ・ F で全画面 ・ P で印刷(PDF)</div>
 
 <main id="deck">
@@ -683,9 +683,61 @@
   <p class="takeaway">融資後は<b>四半期ごとにKPIと資金繰り実績</b>を公庫へ報告し、計画差異と対応を説明します。</p>
 </section>
 
-<!-- 31 CLOSING -->
+<!-- 31 FLYWHEEL -->
+<section class="slide" data-title="事業の工夫">
+  <h2><span class="kicker">31</span>事業の工夫 ― 在庫が「3つの顔」を持つ</h2>
+  <div class="two-col">
+    <div>
+      <svg viewBox="0 0 360 300" class="flywheel">
+        <defs>
+          <marker id="ah" markerWidth="9" markerHeight="9" refX="6" refY="3" orient="auto">
+            <path d="M0,0 L7,3 L0,6 Z" fill="#7a1f3d"/>
+          </marker>
+        </defs>
+        <path d="M210,70 A120 120 0 0 1 250,210" class="fwarc" marker-end="url(#ah)"/>
+        <path d="M235,235 A120 120 0 0 1 110,235" class="fwarc" marker-end="url(#ah)"/>
+        <path d="M95,210 A120 120 0 0 1 150,70" class="fwarc" marker-end="url(#ah)"/>
+        <circle cx="180" cy="58" r="46" class="fwnode n1"/>
+        <text x="180" y="52" class="fwt">① 貸す</text><text x="180" y="70" class="fwt s">Rent</text>
+        <circle cx="280" cy="232" r="46" class="fwnode n2"/>
+        <text x="280" y="226" class="fwt">② 売る</text><text x="280" y="244" class="fwt s">Sell</text>
+        <circle cx="80" cy="232" r="46" class="fwnode n3"/>
+        <text x="80" y="226" class="fwt">③ 学ぶ</text><text x="80" y="244" class="fwt s">Data</text>
+        <text x="180" y="170" class="fwc">回すほど</text><text x="180" y="188" class="fwc">在庫リスク↓</text><text x="180" y="206" class="fwc">収益性↑</text>
+      </svg>
+    </div>
+    <div>
+      <ul class="bullets">
+        <li><b>貸す</b>：本業のレンタル収益。</li>
+        <li><b>売る</b>：気に入った顧客へ販売（新品はメーカー送客／使用個体は中古販売）＝<b>在庫の出口</b>。</li>
+        <li><b>学ぶ</b>：品種×グラス×シーンの<b>嗜好データ</b>でレコメンド・仕入を最適化。</li>
+      </ul>
+      <div class="callout"><p class="sm0">レンタルが<b>試飲チャネル・販売チャネル・データ装置</b>を兼ねる。メーカーから見れば「<b>試して買わせる新チャネル</b>」＝委託在庫でCAPEX圧縮の芽。<b>在庫リスクという資産型最大の弱点を構造的に解消</b>。</p></div>
+    </div>
+  </div>
+</section>
+
+<!-- 32 NEW SERVICES -->
+<section class="slide" data-title="新サービス">
+  <h2><span class="kicker">32</span>新サービス・ラインナップ</h2>
+  <div class="card-row">
+    <div class="pcard"><span class="pno">★</span><h3>サブスク<br>Monthly Cru</h3><p>毎月ソムリエ監修の名品が届く。所有では出会えない名品を乗り換え。<b>前受でCF改善・LTV向上</b>。¥4,980〜/月。</p></div>
+    <div class="pcard"><span class="pno">★</span><h3>Try &amp; Buy</h3><p>気に入ったら購入可。新品は<b>メーカー送客(手数料10〜20%)</b>、使用個体は<b>中古販売</b>＝在庫の出口。</p></div>
+    <div class="pcard"><span class="pno">+</span><h3>ペアリング/<br>ギフト/体験</h3><p>ワイン連携レコメンド、比較テイスティング、eギフト、出張ソムリエのワイン会。</p></div>
+    <div class="pcard"><span class="pno">+</span><h3>B2B2C・<br>サステナ可視化</h3><p>高級民泊/別荘/ホテル常備。「使い捨て○個削減」表示でESG訴求。</p></div>
+  </div>
+  <table class="tbl full sm mt">
+    <tr><th>サブスク</th><th>月額</th><th>内容</th><th>主原価/月</th><th>貢献/月</th></tr>
+    <tr><td>Casual(隔月)</td><td class="num">¥4,980</td><td>ペア2脚・隔月</td><td class="num">¥2,200</td><td class="num pos">¥2,780</td></tr>
+    <tr><td>Standard</td><td class="num">¥6,980</td><td>ペア2脚・毎月＋ペアリング</td><td class="num">¥2,900</td><td class="num pos">¥4,080</td></tr>
+    <tr><td>Premium</td><td class="num">¥9,980</td><td>ザルト等4脚・毎月</td><td class="num">¥3,400</td><td class="num pos">¥6,580</td></tr>
+  </table>
+  <p class="note">送料が主原価のため<b>隔月配送・地域別・近郊集荷</b>で平準化。ストック収益（定額系）を<b>3年で売上の3割超</b>に育て予測可能性を高める。段階導入：①B2B定額→②Try&Buy→③サブスク→④メーカー連携。</p>
+</section>
+
+<!-- 33 CLOSING -->
 <section class="slide closing" data-title="お願い">
-  <h2><span class="kicker">31</span>お願い（まとめ）</h2>
+  <h2><span class="kicker">33</span>お願い（まとめ）</h2>
   <div class="closing-grid">
     <div class="cl"><span class="cln">¥10M</span><p>新規開業資金をお願いします（7年・据置相談）。</p></div>
     <div class="cl"><span class="cln">資産型</span><p>在庫が資産として残り、担保性・回収可能性が高い。</p></div>
@@ -697,7 +749,7 @@
 
 <!-- 32 APPENDIX: 創業計画書対応表 -->
 <section class="slide" data-title="様式対応表">
-  <h2><span class="kicker">32</span>付録：公庫「創業計画書」対応表</h2>
+  <h2><span class="kicker">34</span>付録：公庫「創業計画書」対応表</h2>
   <table class="tbl full sm">
     <tr><th>創業計画書の欄</th><th>本資料の該当</th></tr>
     <tr><td>1. 創業の動機</td><td>P02 創業の動機・目的</td></tr>
@@ -715,7 +767,7 @@
 
 <!-- 33 APPENDIX: assumptions -->
 <section class="slide" data-title="前提・用語">
-  <h2><span class="kicker">33</span>付録：主要前提と用語</h2>
+  <h2><span class="kicker">35</span>付録：主要前提と用語</h2>
   <div class="two-col">
     <div>
       <h4>主要前提</h4>
