@@ -15,6 +15,9 @@ def create_app() -> Flask:
     app = Flask(__name__)
     app.secret_key = os.environ.get("SECRET_KEY", "jal-lsp-shopping-tool-dev")
 
+    from card_campaigns import bp as cards_bp
+    app.register_blueprint(cards_bp)
+
     @app.after_request
     def add_no_cache_headers(response):
         response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
