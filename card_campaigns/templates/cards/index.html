@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="カードキャンペーン">
+<title>カードキャンペーン</title>
+<style>
+:root {
+  --bg: #f6f7f9; --card: #fff; --text: #1b1f24; --muted: #6a737d; --line: #e3e6ea;
+  --accent: #2f5bd3; --accent-text: #fff; --ok: #1a7f4b; --ok-bg: #e7f5ed;
+  --warn: #b45309; --warn-bg: #fdf3e6; --err: #b42318; --err-bg: #fdecea;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #111418; --card: #1a1e24; --text: #e6e8eb; --muted: #9aa3ad; --line: #2b313a;
+    --accent: #7aa2ff; --accent-text: #0d1117; --ok: #5fd39a; --ok-bg: #16301f;
+    --warn: #f0b264; --warn-bg: #33250f; --err: #ff8a80; --err-bg: #3a1714;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text);
+  font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Hiragino Sans", sans-serif;
+  padding: env(safe-area-inset-top) 0 env(safe-area-inset-bottom); }
+.wrap { max-width: 760px; margin: 0 auto; padding: 12px 16px 48px; }
+h1 { font-size: 20px; margin: 8px 0 4px; }
+.sub { color: var(--muted); font-size: 12px; }
+.summary { display: flex; gap: 8px; margin: 12px 0; }
+.stat { flex: 1; background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+  padding: 8px 10px; }
+.stat b { font-size: 20px; display: block; }
+.stat span { color: var(--muted); font-size: 12px; }
+.banner { border-radius: 8px; padding: 8px 12px; margin: 8px 0; font-size: 13px; }
+.banner.warn { background: var(--warn-bg); color: var(--warn); }
+.banner.err { background: var(--err-bg); color: var(--err); }
+.toolbar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin: 8px 0 16px; }
+section { background: var(--card); border: 1px solid var(--line); border-radius: 12px;
+  margin: 0 0 14px; overflow: hidden; }
+.sec-head { padding: 12px 14px; border-bottom: 1px solid var(--line); }
+.sec-head h2 { font-size: 16px; margin: 0; }
+.cards-list { color: var(--muted); font-size: 12px; margin-top: 2px; }
+.meta { color: var(--muted); font-size: 11px; margin-top: 4px; word-break: break-all; }
+.item { padding: 10px 14px; border-top: 1px solid var(--line); display: flex; gap: 10px;
+  align-items: flex-start; }
+.item:first-of-type { border-top: 0; }
+.item.entered { opacity: .6; }
+.item .body { flex: 1; min-width: 0; }
+.item .title { font-weight: 600; color: var(--text); text-decoration: none; display: block; }
+.item .title:hover { text-decoration: underline; }
+.tags { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 4px; font-size: 11px; }
+.tag { padding: 1px 6px; border-radius: 4px; background: var(--bg); color: var(--muted); }
+.tag.soon { background: var(--warn-bg); color: var(--warn); }
+.tag.ok { background: var(--ok-bg); color: var(--ok); }
+.tag.err { background: var(--err-bg); color: var(--err); }
+.actions { display: flex; flex-direction: column; gap: 6px; align-items: stretch; min-width: 84px; }
+.btn { appearance: none; border: 1px solid var(--line); background: var(--card); color: var(--text);
+  border-radius: 8px; padding: 6px 10px; font-size: 13px; text-align: center; text-decoration: none;
+  cursor: pointer; white-space: nowrap; }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); font-weight: 600; }
+.btn.small { padding: 3px 8px; font-size: 12px; }
+.btn.link { border: 0; background: none; color: var(--muted); padding: 2px; font-size: 12px; }
+.empty { padding: 12px 14px; color: var(--muted); font-size: 13px; }
+details.add { padding: 8px 14px 12px; border-top: 1px solid var(--line); font-size: 13px; }
+details.add summary { color: var(--accent); cursor: pointer; }
+details.add form { display: grid; gap: 6px; margin-top: 8px; }
+input[type=text], input[type=url], input[type=date] { width: 100%; padding: 8px; border-radius: 8px;
+  border: 1px solid var(--line); background: var(--bg); color: var(--text); font-size: 16px; }
+.inline { display: inline; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>カードキャンペーン</h1>
+  <div class="sub">保有カードの発行会社の「既存会員がエントリーするキャンペーン」の一覧です。「応募」を押すと登録済みとして記録し、ログインページを開きます。</div>
+
+  <div class="summary">
+    <div class="stat"><b>{{ totals.open }}</b><span>未登録</span></div>
+    <div class="stat"><b>{{ totals.soon }}</b><span>締切7日以内</span></div>
+    <div class="stat"><b>{{ totals.entered }}</b><span>登録済み</span></div>
+  </div>
+
+  {% if refreshing %}
+  <div class="banner warn" id="refreshing">最新情報を取得中です。完了すると自動で再読み込みします(1分ほどかかります)。</div>
+  {% endif %}
+  {% if not persistent %}
+  <div class="banner err">保存先が永続化されていません。再デプロイで登録記録が消えます。Railway で Volume を /data にマウントしてください。</div>
+  {% endif %}
+  {% if not protected %}
+  <div class="banner warn">アクセスキー(CARDS_ACCESS_KEY)が未設定のため、URLを知っている人は誰でも閲覧・操作できます。</div>
+  {% endif %}
+
+  <div class="toolbar">
+    <form method="post" action="{{ url_for('cards.refresh') }}" class="inline">
+      <button class="btn small" type="submit">今すぐ更新</button>
+    </form>
+    {% if show_all %}
+      <a class="btn small" href="{{ url_for('cards.index') }}">通常表示に戻す</a>
+    {% else %}
+      <a class="btn small" href="{{ url_for('cards.index', all=1) }}">除外分も表示</a>
+    {% endif %}
+  </div>
+
+  {% for sec in sections %}
+  {% set src = sec.src %}
+  <section id="src-{{ src.id }}">
+    <div class="sec-head">
+      <h2>{{ src.issuer }}</h2>
+      <div class="cards-list">{{ src.cards | join(" / ") }}</div>
+      {% if src.kind == "scrape" %}
+        <div class="meta">
+          {% if sec.fetched_at %}取得: {{ fmt_date(sec.fetched_at) }}{% else %}未取得{% endif %}
+          ・<a href="{{ src.official_url }}" target="_blank" rel="noopener">公式一覧</a>
+          {% if sec.hidden.new_member or sec.hidden.expired or sec.hidden.dismissed %}
+          ・除外: 新規入会等 {{ sec.hidden.new_member }} / 終了 {{ sec.hidden.expired }} / 興味なし {{ sec.hidden.dismissed }}
+          {% endif %}
+        </div>
+      {% else %}
+        <div class="meta">{{ src.note }}{% if sec.checked_at %} ・最終確認: {{ fmt_date(sec.checked_at) }}{% endif %}</div>
+      {% endif %}
+      {% if src.note and src.kind == "scrape" %}<div class="meta">{{ src.note }}</div>{% endif %}
+      {% if sec.error %}
+        <div class="tags"><span class="tag err">{% if sec.stale %}更新失敗(前回の結果を表示中){% else %}取得失敗{% endif %}</span></div>
+        <div class="meta">{{ sec.error }}</div>
+      {% endif %}
+    </div>
+
+    {% if src.kind == "login_only" %}
+      <div class="item">
+        <div class="body"><span class="title">会員サイトでキャンペーンを確認</span>
+          <div class="meta">この会社の既存会員向けキャンペーンは公開ページに出ないため、自動取得できません。見つけたものは下の「手動で追加」から登録できます。</div></div>
+        <div class="actions">
+          <a class="btn primary" href="{{ src.login_url }}" target="_blank" rel="noopener"
+             data-check="{{ src.id }}">開く</a>
+        </div>
+      </div>
+    {% endif %}
+
+    {% for it in sec["items"] %}
+      <div class="item {% if it.state == 'entered' %}entered{% endif %}" data-key="{{ it.key }}">
+        <div class="body">
+          {% if it.url %}
+            <a class="title" href="{{ it.url }}" target="_blank" rel="noopener">{{ it.title }}</a>
+          {% else %}
+            <span class="title">{{ it.title }}</span>
+          {% endif %}
+          <div class="tags">
+            {% if it.deadline %}
+              <span class="tag {% if it.days_left is not none and it.days_left <= 7 %}soon{% endif %}">
+                締切 {{ fmt_date(it.deadline) }}{% if it.days_left is not none and it.days_left >= 0 %}(あと{{ it.days_left }}日){% endif %}
+              </span>
+            {% else %}
+              <span class="tag">締切不明</span>
+            {% endif %}
+            {% if it.entry_required %}<span class="tag">要エントリー</span>{% endif %}
+            {% if it.manual_id %}<span class="tag">手動追加</span>{% endif %}
+            {% if it.hidden_reason == "new_member" %}<span class="tag">新規入会等として除外</span>{% endif %}
+            {% if it.hidden_reason == "expired" %}<span class="tag">終了</span>{% endif %}
+            {% if it.hidden_reason == "dismissed" %}<span class="tag">興味なし</span>{% endif %}
+            {% if it.state == "entered" %}<span class="tag ok">登録済み {{ fmt_date(it.state_at) }}</span>{% endif %}
+          </div>
+        </div>
+        <div class="actions">
+          {% if it.state == "entered" %}
+            <form method="post" action="{{ url_for('cards.set_status', all=1 if show_all else None) }}">
+              <input type="hidden" name="key" value="{{ it.key }}"><input type="hidden" name="state" value="clear">
+              <button class="btn link" type="submit">登録を取消</button>
+            </form>
+          {% else %}
+            <a class="btn primary js-entry" href="{{ src.login_url }}" target="_blank" rel="noopener"
+               data-key="{{ it.key }}" data-title="{{ it.title }}" data-source="{{ src.id }}">応募</a>
+            {% if it.state == "dismissed" %}
+            <form method="post" action="{{ url_for('cards.set_status', all=1 if show_all else None) }}">
+              <input type="hidden" name="key" value="{{ it.key }}"><input type="hidden" name="state" value="clear">
+              <button class="btn link" type="submit">興味なしを取消</button>
+            </form>
+            {% else %}
+            <form method="post" action="{{ url_for('cards.set_status', all=1 if show_all else None) }}">
+              <input type="hidden" name="key" value="{{ it.key }}"><input type="hidden" name="state" value="dismissed">
+              <input type="hidden" name="title" value="{{ it.title }}"><input type="hidden" name="source" value="{{ src.id }}">
+              <button class="btn link" type="submit">興味なし</button>
+            </form>
+            {% endif %}
+          {% endif %}
+          {% if it.manual_id %}
+            <form method="post" action="{{ url_for('cards.manual') }}" onsubmit="return confirm('削除しますか？')">
+              <input type="hidden" name="delete" value="{{ it.manual_id }}">
+              <button class="btn link" type="submit">削除</button>
+            </form>
+          {% endif %}
+        </div>
+      </div>
+    {% else %}
+      {% if src.kind == "scrape" %}
+      <div class="empty">表示できるキャンペーンはありません。</div>
+      {% endif %}
+    {% endfor %}
+
+    <details class="add">
+      <summary>手動で追加</summary>
+      <form method="post" action="{{ url_for('cards.manual') }}">
+        <input type="hidden" name="source" value="{{ src.id }}">
+        <input type="text" name="title" placeholder="キャンペーン名" required>
+        <input type="url" name="url" placeholder="URL(任意)">
+        <label class="meta">締切(任意) <input type="date" name="deadline"></label>
+        <button class="btn" type="submit">追加</button>
+      </form>
+    </details>
+  </section>
+  {% endfor %}
+
+  <div class="sub">対象外: 家族カード(ヒルズカード)、法人カード、デビット/プリペイド(JAL Pay・PayPay・Wise・Revolut)。</div>
+</div>
+
+<script>
+(function () {
+  function post(url, data) {
+    var fd = new FormData();
+    Object.keys(data).forEach(function (k) { fd.append(k, data[k]); });
+    fd.append("beacon", "1");
+    if (navigator.sendBeacon && navigator.sendBeacon(url, fd)) return;
+    fetch(url, { method: "POST", body: fd, credentials: "same-origin", keepalive: true });
+  }
+  document.querySelectorAll(".js-entry").forEach(function (a) {
+    a.addEventListener("click", function () {
+      post("{{ url_for('cards.set_status') }}", {
+        key: a.dataset.key, state: "entered", title: a.dataset.title, source: a.dataset.source
+      });
+      var row = a.closest(".item");
+      if (row) row.classList.add("entered");
+      a.textContent = "登録済み";
+      a.classList.remove("primary");
+    });
+  });
+  document.querySelectorAll("[data-check]").forEach(function (a) {
+    a.addEventListener("click", function () {
+      post("{{ url_for('cards.checked') }}", { source: a.dataset.check });
+    });
+  });
+  {% if refreshing %}
+  var timer = setInterval(function () {
+    fetch("{{ url_for('cards.api_state') }}", { credentials: "same-origin" })
+      .then(function (r) { return r.json(); })
+      .then(function (s) { if (!s.refreshing) { clearInterval(timer); location.reload(); } });
+  }, 4000);
+  {% endif %}
+})();
+</script>
+</body>
+</html>
