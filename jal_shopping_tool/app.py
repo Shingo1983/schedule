@@ -2,16 +2,56 @@
 
 import os
 
-from flask import Flask, render_template, request, redirect, url_for, flash, make_response
+from flask import (Flask, abort, flash, jsonify, redirect,
+                   render_template, request, url_for)
 
 from .analyzer import analyze
+from .arbitrage_jobs import CACHE, JOBS, ResultCache
 from .config import Config
-from .jal_shops import get_shops, SHOP_CACHE_FILE
+from .jal_shops import get_shops
 from .price_search import search_all_sites
 from .resale_arbitrage import (
-    run_arbitrage_scan, run_single_arbitrage, ARBITRAGE_CANDIDATES,
+    AMAZON_CATEGORY_LABELS,
+    AMAZON_REFERRAL_RATES,
+    ARBITRAGE_CANDIDATES,
+    SIZE_TIERS,
+    FeeSettings,
+    normalize_size,
+    run_arbitrage_scan,
+    run_single_arbitrage,
 )
 from .site_scrapers import get_manual_search_shops, SCRAPER_SHOP_NAMES, _HAS_CLOUDSCRAPER, _HAS_PLAYWRIGHT
+
+
+def _arbitrage_settings(config: Config, args) -> tuple[FeeSettings, dict]:
+    """クエリ/フォームの値から FeeSettings を構築。表示用のフォーム値も返す"""
+    overrides = {}
+    form = {
+        "min_price": 30000,
+        "tolerance": 5,
+        "use_points": True,
+        "amazon_plan": "small",
+    }
+    v = (args.get("min_price") or "").strip()
+    if v.isdigit():
+        form["min_price"] = int(v)
+        overrides["min_buy_price"] = int(v)
+    v = (args.get("tolerance") or "").strip()
+    try:
+        if v:
+            form["tolerance"] = float(v)
+            overrides["breakeven_tolerance"] = max(0.0, float(v)) / 100.0
+    except ValueError:
+        pass
+    # チェックボックスは「フォームが送信されたか」で判断（submitted=1 を hidden で付ける）
+    if args.get("submitted"):
+        form["use_points"] = bool(args.get("use_points"))
+        overrides["use_point_rebate"] = form["use_points"]
+    plan = (args.get("amazon_plan") or "").strip()
+    if plan in ("small", "pro"):
+        form["amazon_plan"] = plan
+        overrides["amazon_plan"] = plan
+    return FeeSettings.from_config(config, **overrides), form
 
 
 def create_app() -> Flask:
@@ -97,31 +137,81 @@ def create_app() -> Flask:
             manual_count=manual_count,
         )
 
+    # ------------------------------------------------------------------
+    # 転売アービトラージ
+    # ------------------------------------------------------------------
+    def _arbitrage_context(**extra) -> dict:
+        ctx = {
+            "candidates": ARBITRAGE_CANDIDATES,
+            "candidate_count": len(ARBITRAGE_CANDIDATES),
+            "size_tiers": SIZE_TIERS,
+            "categories": [(k, AMAZON_CATEGORY_LABELS[k], int(round(v * 100)))
+                           for k, v in AMAZON_REFERRAL_RATES.items()],
+            "has_playwright": _HAS_PLAYWRIGHT,
+            "scan_running": JOBS.running_count() > 0,
+        }
+        ctx.update(extra)
+        return ctx
+
     @app.route("/arbitrage")
     def arbitrage():
         config = Config.load()
+        settings, form = _arbitrage_settings(config, request.args)
         query = request.args.get("q", "").strip()
         category = request.args.get("category", "general").strip()
-        scan = request.args.get("scan", "").strip()
-        limit = int(request.args.get("limit", "0"))
+        if category not in AMAZON_REFERRAL_RATES:
+            category = "general"
+        size = normalize_size(request.args.get("size", "60"))
 
-        result = None
-        report = None
+        if not query:
+            return render_template("arbitrage.html", mode="index", form=form,
+                                   settings=settings, query="", category=category,
+                                   size=size, **_arbitrage_context())
 
-        if query:
-            result = run_single_arbitrage(query, config, category=category)
-        elif scan:
-            report = run_arbitrage_scan(config, max_items=limit)
+        key = ResultCache.make_key(query, category, size, settings)
+        result = CACHE.get(key)
+        cached = result is not None
+        if result is None:
+            result = run_single_arbitrage(query, config, category=category, size=size,
+                                          settings=settings)
+            CACHE.put(key, result)
 
-        return render_template(
-            "arbitrage.html",
-            query=query,
-            category=category,
-            result=result,
-            report=report,
-            candidates=ARBITRAGE_CANDIDATES,
-            candidate_count=len(ARBITRAGE_CANDIDATES),
-        )
+        if request.args.get("format") == "json":
+            return jsonify(result.to_dict())
+
+        return render_template("arbitrage.html", mode="single", form=form,
+                               settings=settings, query=query, category=category,
+                               size=size, result=result, cached=cached,
+                               **_arbitrage_context())
+
+    @app.route("/arbitrage/scan", methods=["POST"])
+    def arbitrage_scan_start():
+        config = Config.load()
+        settings, _ = _arbitrage_settings(config, request.form)
+        try:
+            limit = int(request.form.get("limit", "0"))
+        except ValueError:
+            limit = 0
+        try:
+            job = JOBS.start(lambda cb: run_arbitrage_scan(
+                config, max_items=limit, settings=settings, progress_cb=cb))
+        except ValueError as e:
+            flash(str(e), "error")
+            return redirect(url_for("arbitrage"))
+        return redirect(url_for("arbitrage_scan_status", job_id=job.id))
+
+    @app.route("/arbitrage/scan/<job_id>")
+    def arbitrage_scan_status(job_id):
+        job = JOBS.get(job_id)
+        if job is None:
+            abort(404)
+        if request.args.get("format") == "json":
+            return jsonify(job.to_dict())
+        settings = job.report.settings if job.report else None
+        return render_template("arbitrage.html", mode="scan", job=job,
+                               report=job.report, settings=settings,
+                               form=None, query="", category="general", size="60",
+                               **_arbitrage_context())
 
     @app.route("/settings", methods=["GET", "POST"])
     def settings():
@@ -168,6 +258,13 @@ def create_app() -> Flask:
         except (ValueError, TypeError):
             return str(value)
 
+    @app.template_filter("signed_currency")
+    def signed_currency_filter(value):
+        try:
+            return f"¥{int(value):+,}"
+        except (ValueError, TypeError):
+            return "---"
+
     @app.template_filter("currency_float")
     def currency_float_filter(value):
         try:
@@ -182,6 +279,13 @@ def create_app() -> Flask:
             return f"{float(value):.2f}"
         except (ValueError, TypeError):
             return str(value)
+
+    @app.template_filter("pct")
+    def pct_filter(value):
+        try:
+            return f"{float(value):+.1f}%"
+        except (ValueError, TypeError):
+            return "---"
 
     return app
 

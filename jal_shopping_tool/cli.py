@@ -4,9 +4,11 @@
   python -m jal_shopping_tool search "商品名"
   python -m jal_shopping_tool setup
   python -m jal_shopping_tool shops
+  python -m jal_shopping_tool arbitrage [商品名] [--limit N] [--json]
 """
 
 import argparse
+import json
 import sys
 
 from .analyzer import AnalysisResult, analyze
@@ -14,8 +16,16 @@ from .config import Config
 from .jal_shops import get_shops
 from .price_search import search_all_sites
 from .resale_arbitrage import (
-    run_arbitrage_scan, run_single_arbitrage, ARBITRAGE_CANDIDATES,
-    ArbitrageResult, ArbitrageReport,
+    AMAZON_CATEGORY_LABELS,
+    AMAZON_REFERRAL_RATES,
+    ARBITRAGE_CANDIDATES,
+    SIZE_TIERS,
+    ArbitrageReport,
+    ArbitrageResult,
+    FeeSettings,
+    normalize_size,
+    run_arbitrage_scan,
+    run_single_arbitrage,
 )
 
 
@@ -179,155 +189,261 @@ def _print_analysis(analysis: AnalysisResult, config: Config) -> None:
                 print(f"  JALマイレージパーク経由で {ch.lsp_earned:.2f} LSP も獲得できます。")
 
 
+# ===========================================================================
+# 転売アービトラージ
+# ===========================================================================
+_VERDICT_MARK = {
+    "profit": "◎", "breakeven": "○", "near": "△", "loss": "×",
+    "no_sell_data": "?", "below_min": "-", "no_buy_data": "-",
+}
+
+
+def _yen(v) -> str:
+    if v is None:
+        return "---"
+    return f"¥{int(v):,}"
+
+
+def _signed_yen(v) -> str:
+    if v is None:
+        return "---"
+    return f"¥{int(v):+,}"
+
+
+def _build_settings(args: argparse.Namespace, config: Config) -> FeeSettings:
+    overrides = {}
+    if args.min_price is not None:
+        overrides["min_buy_price"] = int(args.min_price)
+    if args.tolerance is not None:
+        overrides["breakeven_tolerance"] = float(args.tolerance) / 100.0
+    if args.no_points:
+        overrides["use_point_rebate"] = False
+    if args.amazon_plan:
+        overrides["amazon_plan"] = args.amazon_plan
+    if args.no_delay:
+        overrides["inter_item_delay"] = 0.0
+    return FeeSettings.from_config(config, **overrides)
+
+
 def cmd_arbitrage(args: argparse.Namespace) -> None:
     """転売アービトラージ検索"""
     config = Config.load()
+    settings = _build_settings(args, config)
+
+    if args.list:
+        _print_candidates()
+        return
 
     if args.query:
-        # 単一商品検索
-        print(f"「{args.query}」のアービトラージ分析中...")
-        print()
-        result = run_single_arbitrage(args.query, config, category=args.category)
-        _print_arbitrage_single(result)
-    else:
-        # 候補リスト全体スキャン
-        max_items = args.limit
-        total = min(max_items, len(ARBITRAGE_CANDIDATES)) if max_items > 0 else len(ARBITRAGE_CANDIDATES)
-        print(f"転売アービトラージスキャン開始（{total}商品）...")
-        print("仕入先: 楽天・Yahoo!ショッピング・コジマネット")
-        print("販売先: Amazon・メルカリ")
-        print("条件: 小型商品、30,000円以上")
+        if not args.json:
+            print(f"「{args.query}」のアービトラージ分析中...")
+            print("  仕入先: 楽天市場 / Yahoo!ショッピング / コジマネット")
+            print("  販売先: Amazon / メルカリ")
+            print()
+        result = run_single_arbitrage(args.query, config, category=args.category,
+                                      size=normalize_size(args.size), settings=settings)
+        if args.json:
+            print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
+        else:
+            _print_arbitrage_single(result, settings)
+        return
+
+    # 候補リスト全体スキャン
+    total = len(ARBITRAGE_CANDIDATES) if args.limit <= 0 else min(args.limit, len(ARBITRAGE_CANDIDATES))
+    if not args.json:
+        print(f"転売アービトラージスキャン開始（{total}商品）")
+        print("  仕入先: 楽天市場 / Yahoo!ショッピング / コジマネット")
+        print("  販売先: Amazon / メルカリ")
+        print(f"  条件: 仕入れ {settings.min_buy_price:,}円以上、"
+              f"許容損失 {settings.breakeven_tolerance * 100:.0f}%、"
+              f"ポイント還元{'込み' if settings.use_point_rebate else '除外'}、"
+              f"Amazon {'小口' if settings.amazon_plan == 'small' else '大口'}出品")
         print()
 
-        report = run_arbitrage_scan(config, max_items=max_items)
+    def _progress(i, n, q, r):
+        if args.json:
+            return
+        if r is None:
+            print(f"  [{i}/{n}] {q} ...", flush=True)
+        else:
+            mark = _VERDICT_MARK.get(r.verdict, "?")
+            if r.buy_price:
+                print(f"        {mark} 仕入 {_yen(r.buy_price)} ({r.best_buy_shop}) "
+                      f"→ {r.best_platform or '-'} 損益 {_signed_yen(r.best_profit)}  [{r.verdict_label}]")
+            else:
+                print(f"        {mark} {r.verdict_label}")
+
+    report = run_arbitrage_scan(config, max_items=args.limit, settings=settings,
+                                progress_cb=_progress)
+    if args.json:
+        print(json.dumps(report.to_dict(), ensure_ascii=False, indent=2))
+    else:
+        print()
         _print_arbitrage_report(report)
 
 
-def _print_arbitrage_single(r: ArbitrageResult) -> None:
+def _print_candidates() -> None:
+    print("=" * 100)
+    print(f" 候補商品リスト（{len(ARBITRAGE_CANDIDATES)}件）")
+    print("=" * 100)
+    print(f"{'#':>3} {'商品':<44} {'カテゴリ':<12} {'サイズ':<8} 備考")
+    print("-" * 100)
+    for i, c in enumerate(ARBITRAGE_CANDIDATES, 1):
+        flag = " [Amazon要承認]" if c.amazon_restricted else ""
+        print(f"{i:>3} {c.query:<44} {AMAZON_CATEGORY_LABELS.get(c.category, c.category):<12} "
+              f"{c.size:<8} {c.note}{flag}")
+    print()
+    print("サイズ区分と配送料目安:")
+    for key, tier in SIZE_TIERS.items():
+        print(f"  {key:<8} {tier['label']:<28} メルカリ便 ¥{tier['mercari']:,} / Amazon自己発送 ¥{tier['amazon']:,}")
+
+
+def _print_fee_block(pr, result: ArbitrageResult) -> None:
+    q = pr.quote
+    print(f"  【{pr.platform}】")
+    if not q.price:
+        print(f"    相場取得不可: {q.error or '該当商品なし'}")
+        if q.search_url:
+            print(f"    手動確認: {q.search_url}")
+        return
+    print(f"    相場:          {_yen(q.price):>10}  ({q.basis}"
+          f"{f', {q.sample_count}件' if q.sample_count > 1 else ''})")
+    if q.product_name:
+        print(f"    参考商品:      {q.product_name[:60]}")
+    f = pr.fees
+    print(f"    販売手数料:    {('-' + _yen(f.commission)):>10}  ({f.rate_label})")
+    if f.closing_fee:
+        label = "基本成約料" if pr.platform == "Amazon" else "振込手数料"
+        print(f"    {label}:    {('-' + _yen(f.closing_fee)):>10}")
+    print(f"    配送料:        {('-' + _yen(f.shipping_cost)):>10}  ({f.shipping_label})")
+    if f.packaging_cost:
+        print(f"    梱包材:        {('-' + _yen(f.packaging_cost)):>10}")
+    print(f"    手取り:        {_yen(f.net_proceeds):>10}")
+    print(f"    損益:          名目 {_signed_yen(pr.profit_nominal)} / "
+          f"ポイント込み {_signed_yen(pr.profit_effective)}")
+    if pr.platform == "Amazon" and result.amazon_restricted:
+        print("    ⚠ Amazon で新品出品するにはブランド承認（出品許可申請）が必要")
+
+
+def _print_arbitrage_single(r: ArbitrageResult, settings: FeeSettings) -> None:
     """単一商品のアービトラージ結果を表示"""
     print("=" * 80)
     print(f" アービトラージ分析: 「{r.query}」")
+    print(f"   カテゴリ: {r.category_label}（Amazon手数料 "
+          f"{AMAZON_REFERRAL_RATES.get(r.category, 0.1) * 100:.0f}%） / サイズ: {r.size_label}")
+    if r.note:
+        print(f"   備考: {r.note}")
     print("=" * 80)
     print()
 
-    # 仕入れ先
-    print("■ 仕入れ先価格")
-    print(f"  {'ショップ':<25} {'価格':>10} {'商品名'}")
-    print("  " + "-" * 75)
-    for name, sp in sorted(r.source_prices.items(), key=lambda x: x[1].price or 999999999):
+    print("■ 仕入れ先（新品最安値）")
+    for sp in r.buy_rows:
         if sp.price:
-            print(f"  {name:<25} ¥{sp.price:>9,} {sp.product_name[:40]}")
+            rate = settings.point_rates.get(sp.shop_name, 0.0)
+            eff = int(round(sp.price * (1 - rate)))
+            mark = "★" if r.best_buy and sp.shop_name == r.best_buy.shop_name else " "
+            print(f"  {mark} {sp.shop_name:<18} {_yen(sp.price):>10}  "
+                  f"(還元{rate * 100:.1f}% → 実質 {_yen(eff)})  {sp.product_name[:40]}")
         else:
-            err = sp.error or "商品なし"
-            print(f"  {name:<25} {'---':>10} ({err})")
+            print(f"    {sp.shop_name:<18} {'---':>10}  ({sp.error or '商品なし'})")
+            if sp.search_url:
+                print(f"      手動確認: {sp.search_url}")
 
-    if r.best_source:
-        print(f"\n  → 最安仕入れ: {r.best_source.shop_name} ¥{r.best_source.price:,}")
-    else:
-        print("\n  → 30,000円以上の仕入れ先なし")
+    if not r.best_buy:
+        print()
+        print("  → 仕入れ価格を取得できませんでした。上記URLで手動確認してください。")
         return
 
     print()
-
-    # 販売先
-    print("■ 販売先分析")
-
-    if r.amazon_price and r.amazon_price.price:
-        print(f"\n  【Amazon】")
-        print(f"    販売価格:   ¥{r.amazon_price.price:,}")
-        if r.amazon_fees:
-            print(f"    販売手数料: ¥{r.amazon_fees.commission:,} ({r.category}カテゴリ)")
-            print(f"    成約料:     ¥{r.amazon_fees.other_fees:,}")
-            print(f"    配送料:     ¥{r.amazon_fees.shipping_cost:,}")
-            print(f"    手取り:     ¥{r.amazon_fees.net_proceeds:,}")
-            print(f"    損益:       ¥{r.amazon_profit:,}")
-    else:
-        print(f"\n  【Amazon】 価格取得不可")
-
-    if r.mercari_price and r.mercari_price.price:
-        print(f"\n  【メルカリ】")
-        print(f"    販売価格:   ¥{r.mercari_price.price:,}")
-        if r.mercari_fees:
-            print(f"    販売手数料: ¥{r.mercari_fees.commission:,} (10%)")
-            print(f"    配送料:     ¥{r.mercari_fees.shipping_cost:,} (宅急便コンパクト)")
-            print(f"    手取り:     ¥{r.mercari_fees.net_proceeds:,}")
-            print(f"    損益:       ¥{r.mercari_profit:,}")
-    else:
-        print(f"\n  【メルカリ】 価格取得不可")
-
+    print(f"  → 最安仕入れ: {r.best_buy_shop} {_yen(r.buy_price)}"
+          f"（ポイント {r.point_rate * 100:.1f}% = {_yen(r.point_rebate)} → 実質 {_yen(r.effective_buy_price)}）")
+    if not r.meets_min_price:
+        print(f"  ※ 条件（{settings.min_buy_price:,}円以上）を満たしていません")
     print()
+
+    print("■ 販売先")
+    for name in ("Amazon", "メルカリ"):
+        pr = r.platforms.get(name)
+        if pr:
+            _print_fee_block(pr, r)
+        else:
+            print(f"  【{name}】 未取得")
+        print()
+
     print("■ 判定")
     print("-" * 80)
-    if r.is_viable:
-        print(f"  ✓ アービトラージ成立！")
-        print(f"    最良販売先: {r.best_platform}")
-        print(f"    損益: ¥{r.best_profit:,}（利益率 {r.profit_rate:+.1f}%）")
-    elif r.best_source_price > 0 and r.best_profit >= -int(r.best_source_price * 0.10):
-        print(f"  △ ほぼ損益分岐（損失{abs(r.best_profit):,}円 = 仕入れ額の{abs(r.profit_rate):.1f}%）")
-        print(f"    最良販売先: {r.best_platform}")
+    basis = "ポイント還元込み" if settings.use_point_rebate else "名目"
+    mark = _VERDICT_MARK.get(r.verdict, "?")
+    if r.best_profit is not None:
+        print(f"  {mark} {r.verdict_label}  最良販売先: {r.best_platform}  "
+              f"損益({basis}): {_signed_yen(r.best_profit)}（{r.profit_rate:+.1f}%）")
+        print(f"     許容損失: 仕入れ額の {settings.breakeven_tolerance * 100:.0f}% 以内を「ほぼ同額」と判定")
     else:
-        loss = abs(r.best_profit) if r.best_profit < 0 else 0
-        print(f"  × アービトラージ不成立（損失 ¥{loss:,}）")
+        print(f"  {mark} {r.verdict_label}")
 
 
 def _print_arbitrage_report(report: ArbitrageReport) -> None:
     """全体レポートを表示"""
-    print("=" * 100)
-    print(f" 転売アービトラージ スキャン結果")
-    print(f" 検索数: {report.total_searched}商品 / 成立: {report.viable_count}商品")
-    print("=" * 100)
+    s = report.settings or FeeSettings()
+    print("=" * 110)
+    print(" 転売アービトラージ スキャン結果")
+    print(f" 検索数: {report.total_searched}商品 / 成立（利益あり+ほぼ同額）: {report.viable_count}商品"
+          f" / 所要 {report.elapsed_seconds:.0f}秒")
+    print("=" * 110)
     print()
 
-    near_breakeven = report.near_breakeven_results
-
-    if near_breakeven:
-        print("■ ほぼ同額で売れる商品（損失5%以内）")
+    viable = report.viable_results
+    if viable:
+        print("■ ほぼ同額以上で売れる商品")
         print()
-        print(f"  {'#':>3} {'商品':<30} {'サイズ':<6} {'仕入価格':>10} {'仕入先':<15} "
-              f"{'販売先':<8} {'手取り':>10} {'損益':>10} {'率':>7}")
-        print("  " + "-" * 115)
-
-        for i, r in enumerate(near_breakeven, 1):
-            sell_net = r.best_profit + r.best_source_price
-            source = r.best_source.shop_name if r.best_source else "---"
-            print(f"  {i:>3} {r.query:<30} {r.size:<6} ¥{r.best_source_price:>9,} "
-                  f"{source:<15} {r.best_platform:<8} ¥{sell_net:>9,} "
-                  f"¥{r.best_profit:>9,} {r.profit_rate:>+6.1f}%")
+        _print_report_table(viable, s)
         print()
 
-    # 全結果サマリ
-    print("■ 全商品サマリ")
-    print()
-    results_with_data = [r for r in report.results if r.best_source_price > 0]
+    analyzed = [r for r in report.ranked_results if r.buy_price > 0 and r not in viable]
+    if analyzed:
+        print("■ その他（仕入れ価格は取得できたが条件を満たさない）")
+        print()
+        _print_report_table(analyzed, s)
+        print()
 
-    if not results_with_data:
-        print("  仕入れ可能な商品が見つかりませんでした。")
-        return
+    missing = [r for r in report.results if r.buy_price == 0]
+    if missing:
+        print("■ 仕入れ価格を取得できなかった商品")
+        for r in missing:
+            errs = ", ".join(f"{n}: {sp.error or '商品なし'}" for n, sp in r.buy_quotes.items())
+            print(f"  - {r.query}  ({errs})")
+        print()
 
-    print(f"  {'#':>3} {'商品':<30} {'仕入価格':>10} {'Amazon損益':>12} {'メルカリ損益':>12} {'判定':<6}")
-    print("  " + "-" * 90)
-
-    for i, r in enumerate(results_with_data, 1):
-        amz = f"¥{r.amazon_profit:,}" if r.amazon_fees else "---"
-        mer = f"¥{r.mercari_profit:,}" if r.mercari_fees else "---"
-        status = "○" if r.is_viable else "△" if r.best_profit >= -int(r.best_source_price * 0.10) else "×"
-        print(f"  {i:>3} {r.query:<30} ¥{r.best_source_price:>9,} {amz:>12} {mer:>12} {status:<6}")
-
-    print()
-    print("  判定: ○=損失5%以内  △=損失5-10%  ×=損失10%超")
+    print("判定: ◎=利益あり ○=ほぼ同額（許容損失内） △=やや損（許容の2倍以内） ×=損失 ?=販売相場なし -=対象外")
+    print(f"判定基準: 仕入れ{'（ポイント還元込み）' if s.use_point_rebate else '（名目）'}に対する損益、"
+          f"許容損失 {s.breakeven_tolerance * 100:.0f}%")
     print()
 
-    # 検索URLの表示
-    print("■ 手動確認用URL（価格は変動するため最新価格をご確認ください）")
-    for r in near_breakeven[:5]:
-        print(f"\n  【{r.query}】")
-        for name, sp in r.source_prices.items():
-            if sp.search_url:
-                print(f"    {name}: {sp.search_url}")
-        if r.amazon_price and r.amazon_price.search_url:
-            print(f"    Amazon: {r.amazon_price.search_url}")
-        if r.mercari_price and r.mercari_price.search_url:
-            print(f"    メルカリ: {r.mercari_price.search_url}")
+    if viable:
+        print("■ 手動確認用URL（価格は変動するため必ず最新価格をご確認ください）")
+        for r in viable[:5]:
+            print(f"\n  【{r.query}】")
+            for sp in r.buy_rows:
+                if sp.search_url:
+                    print(f"    {sp.shop_name}: {sp.search_url}")
+            for name, pr in r.platforms.items():
+                if pr.quote.search_url:
+                    print(f"    {name}: {pr.quote.search_url}")
+
+
+def _print_report_table(rows: list[ArbitrageResult], s: FeeSettings) -> None:
+    print(f"  {'#':>2} {'商品':<40} {'サイズ':<8} {'仕入':>9} {'実質':>9} {'仕入先':<12} "
+          f"{'最良':<7} {'手取り':>9} {'損益':>9} {'率':>7} 判定")
+    print("  " + "-" * 125)
+    for i, r in enumerate(rows, 1):
+        mark = _VERDICT_MARK.get(r.verdict, "?")
+        flag = "†" if r.amazon_restricted and r.best_platform == "Amazon" else ""
+        print(f"  {i:>2} {r.query[:40]:<40} {r.size:<8} {_yen(r.buy_price):>9} "
+              f"{_yen(r.effective_buy_price):>9} {r.best_buy_shop[:12]:<12} "
+              f"{(r.best_platform or '-')[:7]:<7} {_yen(r.best_net_proceeds):>9} "
+              f"{_signed_yen(r.best_profit):>9} {r.profit_rate:>+6.1f}% {mark}{flag}")
+    if any(r.amazon_restricted for r in rows):
+        print("  † Amazon で新品出品するにはブランド承認が必要")
 
 
 def main() -> None:
@@ -347,13 +463,28 @@ def main() -> None:
     subparsers.add_parser("shops", help="JALマイレージパーク掲載ショップ一覧")
 
     # arbitrage
-    arb_parser = subparsers.add_parser("arbitrage", help="転売アービトラージ検索")
-    arb_parser.add_argument("query", nargs="?", default="",
-                            help="検索キーワード（省略時は候補リスト全体をスキャン）")
-    arb_parser.add_argument("--category", default="general",
-                            help="商品カテゴリ（electronics, beauty, game等）")
-    arb_parser.add_argument("--limit", type=int, default=0,
-                            help="最大検索数（0=全件）")
+    arb = subparsers.add_parser(
+        "arbitrage",
+        help="転売アービトラージ検索（楽天/Yahoo/コジマで仕入れ → Amazon/メルカリで販売）")
+    arb.add_argument("query", nargs="?", default="",
+                     help="検索キーワード（省略時は候補リスト全体をスキャン）")
+    arb.add_argument("--category", default="general",
+                     choices=sorted(AMAZON_REFERRAL_RATES.keys()),
+                     help="Amazon手数料カテゴリ（単一商品検索時）")
+    arb.add_argument("--size", default="60",
+                     help="梱包サイズ区分: ネコポス/コンパクト/60/80/100（単一商品検索時）")
+    arb.add_argument("--limit", type=int, default=0, help="スキャン最大件数（0=全件）")
+    arb.add_argument("--min-price", type=int, default=None,
+                     help="対象とする最低仕入れ価格（デフォルト 30000）")
+    arb.add_argument("--tolerance", type=float, default=None,
+                     help="「ほぼ同額」とみなす許容損失率%%（デフォルト 5）")
+    arb.add_argument("--no-points", action="store_true",
+                     help="判定にポイント還元を含めない")
+    arb.add_argument("--amazon-plan", choices=["small", "pro"], default=None,
+                     help="Amazon出品プラン（small=小口 1点100円 / pro=大口 成約料なし）")
+    arb.add_argument("--no-delay", action="store_true", help="商品間の待機を省略")
+    arb.add_argument("--json", action="store_true", help="JSONで出力")
+    arb.add_argument("--list", action="store_true", help="候補商品リストを表示して終了")
 
     args = parser.parse_args()
 

@@ -9,6 +9,7 @@ JALマイレージパーク経由のネットショッピングで獲得でき�
 - JALマイレージパーク経由で購入した場合の獲得マイル・LSPを自動計算
 - LSPの金銭的価値を考慮した「実質価格」で比較
 - 最安値とJALマイレージパーク経由の差額を分析し、購入判断を支援
+- 転売アービトラージ検索: 楽天/Yahoo!/コジマで仕入れ → Amazon/メルカリで販売した場合の損益を手数料込みで試算
 
 ## セットアップ
 
@@ -86,6 +87,53 @@ python -m jal_shopping_tool search "ダイソン 掃除機" -n 20
 
 ```bash
 python -m jal_shopping_tool shops
+```
+
+## 転売アービトラージ検索
+
+楽天市場・Yahoo!ショッピング・コジマネットで仕入れ、Amazon またはメルカリで売った場合に
+「出品手数料・配送料を引いても買値とほぼ同額が返ってくるか」を試算します。
+対象は小型（宅急便コンパクト〜80サイズ）・仕入れ 30,000 円以上の商品です。
+
+```bash
+# 候補リスト（26件）を一括スキャン
+python -m jal_shopping_tool arbitrage
+python -m jal_shopping_tool arbitrage --limit 5            # 先頭5件だけ
+python -m jal_shopping_tool arbitrage --json > result.json # JSON出力
+
+# 単一商品を分析（カテゴリ=Amazon手数料区分、サイズ=梱包区分）
+python -m jal_shopping_tool arbitrage "SONY WF-1000XM5" --category electronics --size コンパクト
+
+# 判定条件の変更
+python -m jal_shopping_tool arbitrage --min-price 50000 --tolerance 3 --no-points --amazon-plan pro
+
+# 候補リストと配送料区分を表示
+python -m jal_shopping_tool arbitrage --list
+```
+
+Web 版は `http://localhost:5000/arbitrage` から。一括スキャンはバックグラウンドで実行され、
+進捗ページが 5 秒ごとに更新されます（`?format=json` で JSON 取得可）。
+
+### 試算モデル
+
+| 項目 | 内容 |
+|------|------|
+| 仕入れ価格 | 各ショップ検索結果の新品最安値。ポイント還元（設定画面の楽天/Yahoo!率、コジマ 1%）を引いた「実質仕入れ」も算出 |
+| Amazon 相場 | 検索結果の新品最安値（＝自分が合わせる必要のある価格） |
+| Amazon 手数料 | カテゴリ別 8〜15%（税抜）＋消費税 10%、小口出品は基本成約料 100 円/点、自己発送の配送料目安、梱包材 80 円 |
+| メルカリ相場 | 「売り切れ × 新品、未使用」の直近出品の中央値を優先。取れなければ出品中の新品最安値 |
+| メルカリ手数料 | 10%、らくらくメルカリ便（ネコポス 210 / コンパクト 520 / 60サイズ 750 / 80サイズ 850 / 100サイズ 1,050 円）、梱包材 80 円 |
+| 判定 | 利益あり ◎ / ほぼ同額 ○（損失が仕入れ額の 5% 以内） / やや損 △（10% 以内） / 損失 × 。販売相場が取れない商品は「成立」に含めない |
+
+- メルカリは JavaScript 描画のため、通常の HTTP 取得で相場が取れない場合は Playwright（`pip install playwright && playwright install chromium`）で描画します。未導入時は手動確認用 URL を表示します。
+- 手数料率・配送料は 2025〜2026 年時点の公開情報に基づく目安です。`FeeSettings` または CLI オプションで変更できます。
+- Apple 製品など一部ブランドは Amazon で新品出品にブランド承認が必要です。営利目的で継続的に転売する場合は古物商許可が必要になることがあります。酒類・医薬品・チケット等は別途規制があります。
+
+### テスト
+
+```bash
+pip install pytest
+python -m pytest tests
 ```
 
 ## LSP（Life Status Points）について

@@ -485,12 +485,17 @@ def _soup(resp: requests.Response) -> BeautifulSoup:
         return BeautifulSoup(html, "html.parser")
 
 
-def _is_relevant_product(query: str, product_name: str) -> bool:
+def _is_relevant_product(query: str, product_name: str,
+                         allow_echo: bool = False) -> bool:
     """商品名が検索クエリと関連しているかチェック。
 
     2段階チェック:
     1. キーワードマッチ（過半数一致が必要）
     2. アクセサリ除外（パターンベース — 「充電ケース付き」等の本体記述は除外しない）
+
+    allow_echo=True の場合、クエリとほぼ同一の商品名を「検索結果0件時のエコーバック」
+    とみなして除外する処理をスキップする（メルカリ等、出品者が付けた短いタイトルが
+    クエリと一致しやすい個人出品サイト向け）。
 
     例: query="airpods pro 3"
       OK: 「Apple AirPods Pro 3 ワイヤレスイヤホン MagSafe充電ケース付き」
@@ -529,7 +534,7 @@ def _is_relevant_product(query: str, product_name: str) -> bool:
     _ECHO_STRIP_RE = re.compile(r'[\s　\-/／「」『』【】()（）・、。,.]+')
     _q_normalized = _ECHO_STRIP_RE.sub('', query_lower)
     _n_normalized = _ECHO_STRIP_RE.sub('', name_lower)
-    if _q_normalized and _n_normalized:
+    if _q_normalized and _n_normalized and not allow_echo:
         # 商品名がクエリとほぼ同じ（前後の装飾文字程度の差）→ エコーバック
         if (_n_normalized == _q_normalized
                 # 商品名がクエリの先頭部分+少しだけ余分

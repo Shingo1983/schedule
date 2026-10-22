@@ -16,6 +16,8 @@ dependencies = [
 
 [project.optional-dependencies]
 pdf = ["pdfplumber>=0.10"]
+browser = ["playwright>=1.45"]
+dev = ["pytest>=8.0"]
 
 [project.scripts]
 jal-shop = "jal_shopping_tool.cli:main"

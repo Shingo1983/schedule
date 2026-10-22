@@ -34,12 +34,12 @@ exit /b 1
 :python_ok
 echo [OK] Python found
 echo.
-python -c "import flask" >nul 2>&1
+python -c "import flask, requests, bs4, lxml" >nul 2>&1
 if not errorlevel 1 goto :flask_ok
 echo Installing required packages (first time only)...
 echo This may take 30-60 seconds...
 echo.
-pip install requests flask
+pip install -r requirements.txt
 if not errorlevel 1 goto :install_ok
 echo.
 echo [ERROR] Package install failed.

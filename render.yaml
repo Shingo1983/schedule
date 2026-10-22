@@ -17,7 +17,9 @@ services:
 
     # アプリ起動コマンド
     # gunicorn = 本番用Webサーバー（start.batの代わり）
-    startCommand: gunicorn wsgi:app --bind 0.0.0.0:$PORT --workers 2 --timeout 300
+    # 転売アービトラージの一括スキャンはプロセス内メモリで進捗を保持するため、
+    # ワーカーは1つにしてスレッドで並行処理する（複数ワーカーだと進捗ページが別プロセスに当たり404になる）
+    startCommand: gunicorn wsgi:app --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 300
 
     # 環境変数（アプリの動作設定）
     envVars:
