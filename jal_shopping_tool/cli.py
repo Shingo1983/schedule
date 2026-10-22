@@ -240,8 +240,10 @@ def cmd_arbitrage(args: argparse.Namespace) -> None:
             print("  仕入先: 楽天市場 / Yahoo!ショッピング / コジマネット")
             print("  販売先: Amazon / メルカリ")
             print()
+        # --category/--size 未指定なら候補リストの設定（なければ汎用）を使う
         result = run_single_arbitrage(args.query, config, category=args.category,
-                                      size=normalize_size(args.size), settings=settings)
+                                      size=normalize_size(args.size) if args.size else None,
+                                      settings=settings)
         if args.json:
             print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
         else:
@@ -442,6 +444,8 @@ def _print_report_table(rows: list[ArbitrageResult], s: FeeSettings) -> None:
               f"{_yen(r.effective_buy_price):>9} {r.best_buy_shop[:12]:<12} "
               f"{(r.best_platform or '-')[:7]:<7} {_yen(r.best_net_proceeds):>9} "
               f"{_signed_yen(r.best_profit):>9} {r.profit_rate:>+6.1f}% {mark}{flag}")
+        if r.verdict == "no_sell_data" and r.sell_error_summary:
+            print(f"     └ {r.sell_error_summary}")
     if any(r.amazon_restricted for r in rows):
         print("  † Amazon で新品出品するにはブランド承認が必要")
 
@@ -468,11 +472,11 @@ def main() -> None:
         help="転売アービトラージ検索（楽天/Yahoo/コジマで仕入れ → Amazon/メルカリで販売）")
     arb.add_argument("query", nargs="?", default="",
                      help="検索キーワード（省略時は候補リスト全体をスキャン）")
-    arb.add_argument("--category", default="general",
+    arb.add_argument("--category", default=None,
                      choices=sorted(AMAZON_REFERRAL_RATES.keys()),
-                     help="Amazon手数料カテゴリ（単一商品検索時）")
-    arb.add_argument("--size", default="60",
-                     help="梱包サイズ区分: ネコポス/コンパクト/60/80/100（単一商品検索時）")
+                     help="Amazon手数料カテゴリ（単一商品検索時。省略時は候補リストの設定か general）")
+    arb.add_argument("--size", default=None,
+                     help="梱包サイズ区分: ネコポス/コンパクト/60/80/100（省略時は候補リストの設定か 60）")
     arb.add_argument("--limit", type=int, default=0, help="スキャン最大件数（0=全件）")
     arb.add_argument("--min-price", type=int, default=None,
                      help="対象とする最低仕入れ価格（デフォルト 30000）")

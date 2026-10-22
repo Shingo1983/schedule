@@ -4,21 +4,41 @@
 
 {% block head %}
 {% if mode == "scan" and job.is_running %}
-<meta http-equiv="refresh" content="5">
+<noscript><meta http-equiv="refresh" content="5"></noscript>
+<script>
+(function () {
+  var url = {{ url_for('arbitrage_scan_status', job_id=job.id, format='json', light='1')|tojson }};
+  var lastDone = {{ job.partial|length }};
+  function tick() {
+    fetch(url, {cache: 'no-store'}).then(function (r) { return r.json(); }).then(function (d) {
+      // 新しい結果行が増えた / 完了した → ページ全体を描き直す。それ以外はバーだけ更新
+      if (d.status !== 'running' || d.done !== lastDone) { location.reload(); return; }
+      var set = function (id, v) { var el = document.getElementById(id); if (el) el.textContent = v; };
+      var bar = document.getElementById('scan-bar'); if (bar) bar.style.width = d.percent + '%';
+      set('scan-pct', d.percent);
+      set('scan-current', d.current_query || '');
+      set('scan-elapsed', Math.round(d.elapsed_seconds));
+      setTimeout(tick, 3000);
+    }).catch(function () { setTimeout(tick, 5000); });
+  }
+  setTimeout(tick, 3000);
+})();
+</script>
 {% endif %}
 {% endblock %}
 
 {% block content %}
 {# ---------- マクロ ---------- #}
 {% macro verdict_badge(r) -%}
-  <span class="badge verdict-{{ r.verdict }}">{{ r.verdict_label }}</span>
+  <span class="badge verdict-{{ r.verdict }}"{% if r.sell_error_summary %} title="{{ r.sell_error_summary }}"{% endif %}>{{ r.verdict_label }}</span>
 {%- endmacro %}
 
-{% macro platform_card(pr, result) -%}
+{% macro platform_card(pr, result, settings) -%}
   {% set q = pr.quote %}
   {% set f = pr.fees %}
   {% set judged = pr.profit_effective if result.judged_on_effective else pr.profit_nominal %}
-  <div class="card platform-card {% if f %}{% if judged >= 0 %}pc-good{% elif judged >= -(result.effective_buy_price * settings.breakeven_tolerance)|int %}pc-ok{% else %}pc-bad{% endif %}{% else %}pc-none{% endif %}">
+  {% set tol = (result.judged_buy_price * settings.breakeven_tolerance)|int %}
+  <div class="card platform-card {% if f %}{% if judged >= 0 %}pc-good{% elif judged >= -tol %}pc-ok{% else %}pc-bad{% endif %}{% else %}pc-none{% endif %}">
     <h4>{{ pr.platform }}
       {% if result.best_platform == pr.platform and f %}<span class="badge badge-best">最良</span>{% endif %}
     </h4>
@@ -34,9 +54,9 @@
       {% if f.packaging_cost %}<tr><td>梱包材</td><td class="text-right">-{{ f.packaging_cost|currency }}</td></tr>{% endif %}
       <tr class="fee-total"><td><strong>手取り</strong></td><td class="text-right"><strong>{{ f.net_proceeds|currency }}</strong></td></tr>
       <tr><td>損益（名目）</td>
-          <td class="text-right {{ 'profit-positive' if pr.profit_nominal >= 0 else 'profit-negative' }}">{{ pr.profit_nominal|signed_currency }}</td></tr>
+          <td class="text-right {{ 'profit-positive' if pr.profit_nominal >= 0 else 'profit-negative' }}">{% if not result.judged_on_effective %}<strong>{% endif %}{{ pr.profit_nominal|signed_currency }}{% if not result.judged_on_effective %}</strong>{% endif %}</td></tr>
       <tr><td>損益（ポイント還元込み）</td>
-          <td class="text-right {{ 'profit-positive' if pr.profit_effective >= 0 else 'profit-negative' }}"><strong>{{ pr.profit_effective|signed_currency }}</strong></td></tr>
+          <td class="text-right {{ 'profit-positive' if pr.profit_effective >= 0 else 'profit-negative' }}">{% if result.judged_on_effective %}<strong>{% endif %}{{ pr.profit_effective|signed_currency }}{% if result.judged_on_effective %}</strong>{% endif %}</td></tr>
     </table>
     {% if q.product_name %}
     <p class="text-small text-muted" style="margin-top:.5rem;">参考: {% if q.product_url %}<a href="{{ q.product_url }}" target="_blank" rel="noopener">{{ q.product_name[:80] }}</a>{% else %}{{ q.product_name[:80] }}{% endif %}</p>
@@ -49,6 +69,17 @@
     {% endif %}
     {% if q.search_url %}<p class="text-small"><a href="{{ q.search_url }}" target="_blank" rel="noopener">{{ pr.platform }}で確認 ↗</a></p>{% endif %}
   </div>
+{%- endmacro %}
+
+{% macro result_link(r, settings) -%}
+  {%- set args = {'q': r.query, 'category': r.category, 'size': r.size} -%}
+  {%- if settings -%}
+    {%- set args = dict(args, submitted=1, min_price=settings.min_buy_price,
+                        tolerance=(settings.breakeven_tolerance * 100)|round(2),
+                        amazon_plan=settings.amazon_plan,
+                        use_points=('1' if settings.use_point_rebate else none)) -%}
+  {%- endif -%}
+  {{ url_for('arbitrage', **args) }}
 {%- endmacro %}
 
 {% macro result_table(rows, settings) -%}
@@ -65,7 +96,7 @@
       <tr class="{% if r.verdict == 'profit' %}effective-best-row{% elif r.verdict == 'breakeven' %}best-row{% endif %}">
         <td>{{ loop.index }}</td>
         <td>
-          <a href="{{ url_for('arbitrage', q=r.query, category=r.category, size=r.size) }}">{{ r.query }}</a>
+          <a href="{{ result_link(r, settings) }}">{{ r.query }}</a>
           {% if r.amazon_restricted %}<span class="badge badge-warn" title="Amazon新品出品に承認が必要">Amazon要承認</span>{% endif %}
           {% if r.note %}<br><span class="text-small text-muted">{{ r.note }}</span>{% endif %}
         </td>
@@ -73,7 +104,7 @@
         <td>{{ r.buy_price|currency if r.buy_price else '---' }}</td>
         <td>{{ r.effective_buy_price|currency if r.buy_price else '---' }}</td>
         <td class="text-small">{{ r.best_buy_shop or '---' }}</td>
-        <td>{{ r.best_platform or '---' }}</td>
+        <td{% if not r.best_platform and r.sell_error_summary %} title="{{ r.sell_error_summary }}"{% endif %}>{{ r.best_platform or '---' }}</td>
         <td>{{ r.best_net_proceeds|currency if r.best_net_proceeds is not none else '---' }}</td>
         <td class="{% if r.best_profit is not none %}{{ 'profit-positive' if r.best_profit >= 0 else 'profit-negative' }}{% endif %}">
           <strong>{{ r.best_profit|signed_currency }}</strong>
@@ -91,7 +122,7 @@
   <input type="hidden" name="submitted" value="1">
   <div class="settings-row">
     <label>最低仕入れ額 <input type="number" name="min_price" value="{{ form.min_price }}" min="0" step="1000" class="input-sm"> 円</label>
-    <label>許容損失 <input type="number" name="tolerance" value="{{ form.tolerance }}" min="0" max="50" step="0.5" class="input-sm"> %</label>
+    <label>許容損失 <input type="number" name="tolerance" value="{{ form.tolerance }}" min="0" max="100" step="0.5" class="input-sm"> %</label>
     <label><input type="checkbox" name="use_points" value="1" {% if form.use_points %}checked{% endif %}> ポイント還元を判定に含める</label>
     <label>Amazon
       <select name="amazon_plan" class="search-select input-sm">
@@ -112,11 +143,13 @@
     <div class="search-row">
       <input type="text" name="q" placeholder="商品名・型番（例: SONY WF-1000XM5）" value="{{ query or '' }}" class="search-input" required>
       <select name="category" class="search-select" title="Amazon販売手数料カテゴリ">
+        <option value="" {% if not category %}selected{% endif %}>カテゴリ: 自動</option>
         {% for key, label, rate in categories %}
         <option value="{{ key }}" {% if category == key %}selected{% endif %}>{{ label }} ({{ rate }}%)</option>
         {% endfor %}
       </select>
       <select name="size" class="search-select" title="梱包サイズ">
+        <option value="" {% if not size %}selected{% endif %}>サイズ: 自動</option>
         {% for key, tier in size_tiers.items() %}
         <option value="{{ key }}" {% if size == key %}selected{% endif %}>{{ tier.label }}</option>
         {% endfor %}
@@ -124,6 +157,7 @@
       <button type="submit" class="btn btn-primary">分析</button>
     </div>
     {{ settings_fields(form) }}
+    <p class="text-small text-muted" style="margin-top:.4rem;">「自動」は候補リストに同名の商品があればその設定、なければ「その他(10%)・60サイズ」で試算します。</p>
   </form>
   {% endif %}
 </div>
@@ -135,7 +169,7 @@
   <p class="text-small text-muted">
     カテゴリ: {{ result.category_label }} / サイズ: {{ result.size_label }}
     {% if result.note %} / {{ result.note }}{% endif %}
-    {% if cached %} / <em>キャッシュ結果（10分以内の再検索）</em>{% endif %}
+    {% if cached %} / <em>キャッシュ結果（直近の再検索）</em>{% endif %}
   </p>
 
   <h3>仕入れ先（新品最安値）</h3>
@@ -148,7 +182,7 @@
         <td>{{ sp.shop_name }}</td>
         <td>{{ sp.price|currency if sp.price else '---' }}</td>
         <td>{{ "%.1f"|format(rate * 100) }}%</td>
-        <td>{{ (sp.price * (1 - rate))|currency if sp.price else '---' }}</td>
+        <td>{{ settings.effective_price(sp.shop_name, sp.price)|currency if sp.price else '---' }}</td>
         <td class="text-small">{% if sp.product_name %}{% if sp.product_url %}<a href="{{ sp.product_url }}" target="_blank" rel="noopener">{{ sp.product_name[:70] }}</a>{% else %}{{ sp.product_name[:70] }}{% endif %}{% else %}<span class="text-muted">{{ sp.error or '商品なし' }}</span>{% endif %}</td>
         <td>{% if sp.search_url %}<a href="{{ sp.search_url }}" target="_blank" rel="noopener">検索 ↗</a>{% endif %}</td>
       </tr>
@@ -158,7 +192,7 @@
 
   {% if result.best_buy %}
   <div class="recommendation" style="margin-top:1rem;">
-    最安仕入れ: <strong>{{ result.best_buy_shop }} {{ result.buy_price|currency }}</strong>
+    最安仕入れ{{ '（ポイント込みで比較）' if result.judged_on_effective else '' }}: <strong>{{ result.best_buy_shop }} {{ result.buy_price|currency }}</strong>
     （ポイント {{ "%.1f"|format(result.point_rate * 100) }}% = {{ result.point_rebate|currency }} → 実質 <strong>{{ result.effective_buy_price|currency }}</strong>）
     {% if not result.meets_min_price %}<br><span class="warn-text">※ 条件（{{ settings.min_buy_price|currency }}以上）を満たしていません</span>{% endif %}
   </div>
@@ -167,7 +201,7 @@
   <div class="platform-grid">
     {% for name in ["Amazon", "メルカリ"] %}
       {% set pr = result.platforms.get(name) %}
-      {% if pr %}{{ platform_card(pr, result) }}{% else %}<div class="card platform-card pc-none"><h4>{{ name }}</h4><p class="text-muted">未取得</p></div>{% endif %}
+      {% if pr %}{{ platform_card(pr, result, settings) }}{% else %}<div class="card platform-card pc-none"><h4>{{ name }}</h4><p class="text-muted">未取得</p></div>{% endif %}
     {% endfor %}
   </div>
 
@@ -178,7 +212,7 @@
        損益（{{ 'ポイント還元込み' if result.judged_on_effective else '名目' }}）: <strong>{{ result.best_profit|signed_currency }}</strong>（{{ result.profit_rate|pct }}）
        <span class="text-small text-muted">許容損失 {{ (settings.breakeven_tolerance * 100)|round(1) }}% 以内を「ほぼ同額」と判定</span></p>
     {% else %}
-    <p>販売相場が取得できなかったため損益を計算できません。上のリンクから手動で相場を確認してください。</p>
+    <p>販売相場が取得できなかったため損益を計算できません{% if result.sell_error_summary %}（{{ result.sell_error_summary }}）{% endif %}。上のリンクから手動で相場を確認してください。</p>
     {% endif %}
   </div>
   {% else %}
@@ -194,9 +228,9 @@
 <section style="margin-top:2rem;">
   {% if job.is_running %}
   <div class="card">
-    <h2>スキャン実行中… {{ job.percent }}%</h2>
-    <div class="progress-bar"><div class="progress-fill" style="width:{{ job.percent }}%"></div></div>
-    <p class="text-small text-muted">{{ job.partial|length }} / {{ job.total }} 件完了 ・ 現在: {{ job.current_query }} ・ 経過 {{ job.elapsed_seconds|round(0)|int }} 秒（5秒ごとに自動更新）</p>
+    <h2>スキャン実行中… <span id="scan-pct">{{ job.percent }}</span>%</h2>
+    <div class="progress-bar"><div class="progress-fill" id="scan-bar" style="width:{{ job.percent }}%"></div></div>
+    <p class="text-small text-muted">{{ job.partial|length }} / {{ job.total }} 件完了 ・ 現在: <span id="scan-current">{{ job.current_query }}</span> ・ 経過 <span id="scan-elapsed">{{ job.elapsed_seconds|round(0)|int }}</span> 秒（自動更新）</p>
     {% if job.partial %}
     <h3 style="margin-top:1rem;">途中結果</h3>
     {{ result_table(job.partial, settings) }}
@@ -225,6 +259,7 @@
   <div class="card" style="margin-top:1rem;">
     <h3>その他（条件を満たさない商品）</h3>
     {{ result_table(others, settings) }}
+    <p class="text-small text-muted">「販売相場 取得不可」の行は判定バッジにカーソルを合わせると理由が表示されます。</p>
   </div>
   {% endif %}
 
@@ -234,7 +269,7 @@
     <h3>仕入れ価格を取得できなかった商品</h3>
     <ul class="text-small">
       {% for r in missing %}
-      <li><a href="{{ url_for('arbitrage', q=r.query, category=r.category, size=r.size) }}">{{ r.query }}</a>
+      <li><a href="{{ result_link(r, settings) }}">{{ r.query }}</a>
         <span class="text-muted">— {% for n, sp in r.buy_quotes.items() %}{{ n }}: {{ sp.error or '商品なし' }}{{ ", " if not loop.last }}{% endfor %}</span></li>
       {% endfor %}
     </ul>
@@ -280,7 +315,7 @@
         <td><span class="badge">{{ c.to_dict().category_label }}</span></td>
         <td><span class="badge badge-size">{{ c.size }}</span></td>
         <td class="text-small">{{ c.note }}</td>
-        <td><a href="{{ url_for('arbitrage', q=c.query, category=c.category, size=c.size) }}" class="btn btn-small">分析</a></td>
+        <td><a href="{{ result_link(c, settings) }}" class="btn btn-small">分析</a></td>
       </tr>
       {% endfor %}
     </tbody>
@@ -297,7 +332,7 @@
       <h4>仕入れ側</h4>
       <ul class="text-small">
         <li>各ショップの検索結果の新品最安値を採用（出品者・在庫は要確認）</li>
-        <li>ポイント還元率は設定画面の値（楽天 / Yahoo!）とコジマ 1% を使用</li>
+        <li>ポイント還元率は設定画面の値（楽天 / Yahoo!）とコジマ 1% を使用。「ポイント還元を判定に含める」時は実質価格が最も安い店を仕入れ先に選ぶ</li>
       </ul>
       <h4 style="margin-top:.75rem;">Amazon（自己発送）</h4>
       <ul class="text-small">
@@ -310,7 +345,7 @@
     <div>
       <h4>メルカリ</h4>
       <ul class="text-small">
-        <li>相場: 「売り切れ × 新品、未使用」の直近出品の中央値を優先。取得できない場合は出品中の最安値</li>
+        <li>相場: 「売り切れ × 新品、未使用」の直近 12 件の中央値（極端な安値は除外）を優先。取得できない場合は出品中の新品最安値</li>
         <li>販売手数料 10%、らくらくメルカリ便（ネコポス 210円 / コンパクト 520円 / 60サイズ 750円 / 80サイズ 850円 / 100サイズ 1,050円）</li>
         <li>メルカリは JavaScript 描画のため、Playwright 未導入環境では相場が取れないことがあります{% if not has_playwright %}（この環境: 未導入）{% endif %}</li>
       </ul>

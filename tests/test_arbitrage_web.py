@@ -139,6 +139,99 @@ def test_scan_unknown_job_404(client):
     assert client.get("/arbitrage/scan/nope").status_code == 404
 
 
+def test_bad_tolerance_values_do_not_500(client):
+    for bad in ("inf", "nan", "1e400", "-3", "abc"):
+        res = client.get(f"/arbitrage?q=ABC&submitted=1&tolerance={bad}&format=json")
+        assert res.status_code == 200, bad
+    res = client.get("/arbitrage?q=ABC&submitted=1&tolerance=inf")
+    assert res.status_code == 200
+    assert 'name="tolerance" value="5"' in res.get_data(as_text=True)   # 丸めた値を表示
+
+
+def test_auto_category_uses_candidate_and_explicit_overrides(client):
+    c = ra.ARBITRAGE_CANDIDATES[0]
+    data = client.get(f"/arbitrage?q={c.query}&format=json").get_json()
+    assert data["category"] == c.category and data["size"] == c.size
+    data2 = client.get(f"/arbitrage?q={c.query}&category=watch&size=80&format=json").get_json()
+    assert data2["category"] == "watch" and data2["size"] == "80"
+
+
+def test_scan_row_links_carry_settings(client, monkeypatch):
+    s = ra.FeeSettings(point_rates={"楽天市場": 0.1}, min_buy_price=45000,
+                       breakeven_tolerance=0.03, use_point_rebate=False, amazon_plan="pro")
+    rep = ra.ArbitrageReport(results=[_make_result("ITEM", settings=s)], total_searched=1,
+                             settings=s, started_at=1.0, finished_at=2.0)
+    job = jobs.ScanJob(id="j1", status="done", total=1, report=rep, settings=s)
+    app_module.JOBS._jobs["j1"] = job
+    body = client.get("/arbitrage/scan/j1").get_data(as_text=True)
+    assert "min_price=45000" in body and "tolerance=3" in body and "amazon_plan=pro" in body
+    assert "use_points=" not in body            # ポイント除外 → パラメータを付けない
+    # 実行中ページは job.settings を使う（report はまだ無い）
+    running = jobs.ScanJob(id="j2", status="running", total=3, index=2, current_query="X",
+                           partial=[_make_result("ITEM2", settings=s)], settings=s)
+    app_module.JOBS._jobs["j2"] = running
+    body2 = client.get("/arbitrage/scan/j2").get_data(as_text=True)
+    assert "min_price=45000" in body2 and "scan-bar" in body2
+    light = client.get("/arbitrage/scan/j2?format=json&light=1").get_json()
+    assert light["done"] == 1 and "partial" not in light and "report" not in light
+
+
+def test_error_results_cached_briefly(client, monkeypatch):
+    calls = []
+
+    def flaky(q, cfg, category="general", size="60", settings=None):
+        calls.append(q)
+        return ra.evaluate(ra.ArbitrageResult(query=q), ra.FeeSettings())   # 仕入れ取得不可
+    monkeypatch.setattr(app_module, "run_single_arbitrage", flaky)
+    monkeypatch.setattr(jobs.time, "time", lambda: 1000.0)
+    client.get("/arbitrage?q=FLAKY&format=json")
+    client.get("/arbitrage?q=FLAKY&format=json")
+    assert len(calls) == 1                       # 直後はキャッシュ
+    monkeypatch.setattr(jobs.time, "time", lambda: 1000.0 + 61)
+    client.get("/arbitrage?q=FLAKY&format=json")
+    assert len(calls) == 2                       # 60秒後には再試行できる
+
+
+def test_job_manager_rejects_concurrent_starts_atomically():
+    mgr = jobs.JobManager(max_concurrent=1)
+    gate = threading.Event()
+
+    def runner(cb):
+        gate.wait(5)
+        return ra.ArbitrageReport()
+
+    barrier = threading.Barrier(8)
+    outcomes = []
+
+    def try_start():
+        barrier.wait()
+        try:
+            mgr.start(runner)
+            outcomes.append("ok")
+        except ValueError:
+            outcomes.append("rejected")
+
+    threads = [threading.Thread(target=try_start) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert outcomes.count("ok") == 1 and outcomes.count("rejected") == 7
+    gate.set()
+
+
+def test_job_ttl_counts_from_completion():
+    mgr = jobs.JobManager(ttl_seconds=100)
+    old_but_recent = jobs.ScanJob(id="a", status="done", created_at=time.time() - 10_000,
+                                  finished_at=time.time() - 5)
+    long_finished = jobs.ScanJob(id="b", status="done", created_at=time.time() - 10_000,
+                                 finished_at=time.time() - 500)
+    still_running = jobs.ScanJob(id="c", status="running", created_at=time.time() - 10_000)
+    mgr._jobs.update({"a": old_but_recent, "b": long_finished, "c": still_running})
+    mgr._cleanup()
+    assert set(mgr._jobs) == {"a", "c"}
+
+
 def test_job_manager_error_and_cleanup():
     mgr = jobs.JobManager(ttl_seconds=0)
 
@@ -155,8 +248,10 @@ def test_job_manager_error_and_cleanup():
     assert mgr.get(job.id) is None
 
 
-def test_result_cache_ttl_and_eviction():
-    cache = jobs.ResultCache(ttl_seconds=0, max_entries=1)
+def test_result_cache_ttl_and_eviction(monkeypatch):
+    now = [1000.0]
+    monkeypatch.setattr(jobs.time, "time", lambda: now[0])
+    cache = jobs.ResultCache(ttl_seconds=10, max_entries=1)
     s = ra.FeeSettings()
     k1 = jobs.ResultCache.make_key("A", "general", "60", s)
     k2 = jobs.ResultCache.make_key("a ", "general", "60", s)
@@ -164,8 +259,15 @@ def test_result_cache_ttl_and_eviction():
     assert k1 != jobs.ResultCache.make_key("A", "general", "80", s)
     r = ra.ArbitrageResult(query="A")
     cache.put(k1, r)
-    assert cache.get(k1) is None                       # TTL 0 → 即失効
+    assert cache.get(k1) is r
+    now[0] += 11
+    assert cache.get(k1) is None                       # TTL 経過で失効
+    cache.put("x", r, ttl_seconds=1)                   # エントリ個別 TTL
+    now[0] += 2
+    assert cache.get("x") is None
     cache2 = jobs.ResultCache(ttl_seconds=100, max_entries=1)
     cache2.put("x", r)
     cache2.put("y", r)
     assert cache2.get("x") is None and cache2.get("y") is r
+    cache2.put("y", r)                                 # 既存キーの上書きは追い出しを起こさない
+    assert cache2.get("y") is r

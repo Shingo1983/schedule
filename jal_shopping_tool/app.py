@@ -17,6 +17,7 @@ from .resale_arbitrage import (
     SIZE_TIERS,
     FeeSettings,
     normalize_size,
+    resolve_candidate_meta,
     run_arbitrage_scan,
     run_single_arbitrage,
 )
@@ -24,34 +25,45 @@ from .site_scrapers import get_manual_search_shops, SCRAPER_SHOP_NAMES, _HAS_CLO
 
 
 def _arbitrage_settings(config: Config, args) -> tuple[FeeSettings, dict]:
-    """クエリ/フォームの値から FeeSettings を構築。表示用のフォーム値も返す"""
+    """クエリ/フォームの値から FeeSettings を構築。表示用のフォーム値も返す
+
+    値の妥当性チェック（inf/nan/範囲外）は FeeSettings.__post_init__ に集約し、
+    フォームには丸めた後の値を返す（入力と表示が食い違わないように）。
+    """
     overrides = {}
-    form = {
-        "min_price": 30000,
-        "tolerance": 5,
-        "use_points": True,
-        "amazon_plan": "small",
-    }
     v = (args.get("min_price") or "").strip()
     if v.isdigit():
-        form["min_price"] = int(v)
-        overrides["min_buy_price"] = int(v)
+        overrides["min_buy_price"] = int(v[:9])
     v = (args.get("tolerance") or "").strip()
-    try:
-        if v:
-            form["tolerance"] = float(v)
-            overrides["breakeven_tolerance"] = max(0.0, float(v)) / 100.0
-    except ValueError:
-        pass
+    if v:
+        try:
+            overrides["breakeven_tolerance"] = float(v) / 100.0
+        except ValueError:
+            pass
     # チェックボックスは「フォームが送信されたか」で判断（submitted=1 を hidden で付ける）
     if args.get("submitted"):
-        form["use_points"] = bool(args.get("use_points"))
-        overrides["use_point_rebate"] = form["use_points"]
+        overrides["use_point_rebate"] = bool(args.get("use_points"))
     plan = (args.get("amazon_plan") or "").strip()
     if plan in ("small", "pro"):
-        form["amazon_plan"] = plan
         overrides["amazon_plan"] = plan
-    return FeeSettings.from_config(config, **overrides), form
+    settings = FeeSettings.from_config(config, **overrides)
+    tol = round(settings.breakeven_tolerance * 100, 2)
+    form = {
+        "min_price": settings.min_buy_price,
+        "tolerance": int(tol) if tol == int(tol) else tol,
+        "use_points": settings.use_point_rebate,
+        "amazon_plan": settings.amazon_plan,
+    }
+    return settings, form
+
+
+def _has_fetch_errors(result) -> bool:
+    """一時的な取得失敗を含む結果か（キャッシュ期間を短くする判断用）"""
+    if result.best_buy is None:
+        return True
+    if any(sp.error for sp in result.buy_quotes.values()):
+        return True
+    return any(pr.quote.error for pr in result.platforms.values())
 
 
 def create_app() -> Flask:
@@ -158,23 +170,26 @@ def create_app() -> Flask:
         config = Config.load()
         settings, form = _arbitrage_settings(config, request.args)
         query = request.args.get("q", "").strip()
-        category = request.args.get("category", "general").strip()
-        if category not in AMAZON_REFERRAL_RATES:
-            category = "general"
-        size = normalize_size(request.args.get("size", "60"))
+        # 空/不正 = 「自動」（候補リストに同名があればその設定、なければ汎用）
+        category_in = request.args.get("category", "").strip()
+        category = category_in if category_in in AMAZON_REFERRAL_RATES else ""
+        size_in = request.args.get("size", "").strip()
+        size = normalize_size(size_in) if size_in else ""
 
         if not query:
             return render_template("arbitrage.html", mode="index", form=form,
                                    settings=settings, query="", category=category,
                                    size=size, **_arbitrage_context())
 
-        key = ResultCache.make_key(query, category, size, settings)
+        cat, sz, _note, _restricted = resolve_candidate_meta(query, category or None, size or None)
+        key = ResultCache.make_key(query, cat, sz, settings)
         result = CACHE.get(key)
         cached = result is not None
         if result is None:
-            result = run_single_arbitrage(query, config, category=category, size=size,
+            result = run_single_arbitrage(query, config, category=cat, size=sz,
                                           settings=settings)
-            CACHE.put(key, result)
+            # 取得失敗を含む結果は短時間だけキャッシュ（連打防止）し、すぐ再試行できるようにする
+            CACHE.put(key, result, ttl_seconds=60 if _has_fetch_errors(result) else None)
 
         if request.args.get("format") == "json":
             return jsonify(result.to_dict())
@@ -189,12 +204,13 @@ def create_app() -> Flask:
         config = Config.load()
         settings, _ = _arbitrage_settings(config, request.form)
         try:
-            limit = int(request.form.get("limit", "0"))
+            limit = max(0, int(request.form.get("limit", "0")))
         except ValueError:
             limit = 0
         try:
             job = JOBS.start(lambda cb: run_arbitrage_scan(
-                config, max_items=limit, settings=settings, progress_cb=cb))
+                config, max_items=limit, settings=settings, progress_cb=cb),
+                settings=settings)
         except ValueError as e:
             flash(str(e), "error")
             return redirect(url_for("arbitrage"))
@@ -206,11 +222,12 @@ def create_app() -> Flask:
         if job is None:
             abort(404)
         if request.args.get("format") == "json":
-            return jsonify(job.to_dict())
-        settings = job.report.settings if job.report else None
+            # light=1 は進捗バー更新用（結果本体を含めない）
+            return jsonify(job.to_dict(include_results=request.args.get("light") != "1"))
+        settings = job.report.settings if job.report else job.settings
         return render_template("arbitrage.html", mode="scan", job=job,
                                report=job.report, settings=settings,
-                               form=None, query="", category="general", size="60",
+                               form=None, query="", category="", size="",
                                **_arbitrage_context())
 
     @app.route("/settings", methods=["GET", "POST"])

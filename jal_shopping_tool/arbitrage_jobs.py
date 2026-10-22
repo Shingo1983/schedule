@@ -34,6 +34,7 @@ class ScanJob:
     partial: list[ArbitrageResult] = field(default_factory=list)
     report: ArbitrageReport | None = None
     error: str = ""
+    settings: FeeSettings | None = None
 
     @property
     def is_running(self) -> bool:
@@ -57,6 +58,7 @@ class ScanJob:
             "status": self.status,
             "index": self.index,
             "total": self.total,
+            "done": len(self.partial),
             "current_query": self.current_query,
             "percent": self.percent,
             "elapsed_seconds": round(self.elapsed_seconds, 1),
@@ -81,16 +83,23 @@ class JobManager:
 
     def running_count(self) -> int:
         with self._lock:
-            return sum(1 for j in self._jobs.values() if j.is_running)
+            return self._running_count_locked()
 
-    def start(self, runner: Callable[[ProgressCallback], ArbitrageReport]) -> ScanJob:
-        """runner(progress_cb) を別スレッドで実行する。同時実行数を超えると ValueError"""
-        self._cleanup()
-        if self.running_count() >= self._max_concurrent:
-            raise ValueError("別のスキャンが実行中です。完了後に再度お試しください。")
+    def _running_count_locked(self) -> int:
+        return sum(1 for j in self._jobs.values() if j.is_running)
 
-        job = ScanJob(id=uuid.uuid4().hex[:12])
+    def start(self, runner: Callable[[ProgressCallback], ArbitrageReport],
+              settings: FeeSettings | None = None) -> ScanJob:
+        """runner(progress_cb) を別スレッドで実行する。同時実行数を超えると ValueError
+
+        古いジョブの掃除・実行中カウント・登録を1つのロック内で行い、
+        同時に押された複数リクエストがすり抜けないようにする。
+        """
+        job = ScanJob(id=uuid.uuid4().hex[:12], settings=settings)
         with self._lock:
+            self._cleanup_locked()
+            if self._running_count_locked() >= self._max_concurrent:
+                raise ValueError("別のスキャンが実行中です。完了後に再度お試しください。")
             self._jobs[job.id] = job
 
         def _progress(index: int, total: int, query: str, result: ArbitrageResult | None):
@@ -116,12 +125,17 @@ class JobManager:
             return self._jobs.get(job_id)
 
     def _cleanup(self) -> None:
-        now = time.time()
         with self._lock:
-            stale = [jid for jid, j in self._jobs.items()
-                     if not j.is_running and now - j.created_at > self._ttl]
-            for jid in stale:
-                del self._jobs[jid]
+            self._cleanup_locked()
+
+    def _cleanup_locked(self) -> None:
+        """完了してから TTL を過ぎたジョブを捨てる（実行中・完了直後は残す）"""
+        now = time.time()
+        stale = [jid for jid, j in self._jobs.items()
+                 if not j.is_running and j.finished_at
+                 and now - j.finished_at > self._ttl]
+        for jid in stale:
+            del self._jobs[jid]
 
 
 class ResultCache:
@@ -144,18 +158,20 @@ class ResultCache:
             hit = self._data.get(key)
             if not hit:
                 return None
-            ts, value = hit
-            if time.time() - ts > self._ttl:
+            expires_at, value = hit
+            if time.time() > expires_at:
                 del self._data[key]
                 return None
             return value
 
-    def put(self, key: str, value: ArbitrageResult) -> None:
+    def put(self, key: str, value: ArbitrageResult, ttl_seconds: float | None = None) -> None:
+        """ttl_seconds を指定するとそのエントリだけ短い/長い有効期限にできる"""
+        ttl = self._ttl if ttl_seconds is None else ttl_seconds
         with self._lock:
-            if len(self._data) >= self._max:
+            if len(self._data) >= self._max and key not in self._data:
                 oldest = min(self._data.items(), key=lambda kv: kv[1][0])[0]
                 del self._data[oldest]
-            self._data[key] = (time.time(), value)
+            self._data[key] = (time.time() + ttl, value)
 
 
 JOBS = JobManager()

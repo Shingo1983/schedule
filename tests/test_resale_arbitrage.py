@@ -92,6 +92,55 @@ def test_best_buy_is_global_minimum_even_if_below_threshold():
     assert r.verdict == "below_min"
 
 
+def test_best_buy_uses_effective_price_when_points_count():
+    # 楽天 1% vs Yahoo 7.5%: 名目は楽天が安いが実質は Yahoo が安い
+    s = ra.FeeSettings(point_rates={"楽天市場": 0.01, "Yahoo!ショッピング": 0.075})
+    r = _result({"楽天市場": 40000, "Yahoo!ショッピング": 40500}, amazon=43000)
+    ra.evaluate(r, s)
+    assert r.best_buy_shop == "Yahoo!ショッピング"
+    assert r.effective_buy_price == 40500 - 3038
+    assert r.verdict == "profit"
+    # ポイントを見ないなら名目最安の楽天
+    s2 = ra.FeeSettings(point_rates=s.point_rates, use_point_rebate=False)
+    ra.evaluate(r, s2)
+    assert r.best_buy_shop == "楽天市場"
+    assert r.meets_min_price is True
+
+
+def test_fee_settings_sanitize_inputs():
+    s = ra.FeeSettings(breakeven_tolerance=float("inf"), min_buy_price=-5, amazon_plan="x",
+                       point_rates={"a": "oops", "b": 2.0, "c": float("nan")})
+    assert s.breakeven_tolerance == 0.05
+    assert s.min_buy_price == 0
+    assert s.amazon_plan == "small"
+    assert s.point_rates == {"b": 1.0}
+    assert ra.FeeSettings(breakeven_tolerance=float("nan")).breakeven_tolerance == 0.05
+    assert ra.FeeSettings(breakeven_tolerance=5).breakeven_tolerance == 1.0
+    # inf でも判定が落ちない
+    r = _result({"楽天市場": 40000}, amazon=38000)
+    ra.evaluate(r, ra.FeeSettings(breakeven_tolerance=float("inf")))
+    assert r.verdict in ra.VERDICT_LABELS
+
+
+def test_below_min_resets_stale_best_platform():
+    s = _settings(min_buy_price=50000)
+    r = _result({"楽天市場": 40000}, amazon=46000)
+    ra.evaluate(r, s)
+    assert r.verdict == "below_min" and r.best_platform == "Amazon"
+    r.platforms["Amazon"].quote.price = None      # 相場が消えた状態で再評価
+    ra.evaluate(r, s)
+    assert r.best_platform == "" and r.best_profit is None and r.best_net_proceeds is None
+
+
+def test_resolve_candidate_meta_prefers_explicit_values():
+    c = ra.ARBITRAGE_CANDIDATES[0]
+    assert ra.resolve_candidate_meta(c.query) == (c.category, c.size, c.note, c.amazon_restricted)
+    cat, sz, note, restricted = ra.resolve_candidate_meta(c.query, "watch", "80")
+    assert (cat, sz) == ("watch", "80") and note == c.note and restricted == c.amazon_restricted
+    assert ra.resolve_candidate_meta("unknown item") == ("general", ra.DEFAULT_SIZE_TIER, "", False)
+    assert ra.resolve_candidate_meta("unknown item", "bogus", "超小型")[:2] == ("general", "コンパクト")
+
+
 def test_no_sell_data_is_not_viable():
     # 以前のバグ: 販売相場なしでも profit=0 扱いで「ほぼ同額」判定になっていた
     r = _result({"楽天市場": 40000}, amazon=None, mercari=None)
@@ -331,6 +380,16 @@ def test_fetch_mercari_quote_prefers_sold_median(monkeypatch):
     assert "status=sold_out" in q.search_url
 
 
+def _fake_browser(render_fn=None, reason=None):
+    """_browser_session の差し替え用コンテキストマネージャを作る"""
+    import contextlib
+
+    @contextlib.contextmanager
+    def _session():
+        yield (render_fn, reason) if render_fn else (None, reason or "Playwright未導入")
+    return _session
+
+
 def test_fetch_mercari_quote_falls_back_to_on_sale_then_manual(monkeypatch):
     class Resp:
         status_code = 200
@@ -339,18 +398,93 @@ def test_fetch_mercari_quote_falls_back_to_on_sale_then_manual(monkeypatch):
         content = text.encode("utf-8")
 
     monkeypatch.setattr(ra, "_fetch", lambda url, **kw: Resp())
-    monkeypatch.setattr(ra, "_render_html_with_browser", lambda url, sels, **kw: None)
+    monkeypatch.setattr(ra, "_browser_session", _fake_browser(reason="Playwright未導入"))
     q = ra.fetch_mercari_quote("X")
     assert q.price is None
-    assert "ブラウザ" in (q.error or "")
+    assert "要ブラウザ描画" in (q.error or "") and "Playwright未導入" in q.error
 
-    # ブラウザ描画で出品中が取れるケース
+    # 起動失敗は「未導入」と区別して表示する
+    monkeypatch.setattr(ra, "_browser_session",
+                        _fake_browser(reason="ブラウザ起動失敗（playwright install chromium が必要）"))
+    assert "起動失敗" in ra.fetch_mercari_quote("X").error
+
+    # ブラウザ描画で出品中が取れるケース（売り切れページは空）
     rendered = ('<a href="/item/m5"><mer-item-thumbnail item-name="X 新品" price="30000">'
                 '</mer-item-thumbnail></a>')
-    monkeypatch.setattr(ra, "_render_html_with_browser",
-                        lambda url, sels, **kw: rendered if "on_sale" in url else "<html></html>")
+    calls = []
+
+    def render(url, sel, **kw):
+        calls.append(url)
+        return rendered if "on_sale" in url else "<html></html>"
+    monkeypatch.setattr(ra, "_browser_session", _fake_browser(render))
     q2 = ra.fetch_mercari_quote("X")
     assert q2.price == 30000 and q2.basis.startswith("出品中")
+    assert len(calls) == 2            # 1セッションで sold → on_sale の順
+
+    # 描画結果が bot ブロックページなら相場にしない
+    blocked = "<html><body><h1>アクセスが集中しています</h1><p>しばらく時間をおいてから再度アクセスしてください</p></body></html>"
+    monkeypatch.setattr(ra, "_is_bot_blocked_page", lambda soup: "しばらく" in soup.get_text())
+    monkeypatch.setattr(ra, "_browser_session", _fake_browser(lambda url, sel, **kw: blocked))
+    q3 = ra.fetch_mercari_quote("X")
+    assert q3.price is None and "アクセス制限" in q3.error
+
+
+def test_sold_median_uses_most_recent_not_cheapest(monkeypatch):
+    """ページ順（新しい順）の先頭 N 件で中央値を取る。安い順に並べ替えてはいけない"""
+    class Resp:
+        status_code = 200
+        headers = {"Content-Type": "text/html; charset=utf-8"}
+
+        def __init__(self, text):
+            self.text, self.content = text, text.encode("utf-8")
+
+    prices_in_page_order = [60000, 61000, 59000, 20000, 21000, 19000]
+    rows = "".join(
+        f'<a href="/item/m{i}"><mer-item-thumbnail item-name="DJI Osmo Pocket 3 新品" price="{p}"></mer-item-thumbnail></a>'
+        for i, p in enumerate(prices_in_page_order))
+    monkeypatch.setattr(ra, "_fetch", lambda url, **kw: Resp(f"<html><body>{rows}</body></html>"))
+    q = ra.fetch_mercari_quote("DJI Osmo Pocket 3", max_samples=3)
+    assert q.price == 60000
+    assert q.sample_count == 3
+    # 6件全部なら sorted=[19000,20000,21000,59000,60000,61000] → 中央値 40,000
+    # （2万円台は中央値の30%=12,000 を上回るので外れ値扱いにはならない）
+    q2 = ra.fetch_mercari_quote("DJI Osmo Pocket 3", max_samples=6)
+    assert q2.price == 40000 and q2.sample_count == 6
+
+    # 極端な安値（付属品など、中央値の30%未満）は中央値の計算から除外される
+    prices = [60000, 61000, 59000, 5000]
+    rows2 = "".join(
+        f'<a href="/item/m{i}"><mer-item-thumbnail item-name="DJI Osmo Pocket 3 新品" price="{p}"></mer-item-thumbnail></a>'
+        for i, p in enumerate(prices))
+    monkeypatch.setattr(ra, "_fetch", lambda url, **kw: Resp(f"<html><body>{rows2}</body></html>"))
+    q3 = ra.fetch_mercari_quote("DJI Osmo Pocket 3")
+    assert q3.price == 60000 and q3.sample_count == 3
+
+
+def test_mercari_relevance_accepts_brandless_titles():
+    assert ra._mercari_relevant("SONY WF-1000XM5", "WF-1000XM5 ブラック 新品未開封")
+    assert ra._mercari_relevant("SONY WF-1000XM5", "SONY WF-1000XM5")      # クエリと同一でもOK
+    assert ra._mercari_relevant("パナソニック ナノケア EH-NA0J", "ナノケア EH-NA0J ラベンダー 新品")
+    assert not ra._mercari_relevant("SONY WF-1000XM5", "SONY WH-1000XM5 ヘッドホン")
+    assert not ra._mercari_relevant("SONY WF-1000XM5", "WF-1000XM5 用 ケース")
+    # 型番らしい語が無いクエリではブランド抜き再判定をしない（「Pro 3」だけで通さない）
+    assert not ra._mercari_relevant("AirPods Pro 3", "iPhone 17 Pro 3台セット")
+    assert ra._mercari_relevant("AirPods Pro 3", "AirPods Pro 3 新品未開封 MagSafe")
+
+
+def test_parse_mercari_skips_nameless_cells_and_reads_jsonld_offers():
+    html = """
+    <li data-testid="item-cell"><a href="/item/m1"><span class="price">¥35,000</span></a></li>
+    """
+    assert ra._parse_mercari_html(html, "AirPods Pro 3") == []
+    ld = {"@type": "ItemList", "itemListElement": [
+        {"@type": "ListItem", "item": {"@type": "Product", "name": "AirPods Pro 3 新品",
+                                       "offers": {"@type": "Offer", "price": "36800"}}},
+        {"@type": "ListItem", "item": {"@type": "Product", "name": "AirPods Pro 3",
+                                       "offers": [{"@type": "Offer", "lowPrice": 35000}]}},
+    ]}
+    html2 = f'<script type="application/ld+json">{json.dumps(ld, ensure_ascii=False)}</script>'
+    assert sorted(p for p, _, _ in ra._parse_mercari_html(html2, "AirPods Pro 3")) == [35000, 36800]
 
 
 def test_mercari_search_url_params():

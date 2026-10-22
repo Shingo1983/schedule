@@ -21,11 +21,14 @@ from __future__ import annotations
 
 import json
 import logging
+import math
+import re
 import statistics
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass, field, asdict
-from typing import Callable
+from typing import Callable, Iterator
 from urllib.parse import quote, urlencode
 
 from .config import Config
@@ -136,6 +139,32 @@ class FeeSettings:
     packaging_cost: int = 80            # 梱包材（箱・緩衝材）の目安
     inter_item_delay: float = 1.0       # スキャン時の商品間待機秒数（bot検出対策）
 
+    def __post_init__(self):
+        # 外部入力（フォーム/CLI）をそのまま受けるため、ここで必ず妥当な範囲に丸める
+        try:
+            tol = float(self.breakeven_tolerance)
+        except (TypeError, ValueError):
+            tol = 0.05
+        if not math.isfinite(tol):
+            tol = 0.05
+        self.breakeven_tolerance = min(max(tol, 0.0), 1.0)
+        try:
+            self.min_buy_price = max(int(self.min_buy_price), 0)
+        except (TypeError, ValueError, OverflowError):
+            self.min_buy_price = 30000
+        if self.amazon_plan not in ("small", "pro"):
+            self.amazon_plan = "small"
+        self.use_point_rebate = bool(self.use_point_rebate)
+        cleaned: dict[str, float] = {}
+        for k, v in (self.point_rates or {}).items():
+            try:
+                fv = float(v)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(fv):
+                cleaned[k] = min(max(fv, 0.0), 1.0)
+        self.point_rates = cleaned
+
     @classmethod
     def from_config(cls, config: Config, **overrides) -> "FeeSettings":
         settings = cls(**overrides)
@@ -145,7 +174,12 @@ class FeeSettings:
                 "Yahoo!ショッピング": float(config.yahoo_paypay_rate or 0.0),
                 "コジマネット": 0.01,
             }
+            settings.__post_init__()
         return settings
+
+    def effective_price(self, shop_name: str, price: int) -> int:
+        """ポイント還元を差し引いた実質価格"""
+        return int(round(price * (1.0 - self.point_rates.get(shop_name, 0.0))))
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -288,18 +322,31 @@ def mercari_search_url(query: str, sold: bool = True, new_only: bool = True) -> 
     return "https://jp.mercari.com/search?" + urlencode(params)
 
 
+def _price_from_node(node: dict):
+    """商品らしき dict から価格を取り出す（直下の price、または schema.org の offers）"""
+    price = node.get("price")
+    if price is None:
+        offers = node.get("offers")
+        if isinstance(offers, list) and offers:
+            offers = offers[0]
+        if isinstance(offers, dict):
+            price = offers.get("price") or offers.get("lowPrice")
+    if price is None:
+        return 0
+    try:
+        return int(float(str(price).replace(",", "").replace("¥", "")))
+    except ValueError:
+        return 0
+
+
 def _walk_json_for_items(node, out: list[dict], depth: int = 0) -> None:
     """ネストした JSON から {name, price, id} を持つ商品らしき dict を収集"""
     if depth > 12:
         return
     if isinstance(node, dict):
         name = node.get("name") or node.get("itemName")
-        price = node.get("price")
-        if isinstance(name, str) and isinstance(price, (int, float, str)):
-            try:
-                p = int(float(str(price).replace(",", "")))
-            except ValueError:
-                p = 0
+        if isinstance(name, str):
+            p = _price_from_node(node)
             if p > 0:
                 out.append({
                     "name": name,
@@ -314,20 +361,42 @@ def _walk_json_for_items(node, out: list[dict], depth: int = 0) -> None:
             _walk_json_for_items(v, out, depth + 1)
 
 
+_QUERY_SPLIT_RE = re.compile(r'[\s　/／\-]+')          # _is_relevant_product と同じ分割
+_MODEL_TOKEN_RE = re.compile(r'^(?=.*\d)(?=.*[A-Za-z])[A-Za-z0-9]+$')  # 1000XM5, NA0J, 42mm
+
+
+def _mercari_relevant(query: str, name: str) -> bool:
+    """メルカリ出品タイトル向けの関連性判定
+
+    - 個人出品はクエリと一致しやすい短いタイトルが多い → エコーバック検出は無効化
+    - ブランド名を省いたタイトル（例: 「WF-1000XM5 ブラック 新品」）も多いので、
+      先頭語がブランドらしく（英字/かな）、残りに型番らしい語（英数字混在）がある場合は
+      先頭語を除いた条件でも再判定する。「AirPods Pro 3」→「Pro 3」のような
+      緩すぎる再判定は型番条件で防ぐ。
+    """
+    if _is_relevant_product(query, name, allow_echo=True):
+        return True
+    tokens = [t for t in _QUERY_SPLIT_RE.split(query) if t]
+    if (len(tokens) >= 3 and tokens[0].isalpha()
+            and any(_MODEL_TOKEN_RE.match(t) for t in tokens[1:])):
+        return _is_relevant_product(" ".join(tokens[1:]), name, allow_echo=True)
+    return False
+
+
 def _parse_mercari_html(html_or_soup, query: str) -> list[tuple[int, str, str]]:
-    """メルカリ検索ページから (価格, 商品名, URL) を抽出。複数の構造に対応。"""
+    """メルカリ検索ページから (価格, 商品名, URL) をページ掲載順で抽出。複数の構造に対応。"""
     from bs4 import BeautifulSoup
     soup = html_or_soup if isinstance(html_or_soup, BeautifulSoup) \
         else BeautifulSoup(html_or_soup, "lxml")
     found: list[tuple[int, str, str]] = []
 
     def _add(price, name, url):
-        if not price or price < 1000:
+        # 名前が取れない要素は相場サンプルとして信用できないので捨てる
+        if not price or price < 1000 or not name:
             return
-        # 個人出品のタイトルはクエリと一致しやすいのでエコーバック検出は無効化
-        if name and not _is_relevant_product(query, name, allow_echo=True):
+        if not _mercari_relevant(query, name):
             return
-        found.append((int(price), name or "", url or ""))
+        found.append((int(price), name, url or ""))
 
     # 1) Web Components 版: <mer-item-thumbnail item-name="..." price="..." sticker="sold">
     for el in soup.select("mer-item-thumbnail[price]"):
@@ -367,7 +436,7 @@ def _parse_mercari_html(html_or_soup, query: str) -> list[tuple[int, str, str]]:
                 url = f"https://jp.mercari.com/item/{it['id']}" if it["id"].startswith("m") else ""
                 _add(it["price"], it["name"], url)
 
-    # 4) JSON-LD ItemList
+    # 4) JSON-LD（ItemList → Product{name, offers{price}}）
     if not found:
         for script in soup.select('script[type="application/ld+json"]'):
             try:
@@ -379,7 +448,7 @@ def _parse_mercari_html(html_or_soup, query: str) -> list[tuple[int, str, str]]:
             for it in items:
                 _add(it["price"], it["name"], "")
 
-    # 重複除去（URL or 名前+価格）
+    # 重複除去（URL or 名前+価格）。掲載順は保持
     uniq: dict[tuple, tuple[int, str, str]] = {}
     for price, name, url in found:
         key = (url or name, price)
@@ -397,19 +466,31 @@ def _abs_mercari(href: str) -> str:
     return ""
 
 
-def _render_html_with_browser(url: str, wait_selectors: list[str],
-                              timeout_ms: int = 25000) -> str | None:
-    """Playwright でページを描画して HTML を返す（未インストール時は None）"""
+RenderFn = Callable[[str, str], "str | None"]
+
+
+@contextmanager
+def _browser_session() -> Iterator[tuple[RenderFn | None, str | None]]:
+    """Playwright ブラウザを1回だけ起動し、render(url, wait_selector) -> html|None を提供する。
+
+    yield (None, 理由) の場合はブラウザが使えない（未導入 / 起動失敗）。
+    """
     if not _HAS_PLAYWRIGHT:
-        return None
+        yield None, "Playwright未導入"
+        return
     try:
         from playwright.sync_api import sync_playwright
+    except Exception as e:  # noqa: BLE001
+        yield None, f"Playwright読込失敗: {e}"
+        return
+    try:
         with sync_playwright() as pw:
             try:
                 browser = pw.chromium.launch(headless=True, args=["--no-sandbox"])
             except Exception as e:  # noqa: BLE001
                 logger.warning("Playwright launch failed: %s", e)
-                return None
+                yield None, "ブラウザ起動失敗（playwright install chromium が必要）"
+                return
             try:
                 context = browser.new_context(
                     user_agent=_HEADERS["User-Agent"], locale="ja-JP",
@@ -417,28 +498,67 @@ def _render_html_with_browser(url: str, wait_selectors: list[str],
                 )
                 context.add_init_script(
                     "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
-                page = context.new_page()
-                page.goto(url, timeout=timeout_ms, wait_until="domcontentloaded")
-                for sel in wait_selectors:
+
+                def render(url: str, wait_selector: str, timeout_ms: int = 25000) -> str | None:
+                    page = context.new_page()
                     try:
-                        page.wait_for_selector(sel, timeout=8000)
-                        break
-                    except Exception:  # noqa: BLE001
-                        continue
-                try:
-                    page.wait_for_load_state("networkidle", timeout=5000)
-                except Exception:  # noqa: BLE001
-                    pass
-                page.wait_for_timeout(800)
-                return page.content()
+                        page.goto(url, timeout=timeout_ms, wait_until="domcontentloaded")
+                        try:
+                            page.wait_for_selector(wait_selector, timeout=8000)
+                        except Exception:  # noqa: BLE001
+                            pass
+                        try:
+                            page.wait_for_load_state("networkidle", timeout=4000)
+                        except Exception:  # noqa: BLE001
+                            pass
+                        page.wait_for_timeout(500)
+                        return page.content()
+                    except Exception as e:  # noqa: BLE001
+                        logger.warning("Playwright render error (%s): %s", url, e)
+                        return None
+                    finally:
+                        page.close()
+
+                yield render, None
             finally:
                 browser.close()
+    except GeneratorExit:
+        raise
     except Exception as e:  # noqa: BLE001
-        logger.warning("Playwright render error: %s", e)
-        return None
+        logger.warning("Playwright session error: %s", e)
+        yield None, f"ブラウザエラー: {e}"
 
 
-_MERCARI_WAIT_SELECTORS = ['mer-item-thumbnail', '[data-testid="item-cell"]']
+_MERCARI_WAIT_SELECTOR = 'mer-item-thumbnail, [data-testid="item-cell"]'
+
+
+def _quote_from_sold(items: list[tuple[int, str, str]], url: str, max_samples: int) -> SellQuote:
+    """売り切れ一覧（新しい順）から相場を決める: 直近 N 件 → 外れ値除去 → 中央値"""
+    recent = [p for p, _, _ in items][:max_samples]
+    med0 = statistics.median(recent)
+    kept = [p for p in recent if p >= med0 * 0.3] or recent
+    median = int(statistics.median(kept))
+    rep = min(items, key=lambda t: abs(t[0] - median))
+    return SellQuote(
+        platform="メルカリ", price=median, product_name=rep[1], product_url=rep[2],
+        search_url=url, basis="売却済み(新品)中央値",
+        sample_count=len(kept), sample_prices=sorted(kept),
+    )
+
+
+def _quote_from_onsale(items: list[tuple[int, str, str]], url: str, max_samples: int) -> SellQuote:
+    """出品中一覧から相場を決める: 外れ値除去 → 最安値（まだ売れていない価格の下限）"""
+    prices = sorted(p for p, _, _ in items)
+    if len(prices) >= 3:
+        med = prices[len(prices) // 2]
+        prices = [p for p in prices if p >= med * 0.3] or prices
+    low = prices[0]
+    rep = min(items, key=lambda t: abs(t[0] - low))
+    return SellQuote(
+        platform="メルカリ", price=low, product_name=rep[1], product_url=rep[2],
+        search_url=url, basis="出品中(新品)最安値",
+        sample_count=len(prices), sample_prices=prices[:max_samples],
+    )
 
 
 def fetch_mercari_quote(query: str, max_samples: int = 12) -> SellQuote:
@@ -448,63 +568,65 @@ def fetch_mercari_quote(query: str, max_samples: int = 12) -> SellQuote:
       1. 売り切れ × 新品未使用 の直近出品 → 中央値（実際に売れた価格）
       2. 出品中 × 新品未使用 の最安値（まだ売れていないが相場の下限）
     メルカリは JavaScript 描画の SPA なので、通常の HTTP 取得で商品が得られない場合は
-    Playwright（インストール時のみ）で描画する。どちらも不可なら手動確認用 URL を返す。
+    Playwright（インストール時のみ、ブラウザは1回だけ起動）で描画する。
+    どちらも不可なら手動確認用 URL とエラー理由を返す。
     """
     sold_url = mercari_search_url(query, sold=True)
     onsale_url = mercari_search_url(query, sold=False)
+    errors: list[str] = []
 
-    def _get_items(url: str) -> tuple[list[tuple[int, str, str]], str | None]:
+    def _http_items(url: str) -> list[tuple[int, str, str]]:
         try:
             resp = _fetch(url)
         except Exception as e:  # noqa: BLE001
             logger.info("Mercari fetch error: %s", e)
-            return [], "接続エラー"
+            errors.append("接続エラー")
+            return []
         if resp.status_code != 200:
-            return [], f"HTTP {resp.status_code}"
+            errors.append(f"HTTP {resp.status_code}")
+            return []
         soup = _soup(resp)
         if _is_bot_blocked_page(soup):
-            return [], "アクセス制限"
-        items = _parse_mercari_html(soup, query)
-        if items:
-            return items, None
-        # SPA シェルのみ → ブラウザ描画を試す
-        html = _render_html_with_browser(url, _MERCARI_WAIT_SELECTORS)
-        if html:
-            items = _parse_mercari_html(html, query)
+            errors.append("アクセス制限")
+            return []
+        return _parse_mercari_html(soup, query)
+
+    # --- 1. 通常の HTTP 取得 ---
+    items = _http_items(sold_url)
+    if items:
+        return _quote_from_sold(items, sold_url, max_samples)
+    items = _http_items(onsale_url)
+    if items:
+        return _quote_from_onsale(items, onsale_url, max_samples)
+
+    # --- 2. ブラウザ描画（SPA シェルしか返らない場合）---
+    with _browser_session() as (render, unavailable):
+        if render is None:
+            reason = errors[0] if errors else f"要ブラウザ描画（{unavailable}）"
+            return SellQuote(platform="メルカリ", price=None, search_url=sold_url, error=reason)
+        for url, make_quote in ((sold_url, _quote_from_sold), (onsale_url, _quote_from_onsale)):
+            html = render(url, _MERCARI_WAIT_SELECTOR)
+            if not html:
+                errors.append("描画失敗")
+                continue
+            soup = _soup_from_html(html)
+            if _is_bot_blocked_page(soup):
+                errors.append("アクセス制限（ブラウザ）")
+                continue
+            items = _parse_mercari_html(soup, query)
             if items:
-                return items, None
-            return [], None
-        return [], "要ブラウザ描画（Playwright未導入のため手動確認）"
-
-    sold_items, err = _get_items(sold_url)
-    if sold_items:
-        prices = sorted(p for p, _, _ in sold_items)[:max_samples]
-        median = int(statistics.median(prices))
-        # 中央値に最も近い出品を代表として表示
-        rep = min(sold_items, key=lambda t: abs(t[0] - median))
-        return SellQuote(
-            platform="メルカリ", price=median, product_name=rep[1], product_url=rep[2],
-            search_url=sold_url, basis="売却済み(新品)中央値",
-            sample_count=len(prices), sample_prices=prices,
-        )
-
-    onsale_items, err2 = _get_items(onsale_url)
-    if onsale_items:
-        prices = sorted(p for p, _, _ in onsale_items)
-        # 外れ値（中央値の30%未満: 付属品等）を除外
-        if len(prices) >= 3:
-            med = prices[len(prices) // 2]
-            prices = [p for p in prices if p >= med * 0.3] or prices
-        low = prices[0]
-        rep = min(onsale_items, key=lambda t: abs(t[0] - low))
-        return SellQuote(
-            platform="メルカリ", price=low, product_name=rep[1], product_url=rep[2],
-            search_url=onsale_url, basis="出品中(新品)最安値",
-            sample_count=len(prices), sample_prices=prices[:max_samples],
-        )
+                return make_quote(items, url, max_samples)
 
     return SellQuote(platform="メルカリ", price=None, search_url=sold_url,
-                     error=err or err2 or "該当商品なし")
+                     error=errors[0] if errors else "該当商品なし")
+
+
+def _soup_from_html(html: str):
+    from bs4 import BeautifulSoup
+    try:
+        return BeautifulSoup(html, "lxml")
+    except Exception:  # noqa: BLE001
+        return BeautifulSoup(html, "html.parser")
 
 
 # ---------------------------------------------------------------------------
@@ -603,6 +725,24 @@ def find_candidate(query: str) -> Candidate | None:
     return None
 
 
+def resolve_candidate_meta(query: str, category: str | None = None,
+                           size: str | None = None) -> tuple[str, str, str, bool]:
+    """呼び出し側の指定を優先し、未指定（None/空）の項目だけ候補リストから補完する
+
+    Returns: (category, size, note, amazon_restricted)
+    """
+    c = find_candidate(query)
+    if category in AMAZON_REFERRAL_RATES:
+        cat = category
+    else:
+        cat = c.category if c else "general"
+    if size:
+        sz = normalize_size(size)
+    else:
+        sz = c.size if c else DEFAULT_SIZE_TIER
+    return cat, sz, (c.note if c else ""), (c.amazon_restricted if c else False)
+
+
 # ---------------------------------------------------------------------------
 # 分析結果
 # ---------------------------------------------------------------------------
@@ -671,6 +811,11 @@ class ArbitrageResult:
         return self.buy_price - self.point_rebate
 
     @property
+    def judged_buy_price(self) -> int:
+        """判定基準の仕入れ額（ポイント込み or 名目）"""
+        return self.effective_buy_price if self.judged_on_effective else self.buy_price
+
+    @property
     def best_buy_shop(self) -> str:
         return self.best_buy.shop_name if self.best_buy else ""
 
@@ -682,7 +827,7 @@ class ArbitrageResult:
     @property
     def profit_rate(self) -> float:
         """判定基準の仕入れ額に対する損益率（%）"""
-        base = self.effective_buy_price if self.judged_on_effective else self.buy_price
+        base = self.judged_buy_price
         if not base or self.best_profit is None:
             return 0.0
         return self.best_profit / base * 100.0
@@ -690,6 +835,15 @@ class ArbitrageResult:
     @property
     def has_sell_data(self) -> bool:
         return any(p.fees is not None for p in self.platforms.values())
+
+    @property
+    def sell_error_summary(self) -> str:
+        """相場が取れなかった販売先と理由（表示用）"""
+        parts = []
+        for name, pr in self.platforms.items():
+            if not pr.quote.price:
+                parts.append(f"{name}: {pr.quote.error or '該当商品なし'}")
+        return " / ".join(parts)
 
     @property
     def verdict_label(self) -> str:
@@ -745,6 +899,7 @@ class ArbitrageResult:
             "profit_rate": round(self.profit_rate, 2),
             "verdict": self.verdict,
             "verdict_label": self.verdict_label,
+            "sell_error_summary": self.sell_error_summary,
         }
 
 
@@ -839,12 +994,22 @@ def fetch_sell_quotes(query: str, config: Config) -> dict[str, SellQuote]:
 
 
 def evaluate(result: ArbitrageResult, settings: FeeSettings) -> ArbitrageResult:
-    """取得済みの相場から損益・判定を計算する（純粋関数。テスト容易）"""
+    """取得済みの相場から損益・判定を計算する（純粋関数。テスト容易）
+
+    - 最安仕入れ先は判定基準と同じ物差し（ポイント込み or 名目）で選ぶ
+    - 30,000円条件は名目価格で判定する
+    """
     result.judged_on_effective = settings.use_point_rebate
 
     # --- 仕入れ ---
     priced = [sp for sp in result.buy_quotes.values() if sp.price]
-    result.best_buy = min(priced, key=lambda sp: sp.price) if priced else None
+
+    def _buy_key(sp: ShopPrice):
+        judged = settings.effective_price(sp.shop_name, sp.price) \
+            if settings.use_point_rebate else sp.price
+        return (judged, sp.price)
+
+    result.best_buy = min(priced, key=_buy_key) if priced else None
     if not result.best_buy:
         result.verdict = "no_buy_data"
         result.best_platform, result.best_profit = "", None
@@ -869,19 +1034,16 @@ def evaluate(result: ArbitrageResult, settings: FeeSettings) -> ArbitrageResult:
         if best is None or judged > best[1]:
             best = (name, judged)
 
+    result.best_platform, result.best_profit = best if best else ("", None)
+
     if not result.meets_min_price:
         result.verdict = "below_min"
-        if best:
-            result.best_platform, result.best_profit = best
         return result
-
     if best is None:
         result.verdict = "no_sell_data"
-        result.best_platform, result.best_profit = "", None
         return result
 
-    result.best_platform, result.best_profit = best
-    base = result.effective_buy_price if settings.use_point_rebate else result.buy_price
+    base = result.judged_buy_price
     tol = int(base * settings.breakeven_tolerance)
     if result.best_profit >= 0:
         result.verdict = "profit"
@@ -973,12 +1135,14 @@ def run_arbitrage_scan(config: Config,
     return report
 
 
-def run_single_arbitrage(query: str, config: Config, category: str = "general",
-                         size: str = DEFAULT_SIZE_TIER,
+def run_single_arbitrage(query: str, config: Config, category: str | None = None,
+                         size: str | None = None,
                          settings: FeeSettings | None = None) -> ArbitrageResult:
-    """単一商品の分析（候補リストに同名があればその設定を引き継ぐ）"""
-    c = find_candidate(query)
-    if c:
-        return analyze_single(query, config, category=c.category, size=c.size, note=c.note,
-                              amazon_restricted=c.amazon_restricted, settings=settings)
-    return analyze_single(query, config, category=category, size=size, settings=settings)
+    """単一商品の分析
+
+    category / size が未指定（None・空）なら候補リストに同名があればその設定を使う。
+    指定があれば常にそれを優先する（表示と入力が食い違わないように）。
+    """
+    cat, sz, note, restricted = resolve_candidate_meta(query, category, size)
+    return analyze_single(query, config, category=cat, size=sz, note=note,
+                          amazon_restricted=restricted, settings=settings)
